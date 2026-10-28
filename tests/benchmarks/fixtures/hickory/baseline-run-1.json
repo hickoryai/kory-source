@@ -1,0 +1,1921 @@
+{
+  "label": "hickory-baseline-r1",
+  "git_sha": "e0cf571",
+  "timestamp": "20261028-193622",
+  "source": "hickory",
+  "judge_model": "codex-default",
+  "config": {
+    "llm": {
+      "model": "codex-default",
+      "fallback_model": null,
+      "indexing_model": null,
+      "review_model": null,
+      "security_model": null,
+      "review_reasoning_effort": null,
+      "reasoning_effort": null,
+      "temperature": 0.0,
+      "max_tokens": 4096,
+      "max_context_tokens": 120000,
+      "provider": "codex-cli",
+      "api_style": "chat",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "region": "us-east-1",
+      "aws_profile": null,
+      "max_retries": 3,
+      "request_timeout": 120,
+      "retry_min_wait": 2,
+      "retry_max_wait": 30,
+      "codex_command": "codex",
+      "codex_home": "/home/devagent/.codex",
+      "codex_sandbox": "read-only",
+      "codex_timeout_seconds": 900
+    },
+    "filter": {
+      "confidence_threshold": 0.7,
+      "category_confidence_thresholds": {},
+      "max_comments": 5,
+      "min_severity": "nitpick",
+      "exclude_patterns": [
+        "*.lock",
+        "*.lockb",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "Pipfile.lock",
+        "poetry.lock",
+        "go.sum",
+        "*.min.js",
+        "*.min.css",
+        "*.map",
+        "*.svg",
+        "*.png",
+        "*.jpg",
+        "*.jpeg",
+        "*.gif",
+        "*.ico",
+        "*.woff",
+        "*.woff2",
+        "*.ttf",
+        "*.eot",
+        "*.pdf",
+        "*.zip",
+        "*.tar.gz"
+      ],
+      "exclude_deleted": true,
+      "max_files": 50,
+      "allowed_authors": [],
+      "blocked_authors": []
+    },
+    "commands": {
+      "allowed_users": [],
+      "allow_repo_write_access": true,
+      "blocked_users": [],
+      "review": null,
+      "review_rest": null,
+      "help": null,
+      "pause": null,
+      "resume": null,
+      "reject": null,
+      "ask": null
+    },
+    "review": {
+      "context_lines": 3,
+      "max_diff_size": 250000,
+      "max_file_size": 50000,
+      "max_chunks_per_review": 5,
+      "include_summary": true,
+      "focus_only_on_problems": false,
+      "walkthrough": true,
+      "walkthrough_sequence_diagram": true,
+      "pr_summary": "disable",
+      "code_context": true,
+      "context_token_budget": 8000,
+      "max_concurrent_chunks": 5,
+      "ensemble_runs": 1,
+      "ensemble_temperature": 0.3,
+      "self_critique": true,
+      "security_pass": true,
+      "security_agentic": true,
+      "osv_scan": true,
+      "secrets_scan": true,
+      "agentic_tools": true,
+      "jit_java_go": true,
+      "blast_radius": true,
+      "dependency_overlap": true,
+      "overlap": {
+        "enabled": true,
+        "max_candidates": 20,
+        "confidence_floor": 0.6,
+        "title_similarity_threshold": 0.4
+      },
+      "auto_resolve_conversations": true,
+      "review_on_synchronize": true
+    },
+    "index": {
+      "llm_concurrency": 8,
+      "max_file_size": 1048576
+    },
+    "provider": {
+      "type": "github"
+    },
+    "database": {
+      "url": "",
+      "admin_password": ""
+    }
+  },
+  "scores": {
+    "overall": {
+      "tp": 2,
+      "fp": 11,
+      "fn": 75,
+      "precision": 0.1538,
+      "recall": 0.026,
+      "f1": 4.44,
+      "prs": 30
+    },
+    "by_language": {
+      "mixed": {
+        "tp": 2,
+        "fp": 11,
+        "fn": 75,
+        "precision": 0.1538,
+        "recall": 0.026,
+        "f1": 4.44,
+        "prs": 30
+      }
+    },
+    "by_source": {
+      "hickory": {
+        "tp": 2,
+        "fp": 11,
+        "fn": 75,
+        "precision": 0.1538,
+        "recall": 0.026,
+        "f1": 4.44,
+        "prs": 30
+      }
+    }
+  },
+  "median_duration_s": 40.6,
+  "prs": [
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11940",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 15.7,
+      "tokens": 12902,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11932",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 2,
+      "fn": 7,
+      "matched": {},
+      "missed": [
+        "hickory-11932-1",
+        "hickory-11932-2",
+        "hickory-11932-3",
+        "hickory-11932-4",
+        "hickory-11932-5",
+        "hickory-11932-6",
+        "hickory-11932-7"
+      ],
+      "fp_indices": [
+        0,
+        1
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": ".github/workflows/authz-gauntlet-panel.yml",
+          "line": 274,
+          "severity": "BLOCKER",
+          "category": "security",
+          "title": "The permitted Git commands can write files and execute code",
+          "body": "These command prefixes do not enforce the promised read-only boundary. An agent influenced by attacker-controlled repository content can run `git log -1 --format=... --output=.git/config` to write Git configuration, then invoke `git diff --ext-diff` to execute a configured external command. This permits arbitrary code execution in the lens job, which receives the Anthropic API key and has `id-token: write`. Restricting executable names to Git subcommands does not restrict their side effects.",
+          "confidence": 0.93,
+          "source_pass": "security"
+        },
+        {
+          "path": ".github/scripts/authz_gauntlet_checks.py",
+          "line": 46,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Keep raw index predicate matching within one SQL statement",
+          "body": "The `.*?` before `WHERE` crosses semicolons, so a valid migration string such as `CREATE INDEX ix ON t (id); DELETE FROM t WHERE expires_at < now();` is reported as an invalid index predicate. I verified that this regex captures the DELETE predicate. Since migration findings fail the blocking checks job, this prevents valid authz migrations from merging. Bound the index match to its statement and inspect every index statement in a string.",
+          "confidence": 1.0,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 2
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        },
+        {
+          "stage": "noise_filter",
+          "path": ".github/workflows/authz-gauntlet-panel.yml",
+          "line": 274,
+          "title": "Wildcard Git permissions allow overwriting the trusted extractor",
+          "severity": "WARNING",
+          "category": "security",
+          "confidence": 0.99,
+          "reason": ""
+        }
+      ],
+      "duration_s": 137.3,
+      "tokens": 64771,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11937",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11937-1"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 33.9,
+      "tokens": 34972,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11929",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 23.0,
+      "tokens": 13826,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11862",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 1,
+      "fp": 2,
+      "fn": 10,
+      "matched": {
+        "hickory-11862-3": 0
+      },
+      "missed": [
+        "hickory-11862-1",
+        "hickory-11862-2",
+        "hickory-11862-4",
+        "hickory-11862-5",
+        "hickory-11862-6",
+        "hickory-11862-7",
+        "hickory-11862-8",
+        "hickory-11862-9",
+        "hickory-11862-10",
+        "hickory-11862-11"
+      ],
+      "fp_indices": [
+        1,
+        2
+      ],
+      "reasons": {
+        "hickory-11862-3": "It identifies cleanup dismissing qualified deals because it fails to enforce current CCC candidate eligibility."
+      },
+      "comments": [
+        {
+          "path": "scripts/cleanup_ccc_backlog.py",
+          "line": 107,
+          "severity": "BLOCKER",
+          "category": "bug",
+          "title": "Re-check that a lead is still undecided before dismissing it",
+          "body": "A lead qualified after the nightly refresh still has an open-items row and passes these checks: qualification changes `stage_id`, not `is_dismissed`. Consequently, running the cleanup dismisses a now-qualified deal and stamps it `backlog_cleanup_90d`. Re-check current candidate eligibility before updating the deal so decisions made since the refresh are preserved.",
+          "confidence": 0.99,
+          "source_pass": "main"
+        },
+        {
+          "path": "hickory-ui/backend/app/services/ccc_worklist.py",
+          "line": 2950,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Probe historical replies when an open contact changes identity",
+          "body": "`_build_open_contact_rows` replaces the stored identity with the live contact's identity, but this probe only handles an old refresh. If a 40-day-old contact moves to a person who received a callback 20 days ago, a recent refresh and a 14-day window exclude that callback from both clearing paths. The contact incorrectly remains unanswered. Detect changes to tenant, person, or universal identity and request a backward probe, as the lead arm already does for moved people.",
+          "confidence": 0.98,
+          "source_pass": "main"
+        },
+        {
+          "path": "scripts/cleanup_ccc_backlog.py",
+          "line": 91,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Check freshness across all selected brands",
+          "body": "`max(computed_at)` accepts the entire selection when any selected brand is fresh. Since `refresh_open_items` supports replacing individual brands, refreshing one brand allows cleanup to mutate another brand's stale backlog despite the 36-hour guard. Require every selected brand with rows to have a fresh snapshot before permitting writes.",
+          "confidence": 0.97,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 3
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 139.4,
+      "tokens": 138936,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11935",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11935-1"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 18.5,
+      "tokens": 12877,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11919",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 24.8,
+      "tokens": 22910,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11927",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 1,
+      "fp": 0,
+      "fn": 4,
+      "matched": {
+        "hickory-11927-2": 0
+      },
+      "missed": [
+        "hickory-11927-1",
+        "hickory-11927-3",
+        "hickory-11927-4",
+        "hickory-11927-5"
+      ],
+      "fp_indices": [],
+      "reasons": {
+        "hickory-11927-2": "Identifies the same silent failure when a reference badge targets a folded Holds row that is not mounted."
+      },
+      "comments": [
+        {
+          "path": "hickory-ui/frontend/src/components/records/record-reference-badge.tsx",
+          "line": 36,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Reveal folded Holds rows before scrolling",
+          "body": "`DealStageWhyInline` creates a reference button whenever the deciding record exists in `deal.holds`, but `DealHoldings` only mounts the first four open records and hides terminal records until expanded. Clicking a badge for either hidden group therefore reaches this silent return and does nothing. This also affects the canceled-job example covered by the stage explanation tests: those tests manually mount the target row instead of exercising the terminal fold. Connect the badge action to the Holds expansion state, reveal the target group, and scroll after its row mounts.",
+          "confidence": 0.99,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 59.1,
+      "tokens": 42054,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11912",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 16,
+      "matched": {},
+      "missed": [
+        "hickory-11912-1",
+        "hickory-11912-2",
+        "hickory-11912-3",
+        "hickory-11912-4",
+        "hickory-11912-5",
+        "hickory-11912-6",
+        "hickory-11912-7",
+        "hickory-11912-8",
+        "hickory-11912-9",
+        "hickory-11912-10",
+        "hickory-11912-11",
+        "hickory-11912-12",
+        "hickory-11912-13",
+        "hickory-11912-14",
+        "hickory-11912-15",
+        "hickory-11912-16"
+      ],
+      "fp_indices": [
+        0
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "hickory-ui/backend/app/api/endpoints/finance/close_tasks.py",
+          "line": 538,
+          "severity": "WARNING",
+          "category": "race-condition",
+          "title": "Serialize RACI writes before reading the previous assignee",
+          "body": "`FOR UPDATE` locks nothing when this RACI key has no row. Two concurrent `/raci` requests can therefore both read `old = None`; the second upsert overwrites the first assignment but records its audit entry as `NULL \u2192 second user`, instead of `first user \u2192 second user`. Serialize writes for the logical key before reading `old`, including when the row does not exist, so the audit accurately records the assignment being replaced.",
+          "confidence": 0.97,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 137.3,
+      "tokens": 104180,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11926",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11926-1",
+        "hickory-11926-2"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 62.7,
+      "tokens": 30040,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11918",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11918-1"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 39.5,
+      "tokens": 38788,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11923",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11923-1",
+        "hickory-11923-2"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 40.8,
+      "tokens": 41190,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11904",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11904-1"
+      ],
+      "fp_indices": [
+        0
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "scripts/release_drip_draft_holds.py",
+          "line": 87,
+          "severity": "WARNING",
+          "category": "maintainability",
+          "title": "Missing test coverage",
+          "body": "The new release script changes persisted send eligibility, but the added tests exercise only the last-look filter. Add coverage verifying that only the next touch with a `held` attempt and a saved verdict is released, unrelated receipt fields remain intact, `--dry-run` rolls back, and exceeding `--max-release` leaves every run unchanged.",
+          "confidence": 0.99,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 57.7,
+      "tokens": 21106,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11905",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11905-1"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 24.9,
+      "tokens": 29013,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11917",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 3,
+      "matched": {},
+      "missed": [
+        "hickory-11917-1",
+        "hickory-11917-2",
+        "hickory-11917-3"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 40.6,
+      "tokens": 50310,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11925",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11925-1",
+        "hickory-11925-2"
+      ],
+      "fp_indices": [
+        0
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "scripts/backfill_gmail_thread_id.py",
+          "line": 123,
+          "severity": "WARNING",
+          "category": "maintainability",
+          "title": "Missing test coverage",
+          "body": "The new backfill scripts have no automated test coverage; the added tests exercise only the normalizers. The Gmail backfill independently implements provider dispatch, fallback SQL, pagination, and transaction handling while updating both historical and current records. Add tests covering those behaviors, including multiple batches, dry-run rollback, and rollback when the post-condition fails.",
+          "confidence": 0.98,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 67.4,
+      "tokens": 33575,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11924",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11924-1"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 20.4,
+      "tokens": 15376,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11913",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11913-1"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 19.0,
+      "tokens": 12689,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11922",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11922-1",
+        "hickory-11922-2"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 20.0,
+      "tokens": 26646,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11914",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 12.4,
+      "tokens": 10518,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11915",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11915-1",
+        "hickory-11915-2"
+      ],
+      "fp_indices": [
+        0
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "hickory-ui/backend/app/services/deal_board/st_owner_sync.py",
+          "line": 154,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Rank estimates by creation date within the Sold-first ordering",
+          "body": "Using `sold_on` before `st_created_on` selects the most recently sold estimate rather than the newest estimate. For example, an older estimate sold today beats a newer estimate sold yesterday, even when both are Sold and name different eligible reps. `load_facts` uses this timestamp for both salesperson and estimate creator, so both owner steps can select the wrong person. Keep the separate Sold-first priority and use the estimate's creation date to determine which estimate is newest.",
+          "confidence": 0.88,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 100.7,
+      "tokens": 75148,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11916",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 3,
+      "matched": {},
+      "missed": [
+        "hickory-11916-1",
+        "hickory-11916-2",
+        "hickory-11916-3"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 32.0,
+      "tokens": 45738,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11855",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11855-1"
+      ],
+      "fp_indices": [
+        0
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "scripts/restore_deals_flagged_by_ccc_triage.py",
+          "line": 216,
+          "severity": "WARNING",
+          "category": "maintainability",
+          "title": "Missing test coverage",
+          "body": "The new restoration script has no corresponding automated tests; the endpoint tests do not exercise its selection or rollback logic. Since this clears production deal decisions, preserve the reported smoke checks as regression tests, including exact timestamp and actor matching, excluded origins and backlog markers, and rollback of both batches when either update count mismatches.",
+          "confidence": 0.96,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 78.2,
+      "tokens": 78495,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11908",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11908-1",
+        "hickory-11908-2"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 60.2,
+      "tokens": 97792,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11910",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 22.7,
+      "tokens": 27489,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11892",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 6,
+      "matched": {},
+      "missed": [
+        "hickory-11892-1",
+        "hickory-11892-2",
+        "hickory-11892-3",
+        "hickory-11892-4",
+        "hickory-11892-5",
+        "hickory-11892-6"
+      ],
+      "fp_indices": [
+        0,
+        1
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "payment-portal/backend/src/routes/saved_charge.py",
+          "line": 337,
+          "severity": "BLOCKER",
+          "category": "race-condition",
+          "title": "Atomically reserve the invoice before charging",
+          "body": "Two simultaneous requests can both pass `find_active_payment_by_invoice`, `has_recent_unknown_charge`, and `_prior_charge_problem` before either reaches `_charge`. Both then charge the saved method, because the blocking payment row is written only afterward. The modal lock does not coordinate separate tabs or staff users. Although acknowledged in the description, this leaves a direct double-charge path in a money-moving endpoint. Acquire a cross-worker lock or atomic invoice reservation before the checks and retain protection through outcome recording.",
+          "confidence": 0.99,
+          "source_pass": "main"
+        },
+        {
+          "path": "payment-portal/backend/src/routes/saved_charge.py",
+          "line": 333,
+          "severity": "WARNING",
+          "category": "security",
+          "title": "Serialize invoice charge attempts before checking for prior payments",
+          "body": "The prior-payment checks and `_charge` are separate operations with no lock or atomic reservation. Concurrent requests for the same invoice can both observe no recorded payment and no Braintree transaction, then both charge the saved method. An authorized operator can trigger this by submitting parallel requests; the token signature and expiration do not prevent replay. Recording the payment afterward cannot undo the duplicate debit.",
+          "confidence": 0.99,
+          "source_pass": "security"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 3
+        },
+        {
+          "stage": "noise_filter",
+          "path": "hickory-ui/backend/tests/services/test_payment_portal_saved_charge.py",
+          "line": 15,
+          "title": "Hardcoded credential assignment in diff",
+          "severity": "WARNING",
+          "category": "security",
+          "confidence": 0.9,
+          "reason": ""
+        },
+        {
+          "stage": "noise_filter",
+          "path": "packages/hickory-common/tests/test_saved_charge_token.py",
+          "line": 57,
+          "title": "Hardcoded credential assignment in diff",
+          "severity": "WARNING",
+          "category": "security",
+          "confidence": 0.9,
+          "reason": ""
+        },
+        {
+          "stage": "self_critique",
+          "path": "payment-portal/backend/tests/test_saved_charge.py",
+          "line": 355,
+          "title": "Hardcoded credential assignment in diff",
+          "severity": "WARNING",
+          "category": "security",
+          "confidence": 0.9,
+          "reason": "unsupported: The cited value is a synthetic secret used in stubbed tests, with no evidence that it is a real credential requiring rotation."
+        }
+      ],
+      "duration_s": 112.5,
+      "tokens": 97428,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11903",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11903-1",
+        "hickory-11903-2"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 51.1,
+      "tokens": 56863,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11911",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 15.3,
+      "tokens": 12246,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11909",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11909-1",
+        "hickory-11909-2"
+      ],
+      "fp_indices": [
+        0
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "data-platform/processors/canonical-resolution/scripts/merge_family_call_duplicate_deals.py",
+          "line": 262,
+          "severity": "BLOCKER",
+          "category": "bug",
+          "title": "Protect the winner from reference updates when moved calls replay",
+          "body": "Moving the source links makes subsequent resolution of those call identities enter Case A on the sister-brand winner. That path updates the deal's references using the call's resolved own-brand person\u2014the same cross-brand corruption that `_form_attach_target` explicitly prevents for forms. Call intents remain attach-only, but Case-A attachments retain their writes, so that restriction does not protect the winner. Protect cross-brand Case-A attachments before moving these links, and add a regression that resolves a moved call again and verifies the winner retains its original person and location.",
+          "confidence": 0.85,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 93.5,
+      "tokens": 99650,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11863",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11863-1",
+        "hickory-11863-2"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 38.8,
+      "tokens": 67610,
+      "error": null
+    }
+  ]
+}
