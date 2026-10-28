@@ -15,6 +15,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "tests"))
 
+# Docker images own /data; the local Python path does not. Set this before
+# importing the runner because dashboard/index modules capture it at import.
+os.environ.setdefault("MIRA_INDEX_DIR", "/tmp/kory-source-benchmark-indexes")
+
 from benchmarks import runner  # noqa: E402
 from mira.config import FilterConfig, LLMConfig, MiraConfig, ReviewConfig  # noqa: E402
 from mira.llm.codex_cli import CodexCLIProvider  # noqa: E402
