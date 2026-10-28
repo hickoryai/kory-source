@@ -76,7 +76,7 @@ The baseline smoke check used `GET http://127.0.0.1:8765/health` and received
 3. Rebuild and verify:
 
    ```bash
-   uv sync --extra serve
+   uv sync --all-extras
    npm --prefix ui/mira ci
    npm --prefix ui/mira run build
    uv run pytest
