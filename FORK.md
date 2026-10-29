@@ -276,8 +276,10 @@ These files are new and fork-owned:
   learned-rule mirror), `prompt.py`, `realization.py`, `auth.py`
   (registry JWT), `mcp.py`, and `api.py`.
 - `ui/mira/src/pages/registry.tsx` and `ui/mira/src/lib/api/registry.ts`.
-- `tests/test_decision_registry.py`. It also asserts the `engine.py` (<40)
-  and `server.py` (<25) caps against the fork base.
+- `tests/test_decision_registry.py`. It also asserts the `engine.py` (<47)
+  and `server.py` (<25) caps against the fork base. The engine cap moved
+  from 40 to 47 when HAI-12286 added `review_snapshot` (28 lines) beside
+  the registry block (18 lines); the measured total is 46.
 
 MCP is streamable HTTP at `POST /mcp` and returns JSON responses with no
 SSE. Bearer JWT claims are `kind` (human|agent), `sub`, `model` (required
