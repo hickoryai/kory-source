@@ -1056,6 +1056,31 @@ class ReviewEngine:
         """Review a diff from stdin — no provider needed."""
         return await self._review_diff_internal(diff_text)
 
+    async def review_snapshot(
+        self,
+        pr_info: PRInfo,
+        diff_text: str,
+        *,
+        team_conventions: str = "",
+        extra_custom_rules: list[dict[str, str]] | None = None,
+    ) -> ReviewResult:
+        """Review a frozen PR snapshot and return the result without posting.
+
+        The caller supplies the diff and a provider pinned to the snapshot.
+        This path posts nothing, resolves no threads, and records no review
+        history, progress, or last-reviewed SHA. It is always a first-round,
+        full-diff review. ``extra_custom_rules`` are appended to the rules the
+        index already contributes.
+        """
+        self._pr_info = pr_info
+        return await self._review_diff_internal(
+            diff_text,
+            pr_title=pr_info.title,
+            pr_description=pr_info.description,
+            team_conventions=team_conventions,
+            extra_custom_rules=extra_custom_rules,
+        )
+
     async def _review_diff_internal(
         self,
         diff_text: str,
@@ -1066,6 +1091,7 @@ class ReviewEngine:
         review_round: int = 1,
         resolved_threads: list[dict] | None = None,
         team_conventions: str = "",
+        extra_custom_rules: list[dict[str, str]] | None = None,
     ) -> ReviewResult:
         """Core review pipeline.
 
@@ -1328,6 +1354,8 @@ class ReviewEngine:
                     logger.debug("Registry prompt block skipped: %s", exc)
         except Exception:
             pass
+        if extra_custom_rules:
+            custom_rules.extend(extra_custom_rules)
 
         valid_paths = {f.path for f in filtered}
         base_existing = list(existing_comments) if existing_comments else []

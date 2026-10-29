@@ -113,6 +113,47 @@ commits, not fork-authored edits. After an upstream-sync PR lands, any
 remaining output is the intentional fork delta and must comply with the policy
 above.
 
+## Review-without-post API (HAI-12286)
+
+`POST /api/reviews` runs the normal engine against one exact PR snapshot and
+returns findings without writing to GitHub. The contract is in
+`docs/review-api.md`. These files are the intentional delta:
+
+- `src/mira/review_api/__init__.py`, `settings.py`, `tokens.py`,
+  `snapshot.py`, `store.py`, `runner.py`, `executor.py`, `service.py`
+  (new package: token digests, SHA-pinned GitHub reads with a provider that
+  refuses every write, the `review_api_jobs` table, the bounded executor, and
+  the `custom_rules_providers` hook for HAI-11605);
+- `src/mira/dashboard/routers/reviews.py` (new dashboard routes and the job
+  report page) and `src/mira/dashboard/api.py` (one import line);
+- `src/mira/dashboard/auth.py` (a bearer token reaches `/api/reviews` only;
+  HTTPS unless loopback);
+- `src/mira/platforms/server.py` (lifespan starts and stops the review
+  service);
+- `src/mira/llm/router_acp.py` (`call_observer` context variable for per-job
+  model attribution; unparseable replies are recorded as `bad_response`);
+- `src/mira/core/engine.py` (see below);
+- `docs/review-api.md`;
+- `tests/test_review_api.py` and `tests/test_api_routes.py` (route
+  snapshot).
+
+`src/mira/core/engine.py` gains `ReviewEngine.review_snapshot` and an
+`extra_custom_rules` argument on `_review_diff_internal`. `review_pr` cannot
+be reused: even with `dry_run` it records review history, PR progress, and
+the last-reviewed SHA, and it reads the live PR diff. `review_snapshot`
+calls the same `_review_diff_internal` pipeline with a caller-supplied diff
+and nothing else. No upstream behaviour changes; offer it upstream.
+
+The job table is created idempotently at startup on the application
+database, the same way `AppDatabase` creates its own tables. It adds one
+table and one index and alters nothing. If HAI-11605 lands schema first,
+rebase onto it before merge and re-run the fresh and upgrade database tests.
+
+The executor is off by default (`MIRA_REVIEW_API_ENABLED`). On Cloud Run it
+needs CPU between requests, which the `kory_source` module provides whenever
+`min_instance_count >= 1`: prod already sets 1; dev sets 0 and must be raised
+before the executor is enabled there.
+
 ## Local Python boot (SQLite)
 
 Docker is not required. From the repository root:
@@ -235,8 +276,10 @@ These files are new and fork-owned:
   learned-rule mirror), `prompt.py`, `realization.py`, `auth.py`
   (registry JWT), `mcp.py`, and `api.py`.
 - `ui/mira/src/pages/registry.tsx` and `ui/mira/src/lib/api/registry.ts`.
-- `tests/test_decision_registry.py`. It also asserts the `engine.py` (<40)
-  and `server.py` (<25) caps against the fork base.
+- `tests/test_decision_registry.py`. It also asserts the `engine.py` (<47)
+  and `server.py` (<25) caps against the fork base. The engine cap moved
+  from 40 to 47 when HAI-12286 added `review_snapshot` (28 lines) beside
+  the registry block (18 lines); the measured total is 46.
 
 MCP is streamable HTTP at `POST /mcp` and returns JSON responses with no
 SSE. Bearer JWT claims are `kind` (human|agent), `sub`, `model` (required

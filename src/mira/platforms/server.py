@@ -116,7 +116,12 @@ def create_app(
 
         registry_task = asyncio.create_task(run_registry_jobs())
 
+        from mira.review_api import service as review_service
+
+        await review_service.start(app_auth)
+
         yield
+        await review_service.stop()
         if not registry_task.done():
             registry_task.cancel()
         if backfill_task is not None and not backfill_task.done():

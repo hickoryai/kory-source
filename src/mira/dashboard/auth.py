@@ -20,6 +20,7 @@ SESSION_COOKIE = "mira_session"
 _PUBLIC_PATHS = {"/api/auth/login", "/docs", "/openapi.json", "/redoc"}
 # The badge SVG must be public so GitHub can embed it as an image
 _PUBLIC_SVG = re.compile(r"/api/repos/[^/]+/[^/]+/blast-radius\.svg")
+_REVIEW_API = re.compile(r"/api/reviews(?:/[^/]+(?:/report)?)?")
 
 
 class LoginRequest(BaseModel):
@@ -197,6 +198,25 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         # Non-API paths (frontend assets) don't need auth
         if not request.url.path.startswith("/api/"):
+            return await call_next(request)
+
+        # Review-API bearer tokens reach /api/reviews only; never the dashboard.
+        authorization = request.headers.get("authorization", "")
+        if authorization[:7].lower() == "bearer ":
+            from mira.review_api.tokens import authenticate, transport_allowed
+
+            if not _REVIEW_API.fullmatch(request.url.path):
+                return JSONResponse(
+                    status_code=401, content={"error": "Bearer tokens are for /api/reviews only"}
+                )
+            if not transport_allowed(request):
+                return JSONResponse(
+                    status_code=403, content={"error": "Review API tokens require HTTPS"}
+                )
+            principal = authenticate(authorization[7:].strip())
+            if principal is None:
+                return JSONResponse(status_code=401, content={"error": "Invalid review token"})
+            request.state.review_principal = principal
             return await call_next(request)
 
         token = request.cookies.get(SESSION_COOKIE)
