@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import socket
 import statistics
 import subprocess
@@ -216,6 +217,22 @@ async def _run(limit: int, url: str) -> dict:
     }
 
 
+def _place(src: Path, dest: Path) -> None:
+    """Move a result file. The run directory and /tmp are different disks."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    shutil.move(src, dest)
+
+
+def _redact_relay_token(path: Path) -> None:
+    payload = json.loads(path.read_text())
+    llm = payload.get("config", {}).get("llm")
+    if isinstance(llm, dict) and llm.get("router_acp_token"):
+        llm["router_acp_token"] = ""
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
 def main() -> int:
     limit = int(os.environ.get("MIRA_ROUTER_ACP_BENCH_LIMIT", "0"))
     url = os.environ.get("MIRA_ROUTER_ACP_URL", f"http://127.0.0.1:{LOOPBACK_PORT}")
@@ -247,7 +264,8 @@ def main() -> int:
         raw_destination = HERE / "router-acp-held-out-run.json"
     artifact = Path(report["artifact"])
     if artifact.is_file():
-        artifact.replace(raw_destination)
+        _place(artifact, raw_destination)
+        _redact_relay_token(raw_destination)
     summary["artifact"] = str(raw_destination)
     destination.write_text(json.dumps(summary, indent=2) + "\n")
     sys.stdout.write(
