@@ -21,6 +21,8 @@ DEFAULT_RULE = {
     "precision_margin": 0.10,
     "min_scored_units": 20,
     "min_coverage": 0.9,
+    # A failed judge call leaves that unit's comments uncertain, which hides defects.
+    "max_judge_error_rate": 0.05,
     "registry_sigma_multiple": 2.0,
 }
 
@@ -98,6 +100,7 @@ def parity_verdict(
     coverage: float,
     judge_family_overlap: bool,
     rule: dict = DEFAULT_RULE,
+    judge_error_rate: float = 0.0,
 ) -> dict[str, Any]:
     """``per_unit`` rows: pr_url, kory_weighted_tp (mean over runs), greptile_weighted_tp."""
     by_pr: dict[str, list[float]] = {}
@@ -122,6 +125,10 @@ def parity_verdict(
         reasons.append(f"Kory coverage {coverage:.0%} < {rule['min_coverage']:.0%}")
     if judge_family_overlap:
         reasons.append("judge shares a model family with a reviewer call")
+    if judge_error_rate > rule.get("max_judge_error_rate", 1.0):
+        reasons.append(
+            f"judge failed on {judge_error_rate:.0%} of units > {rule['max_judge_error_rate']:.0%}"
+        )
     if reasons or ci["lo"] is None:
         verdict = "inconclusive"
     elif ci["lo"] > 0 and precision_ok:
@@ -136,6 +143,7 @@ def parity_verdict(
         "non_inferiority_margin_abs": round(margin, 4),
         "greptile_weighted_tp_per_unit": round(greptile_mean, 4),
         "precision_ok": precision_ok,
+        "judge_error_rate": round(judge_error_rate, 4),
         "inconclusive_reasons": reasons,
         "rule": rule,
     }

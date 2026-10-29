@@ -508,7 +508,19 @@ def summarize(artifact: dict) -> dict:
             "registry_blocks_seen": sum(
                 1 for r in arm_rows for b in r["rec"]["review"]["registry_blocks"] if b
             ),
-            "parity": parity_verdict(per_unit, k_tot, g_tot, coverage, family_overlap, rule),
+            "parity": parity_verdict(
+                per_unit,
+                k_tot,
+                g_tot,
+                coverage,
+                family_overlap,
+                rule,
+                judge_error_rate=(
+                    sum(1 for r in arm_rows if r["rec"]["judge"]["error"]) / len(arm_rows)
+                    if arm_rows
+                    else 0.0
+                ),
+            ),
             "per_unit": per_unit,
         }
 

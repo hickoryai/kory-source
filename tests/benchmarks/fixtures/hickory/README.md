@@ -123,8 +123,9 @@ as a Kory miss.
   - `as_good`: lower bound ≥ −0.2 × Greptile's mean weighted TP per unit, with
     the same precision condition.
   - `worse`: neither condition holds.
-  - `inconclusive`: fewer than 20 scored units, Kory coverage under 90%, or a
-    judge/reviewer family overlap.
+  - `inconclusive`: fewer than 20 scored units, Kory coverage under 90%, a
+    judge/reviewer family overlap, or failed judge calls on more than 5% of
+    units. A failed judge call leaves that unit's comments `uncertain`.
 - **Registry A/B.** Arms `registry_on` and `registry_off`. In `registry_off`,
   `custom_rules` gets no registry block. In `registry_on`, the shipped block
   is limited to objects approved before Greptile's review time, so later

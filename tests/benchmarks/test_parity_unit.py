@@ -372,6 +372,9 @@ def test_parity_verdicts():
     assert overlap["verdict"] == "inconclusive"
     low_cov = parity_verdict(_rows([(5, 2)] * 24), good, grep, 0.5, False)
     assert low_cov["verdict"] == "inconclusive"
+    judge_down = parity_verdict(_rows([(5, 2)] * 24), good, grep, 1.0, False, judge_error_rate=0.25)
+    assert judge_down["verdict"] == "inconclusive"
+    assert "judge failed" in judge_down["inconclusive_reasons"][0]
 
 
 def test_model_family():
