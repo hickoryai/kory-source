@@ -20,6 +20,9 @@ export interface RegistryRelationship {
   relation: string
   new_clause: string
   existing_clause: string
+  session?: string
+  answer?: string | null
+  answered_by?: string
 }
 
 export interface RegistryObject {
@@ -126,8 +129,18 @@ export const registryApi = {
   reject: (objectId: string, reason = "") =>
     postJson<RegistryObject>(`${base}/objects/${id(objectId)}/reject`, { reason }),
   restore: (objectId: string) => postJson<RegistryObject>(`${base}/objects/${id(objectId)}/restore`, {}),
-  resolve: (objectId: string, choice: "keep" | "supersede") =>
+  resolve: (objectId: string, choice: "keep" | "supersede" | "defer") =>
     postJson<RegistryObject>(`${base}/objects/${id(objectId)}/resolve`, { choice }),
+  sessionConflicts: (session: string) =>
+    fetchJson<{ session: string; unresolved: boolean; conflicts: RegistryRelationship[] }>(
+      `${base}/session-conflicts?session=${id(session)}`,
+    ),
+  conflictPrompts: () =>
+    fetchJson<{
+      prompts: number
+      answers: { keep: number; supersede: number; defer: number }
+      by_session: { session: string; prompts: number }[]
+    }>(`${base}/conflict-prompts`),
   works: () => fetchJson<RegistryObject[]>(`${base}/work`),
   work: (workId: string) => fetchJson<WorkView>(`${base}/work/${id(workId)}`),
   createWork: (body: NewWork) => postJson<RegistryObject>(`${base}/work`, { ...body, scope: "org" }),

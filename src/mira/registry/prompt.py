@@ -138,3 +138,18 @@ def with_registry_tool(executor: Any, pr_info: Any) -> Any:
     if pr_info is None:
         return executor
     return RegistryToolExecutor(executor, f"{pr_info.owner}/{pr_info.repo}")
+
+
+async def apply_registry(
+    engine: Any,
+    pr_info: Any,
+    files: list[Any],
+    custom_rules: list[dict[str, str]],
+    diff_text: str,
+    pr_title: str,
+    pr_body: str,
+) -> None:
+    """Engine hook: registry prompt block plus contradiction findings. No writes."""
+    from mira.registry.review_gate import attach
+
+    await attach(engine, pr_info, files, custom_rules, diff_text, pr_title, pr_body)

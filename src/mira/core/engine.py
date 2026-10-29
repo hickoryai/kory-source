@@ -64,7 +64,7 @@ from mira.models import (
     build_review_stats,
 )
 from mira.providers.base import BaseProvider
-from mira.registry.prompt import SEARCH_DECISIONS_TOOL
+from mira.registry.prompt import SEARCH_DECISIONS_TOOL, apply_registry
 from mira.security.secrets_scan import scan_secrets
 
 logger = logging.getLogger(__name__)
@@ -1342,18 +1342,16 @@ class ReviewEngine:
                             custom_rules.insert(0, {"title": title, "content": content})
                 except Exception:
                     pass
-
-                # Kory Source registry: approved objects on these paths, ahead of everything.
-                try:
-                    from mira.registry.prompt import registry_rule
-
-                    registry_block = registry_rule(pr_info, [f.path for f in filtered])
-                    if registry_block:
-                        custom_rules.insert(0, registry_block)
-                except Exception as exc:
-                    logger.debug("Registry prompt block skipped: %s", exc)
         except Exception:
             pass
+        try:
+            pr_info = getattr(self, "_pr_info", None)
+            if pr_info is not None:
+                await apply_registry(
+                    self, pr_info, filtered, custom_rules, diff_text, pr_title, pr_description
+                )
+        except Exception:
+            logger.debug("Registry contradiction check skipped", exc_info=True)
         if extra_custom_rules:
             custom_rules.extend(extra_custom_rules)
 
@@ -1646,6 +1644,7 @@ class ReviewEngine:
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
 
+        final_comments = [*self.__dict__.pop("_registry_findings", []), *final_comments]
         all_key_issues = _drop_orphan_key_issues(all_key_issues, final_comments)
 
         if self.config.review.include_summary:

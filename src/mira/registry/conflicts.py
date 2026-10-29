@@ -2,7 +2,7 @@
 
 The judge is one seat call per candidate through the configured review model
 (the router-acp seat provider in Kory Source). It returns the quoted clause on
-each side so a human can answer keep or supersede without re-reading both.
+each side so a human can answer keep, supersede, or defer without re-reading both.
 """
 
 from __future__ import annotations
@@ -28,6 +28,9 @@ _SYSTEM = (
     "- widens: the new statement extends the existing one to more cases or users.\n"
     "- reverses: the new statement requires the opposite of the existing one.\n"
     "- none: the statements are compatible or about different things.\n"
+    "Inferred narrowing counts as narrows. A stricter rule derived from a broader "
+    "requirement narrows the approved statement when that statement already fixed the "
+    "behavior the stricter rule would change. Do not call that pair compatible.\n"
     "Quote the exact clause from each statement that carries the change. Use empty "
     "strings for both clauses when the relation is none.\n"
     'Return JSON only: {"relation": "narrows|widens|reverses|none", '

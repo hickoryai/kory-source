@@ -16,6 +16,7 @@ import {
   registryApi,
   type NewWork,
   type RegistryObject,
+  type RegistryRelationship,
   type WorkView,
 } from "@/lib/api/registry"
 import { useAuth } from "@/lib/auth"
@@ -50,6 +51,25 @@ function StatusBadges({ obj }: { obj: RegistryObject }) {
   )
 }
 
+function ConflictCard({ conflict }: { conflict: RegistryRelationship }) {
+  const answer = conflict.answer
+    ? `Answer: ${conflict.answer}${conflict.answered_by ? ` by ${conflict.answered_by}` : ""}`
+    : "Unanswered"
+  return (
+    <div className="rounded border p-2 text-xs">
+      <p>
+        <span className="font-medium">{conflict.relation}</span> {conflict.target_id}
+      </p>
+      <p>New: “{conflict.new_clause}”</p>
+      <p>Existing: “{conflict.existing_clause}”</p>
+      <p>
+        {answer}
+        {conflict.session ? ` · session ${conflict.session}` : ""}
+      </p>
+    </div>
+  )
+}
+
 function ObjectRow({
   obj,
   onOpen,
@@ -75,13 +95,7 @@ function ObjectRow({
           <p className="text-xs text-destructive">Unresolved: {obj.unresolved.join(", ")}</p>
         )}
         {obj.conflicts?.map((c) => (
-          <div key={c.id} className="rounded border p-2 text-xs">
-            <p>
-              <span className="font-medium">{c.relation}</span> {c.target_id}
-            </p>
-            <p>New: “{c.new_clause}”</p>
-            <p>Existing: “{c.existing_clause}”</p>
-          </div>
+          <ConflictCard key={c.id} conflict={c} />
         ))}
       </div>
       {children && <div className="flex flex-wrap gap-2">{children}</div>}
@@ -156,6 +170,9 @@ export function RegistryPage() {
                       </Button>
                       <Button size="sm" onClick={() => run(() => registryApi.resolve(obj.id, "supersede"))}>
                         Supersede
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => run(() => registryApi.resolve(obj.id, "defer"))}>
+                        Defer
                       </Button>
                     </>
                   ) : isAdmin ? (
@@ -317,19 +334,32 @@ function ObjectPanel({ objectId, onOpen }: { objectId: string; onOpen: (id: stri
                 {a.repo} {a.path} {a.qualified_name}
               </p>
             ))}
+            {obj.conflicts && obj.conflicts.length > 0 && (
+              <div className="space-y-2">
+                <p className="font-medium">Conflicts</p>
+                {obj.conflicts.map((c) => (
+                  <ConflictCard key={c.id} conflict={c} />
+                ))}
+              </div>
+            )}
           </>
         )}
         {chain.data && chain.data.length > 1 && (
-          <div>
+          <div className="space-y-2">
             <p className="font-medium">Supersession chain (oldest first)</p>
             {chain.data.map((c) => (
-              <button
-                key={c.id}
-                className={`block text-left text-xs hover:underline ${c.id === objectId ? "font-semibold" : ""}`}
-                onClick={() => onOpen(c.id)}
-              >
-                {c.id} · {c.status} · {c.title}
-              </button>
+              <div key={c.id}>
+                <button
+                  className={`block text-left text-xs hover:underline ${c.id === objectId ? "font-semibold" : ""}`}
+                  onClick={() => onOpen(c.id)}
+                >
+                  {c.id} · {c.status} · {c.title}
+                  {c.session ? ` · session ${c.session}` : ""}
+                </button>
+                {c.conflicts?.map((conflict) => (
+                  <ConflictCard key={conflict.id} conflict={conflict} />
+                ))}
+              </div>
             ))}
           </div>
         )}

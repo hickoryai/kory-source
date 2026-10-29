@@ -120,10 +120,32 @@ TOOLS = [
     ),
     _tool(
         "resolve_conflict",
-        "A person answers a conflict: keep rejects the new object; supersede approves it "
-        "and supersedes the approved one. Refused for agent tokens and for the author.",
-        {"id": _STR, "choice": {"type": "string", "enum": ["keep", "supersede"]}},
+        "A person answers a conflict on one proposal. keep rejects the new object "
+        "(reason conflicts_with_approved). supersede approves it and supersedes the "
+        "approved one, with decided_by set to the person. defer leaves the new object "
+        "proposed. The answer binds to that proposal's session only. Refused for agent "
+        "tokens and for the author.",
+        {
+            "id": _STR,
+            "choice": {"type": "string", "enum": ["keep", "supersede", "defer"]},
+        },
         ["id", "choice"],
+    ),
+    _tool(
+        "session_conflicts",
+        "Does this session hold a conflict that still blocks push? True until this "
+        "session's proposal is answered keep or supersede. Defer lets the session "
+        "continue editing, but push and gh pr create stay blocked. A second session "
+        "does not inherit the answer. Call before git push or gh pr create.",
+        {"session": _STR},
+        ["session"],
+    ),
+    _tool(
+        "conflict_prompt_counts",
+        "How many conflict-judge prompts have run, per session, and the keep / supersede / "
+        "defer split of answers recorded so far.",
+        {},
+        [],
     ),
     _tool(
         "put_work",
@@ -215,6 +237,10 @@ async def call_tool(name: str, args: dict, actor: Actor) -> Any:
         )
     if name == "resolve_conflict":
         return reg.resolve_conflict(args["id"], str(args.get("choice") or ""), actor)
+    if name == "session_conflicts":
+        return reg.session_conflicts(str(args.get("session") or ""))
+    if name == "conflict_prompt_counts":
+        return reg.conflict_prompt_counts()
     if name == "put_work":
         if args.get("id"):
             return reg.update_work(args["id"], args, actor)

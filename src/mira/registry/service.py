@@ -145,6 +145,63 @@ def _words(text: str) -> set[str]:
     return {w for w in re.findall(r"[a-z0-9_]+", text.lower()) if len(w) > 3}
 
 
+_TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+_REVIEW_EXCERPT = 6000
+
+
+def _anchors_touched(anchors: list[dict], repo: str, hunks: dict[str, dict]) -> bool:
+    """True when an anchor's symbol appears in the diff hunk for its file.
+
+    A path-only anchor matches the file. A symbol anchor matches only when the
+    qualified name, or its leaf, appears in that file's hunk text.
+    """
+    for anchor in anchors:
+        if str(anchor.get("repo") or "").lower() != repo.lower():
+            continue
+        hunk = hunks.get(anchor.get("path") or "")
+        if hunk is None:
+            continue
+        name = str(anchor.get("qualified_name") or "")
+        if not name:
+            return True
+        leaf = name.rsplit(".", 1)[-1]
+        text = hunk.get("text") or ""
+        if name in text or (leaf and leaf in text):
+            return True
+    return False
+
+
+def _hit_location(obj: dict, hunks: dict[str, dict], repo: str) -> tuple[str, int]:
+    for anchor in obj.get("anchors") or []:
+        if str(anchor.get("repo") or "").lower() != repo.lower():
+            continue
+        path = anchor.get("path") or ""
+        hunk = hunks.get(path)
+        if hunk is None:
+            continue
+        name = str(anchor.get("qualified_name") or "")
+        leaf = name.rsplit(".", 1)[-1] if name else ""
+        text = hunk.get("text") or ""
+        if not name or name in text or (leaf and leaf in text):
+            return path, int(hunk.get("line") or 1)
+    path = next(iter(hunks), "")
+    hunk = hunks.get(path) or {}
+    return path, int(hunk.get("line") or 1)
+
+
+def _pr_statement(title: str, body: str, hunks: dict[str, dict]) -> str:
+    parts = [p for p in (title.strip(), body.strip()) if p]
+    tickets = _TICKET_RE.findall(f"{title}\n{body}")
+    if tickets:
+        parts.append("Linked tickets: " + ", ".join(dict.fromkeys(tickets)))
+    excerpt = "\n\n".join(f"# {path}\n{hunk.get('text') or ''}" for path, hunk in hunks.items())
+    if len(excerpt) > _REVIEW_EXCERPT:
+        excerpt = excerpt[:_REVIEW_EXCERPT]
+    if excerpt:
+        parts.append(excerpt)
+    return "\n\n".join(parts)
+
+
 class Registry:
     def __init__(
         self,
@@ -632,6 +689,7 @@ class Registry:
             return []
 
         async def _one(cand: dict) -> dict | None:
+            self._record_prompt(str(obj.get("session") or ""), object_id, cand["id"])
             try:
                 verdict = await self.judge(obj, cand)  # type: ignore[misc]
             except Exception as exc:
@@ -674,6 +732,201 @@ class Registry:
             if target["status"] == "approved":
                 reasons.append(f"{rel['type']} {target['id']}")
         return reasons
+
+    def _record_prompt(self, session: str, object_id: str, candidate_id: str) -> None:
+        self.db.execute(
+            "INSERT INTO registry_conflict_prompts "
+            "(id, session, object_id, candidate_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            (new_id("prm_"), session, object_id, candidate_id, self.clock()),
+        )
+
+    def _record_answer(self, object_id: str, session: str, choice: str, actor: Actor) -> None:
+        self.db.execute(
+            "INSERT INTO registry_conflict_answers "
+            "(object_id, session, choice, answered_by, answered_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (object_id, session) DO UPDATE SET choice = excluded.choice, "
+            "answered_by = excluded.answered_by, answered_at = excluded.answered_at",
+            (object_id, session, choice, actor.sub, self.clock()),
+        )
+
+    def _answer(self, object_id: str, session: str) -> dict | None:
+        rows = self.db.execute(
+            "SELECT choice, answered_by, answered_at FROM registry_conflict_answers "
+            "WHERE object_id = ? AND session = ?",
+            (object_id, session),
+        )
+        if not rows:
+            return None
+        return {"choice": rows[0][0], "answered_by": rows[0][1], "answered_at": rows[0][2]}
+
+    def conflict_views(self, obj: dict) -> list[dict]:
+        """Each ``conflicts_with`` link, the operator's answer, and the session that asked."""
+        answer = self._answer(obj["id"], obj.get("session") or "")
+        views = []
+        for rel in self.relationships(obj["id"], direction="out", type="conflicts_with"):
+            views.append(
+                {
+                    **rel,
+                    "session": obj.get("session") or "",
+                    "answer": None if answer is None else answer["choice"],
+                    "answered_by": "" if answer is None else answer["answered_by"],
+                    "answered_at": 0 if answer is None else answer["answered_at"],
+                }
+            )
+        return views
+
+    def session_conflicts(self, session: str) -> dict:
+        """Whether ``session`` still blocks push on an open conflict.
+
+        Keep and supersede clear this session. Defer leaves the conflict in
+        the list with ``answer`` ``defer`` and ``unresolved`` true, so push
+        and PR creation stay blocked while the session continues editing.
+        Another session's answer does not clear this one.
+        """
+        session = str(session or "").strip()
+        if not session:
+            raise RegistryError("session is required")
+        conflicts = []
+        rows = self._select(
+            "session = ? AND status = 'proposed' "
+            "AND kind IN ('decision', 'rule', 'constraint', 'requirement')",
+            (session,),
+        )
+        for obj in rows:
+            answer = self._answer(obj["id"], session)
+            if answer is not None and answer["choice"] in ("keep", "supersede"):
+                continue
+            for rel in self.relationships(obj["id"], direction="out", type="conflicts_with"):
+                if rel["status"] != "proposed":
+                    continue
+                try:
+                    if self.get(rel["target_id"])["status"] != "approved":
+                        continue
+                except NotFound:
+                    continue
+                conflicts.append(
+                    {
+                        "object_id": obj["id"],
+                        "existing_id": rel["target_id"],
+                        "session": session,
+                        "relation": rel["relation"],
+                        "new_clause": rel["new_clause"],
+                        "existing_clause": rel["existing_clause"],
+                        "answer": None if answer is None else answer["choice"],
+                    }
+                )
+        return {"session": session, "unresolved": bool(conflicts), "conflicts": conflicts}
+
+    def conflict_prompt_counts(self) -> dict:
+        """Judge prompts per session, and the keep / supersede / defer split."""
+        prompt_rows = self.db.execute(
+            "SELECT session, COUNT(*) FROM registry_conflict_prompts GROUP BY session"
+        )
+        answer_rows = self.db.execute(
+            "SELECT choice, COUNT(*) FROM registry_conflict_answers GROUP BY choice"
+        )
+        by_session = [{"session": r[0], "prompts": r[1]} for r in prompt_rows]
+        answers = {"keep": 0, "supersede": 0, "defer": 0}
+        for choice, count in answer_rows:
+            if choice in answers:
+                answers[choice] = count
+        return {
+            "prompts": sum(row["prompts"] for row in by_session),
+            "answers": answers,
+            "by_session": sorted(by_session, key=lambda row: row["session"]),
+        }
+
+    def _open_proposal(self, approved_id: str, repo: str, branch: str) -> str | None:
+        """A proposed object that already conflicts with ``approved_id`` on this branch."""
+        for rel in self.relationships(approved_id, direction="in", type="conflicts_with"):
+            if rel["status"] != "proposed":
+                continue
+            try:
+                src = self.get(rel["source_id"])
+            except NotFound:
+                continue
+            if src["status"] != "proposed":
+                continue
+            if repo and src["repo"].lower() != repo.lower():
+                continue
+            if branch and src["branch"] and src["branch"] != branch:
+                continue
+            return src["id"]
+        return None
+
+    async def review_findings(
+        self,
+        *,
+        repo: str,
+        hunks: dict[str, dict],
+        pr_title: str = "",
+        pr_body: str = "",
+        branch: str = "",
+        pr_number: int = 0,
+    ) -> list[dict]:
+        """Judge a PR's text against approved decisions on the symbols it touches.
+
+        Returns one hit per conflicting approved object. This does not write a
+        registry object: the review comment is the whole output of this path.
+        """
+        if self.judge is None or not hunks:
+            return []
+        candidates = self._review_candidates(repo, hunks)
+        if not candidates:
+            return []
+        session = f"review:{repo}#{pr_number}" if pr_number else f"review:{repo}"
+        statement = _pr_statement(pr_title, pr_body, hunks)
+        synthetic = {
+            "id": "",
+            "kind": "rule",
+            "title": pr_title or "Pull request",
+            "summary": "",
+            "body": statement,
+        }
+
+        async def _one(cand: dict) -> dict | None:
+            self._record_prompt(session, "", cand["id"])
+            try:
+                verdict = await self.judge(synthetic, cand)  # type: ignore[misc]
+            except Exception as exc:
+                logger.warning("Registry review judge failed on %s: %s", cand["id"], exc)
+                return None
+            if verdict["relation"] == "none":
+                return None
+            cand["anchors"] = self.anchors(cand["id"])
+            path, line = _hit_location(cand, hunks, repo)
+            return {
+                "relation": verdict["relation"],
+                "new_clause": verdict["new_clause"],
+                "existing_clause": verdict["existing_clause"],
+                "approved_id": cand["id"],
+                "proposal_id": self._open_proposal(cand["id"], repo, branch) or "",
+                "path": path,
+                "line": line,
+            }
+
+        results = await asyncio.gather(*(_one(c) for c in candidates))
+        return [r for r in results if r is not None]
+
+    def _review_candidates(self, repo: str, hunks: dict[str, dict]) -> list[dict]:
+        """Approved claims whose anchored symbol the diff actually touches."""
+        approved = (
+            "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement')"
+        )
+        ranked = []
+        seen: set[str] = set()
+        for oid in self.objects_on_paths(repo, list(hunks), []):
+            if oid in seen:
+                continue
+            seen.add(oid)
+            rows = self._select(f"id = ? AND {approved}", (oid,))
+            if not rows:
+                continue
+            obj = rows[0]
+            if _anchors_touched(self.anchors(obj["id"]), repo, hunks):
+                ranked.append(obj)
+        ranked.sort(key=lambda c: -c["confidence"])
+        return ranked[:MAX_CANDIDATES]
 
     # ── approval lifecycle ────────────────────────────────────────────
 
@@ -771,14 +1024,14 @@ class Registry:
             self._set_rel_status(new_id, old["id"], "supersedes", "active", actor.sub)
 
     def resolve_conflict(self, object_id: str, choice: str, actor: Actor) -> dict:
-        """A person answers keep (reject the new object) or supersede (it wins)."""
+        """A person answers keep, supersede, or defer for this proposal's session."""
         if not actor.is_human:
             raise Forbidden("resolve_conflict needs a person; an agent token cannot answer")
         obj = self.get(object_id)
         if actor.sub == obj["author"]:
             raise Forbidden("the author of a proposal cannot resolve its conflict")
-        if choice not in ("keep", "supersede"):
-            raise RegistryError("choice must be keep or supersede")
+        if choice not in ("keep", "supersede", "defer"):
+            raise RegistryError("choice must be keep, supersede, or defer")
         if obj["status"] != "proposed":
             raise RegistryError(f"{object_id} is {obj['status']}, not proposed")
         conflicts = [
@@ -786,7 +1039,16 @@ class Registry:
             for r in self.relationships(object_id, direction="out", type="conflicts_with")
             if r["status"] == "proposed"
         ]
+        if not conflicts:
+            raise RegistryError("no proposed conflict to answer")
         now = self.clock()
+        if choice == "defer":
+            # The object stays proposed and the conflict stays open for merge.
+            # The answer is recorded for this object's session only. Defer does
+            # not clear session_conflicts, so push stays blocked.
+            self._record_answer(object_id, obj["session"], "defer", actor)
+            return self.get(object_id)
+        self._record_answer(object_id, obj["session"], choice, actor)
         if choice == "keep":
             obj.update(
                 status="rejected",
@@ -914,6 +1176,7 @@ class Registry:
             "anchors": self.anchors(object_id),
             "concepts": [c["title"] for c in self._linked(object_id, "belongs_to")],
             "relationships": rels,
+            "conflicts": self.conflict_views(obj),
             "unresolved": self.unresolved(obj) if obj["status"] == "proposed" else [],
         }
 
@@ -995,7 +1258,10 @@ class Registry:
             node = rels[0]["source_id"]
             seen.add(node)
             newer.append(node)
-        return [self.get(i) for i in [*reversed(older), object_id, *newer]]
+        nodes = [self.get(i) for i in [*reversed(older), object_id, *newer]]
+        for node in nodes:
+            node["conflicts"] = self.conflict_views(node)
+        return nodes
 
     def context_for_paths(
         self,
@@ -1092,11 +1358,7 @@ class Registry:
         )
         for obj in rows:
             obj["unresolved"] = self.unresolved(obj)
-            obj["conflicts"] = [
-                r
-                for r in self.relationships(obj["id"], direction="out", type="conflicts_with")
-                if r["status"] == "proposed"
-            ]
+            obj["conflicts"] = [c for c in self.conflict_views(obj) if c["status"] == "proposed"]
         return sorted(
             rows,
             key=lambda o: (

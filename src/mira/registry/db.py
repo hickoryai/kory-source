@@ -100,6 +100,27 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS registry_anchors_path ON registry_anchors (repo, path)",
+    """
+    CREATE TABLE IF NOT EXISTS registry_conflict_answers (
+        object_id TEXT NOT NULL,
+        session TEXT NOT NULL,
+        choice TEXT NOT NULL,
+        answered_by TEXT NOT NULL DEFAULT '',
+        answered_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+        PRIMARY KEY (object_id, session)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS registry_conflict_prompts (
+        id TEXT PRIMARY KEY,
+        session TEXT NOT NULL DEFAULT '',
+        object_id TEXT NOT NULL DEFAULT '',
+        candidate_id TEXT NOT NULL DEFAULT '',
+        created_at DOUBLE PRECISION NOT NULL DEFAULT 0
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS registry_conflict_prompts_session "
+    "ON registry_conflict_prompts (session)",
 ]
 
 
