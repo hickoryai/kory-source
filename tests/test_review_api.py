@@ -766,7 +766,9 @@ async def test_executor_deadline_marks_job_failed(env):
     await executor.start()
     await asyncio.sleep(0.2)
     await executor.drain()
-    await executor.stop()
+    # stop() must return without waiting out the runner. On 3.11 a stuck
+    # poll task used to block here until the suite was killed.
+    await asyncio.wait_for(executor.stop(), timeout=2)
     final = store.get(job.id)
     assert final is not None
     assert (final.state, final.error_code) == ("failed", "deadline_exceeded")
@@ -784,7 +786,7 @@ async def test_executor_shutdown_interrupts_running_jobs(env):
     executor = ReviewExecutor(store, _settings(), _reader_factory(env["github"]), runner=forever)
     await executor.start()
     await asyncio.wait_for(started.wait(), timeout=5)
-    await executor.stop()
+    await asyncio.wait_for(executor.stop(), timeout=2)
     final = store.get(job.id)
     assert final is not None
     assert (final.state, final.error_code) == ("interrupted", "executor_shutdown")

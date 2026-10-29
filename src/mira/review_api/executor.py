@@ -97,9 +97,33 @@ class ReviewExecutor:
                 self._claim_available()
             except Exception:
                 logger.exception("review API executor poll failed")
-            self._wake.clear()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._wake.wait(), timeout=self.settings.poll_seconds)
+            await self._wait_for_work()
+
+    async def _wait_for_work(self) -> None:
+        """Wait until ``wake()`` or the poll interval, whichever is first.
+
+        ``asyncio.wait_for`` on 3.11 can resume its waiter future and then
+        leave this task unscheduled. ``Task.cancel`` treats that state as
+        "already queued" and does not wake it, so ``stop()`` waits forever
+        and the 3.11 CI job never finishes. ``asyncio.wait`` does not.
+        """
+        # No await between clear and the wait, so a concurrent wake cannot
+        # land in the gap. ``Event.wait`` returns immediately if already set.
+        self._wake.clear()
+        sleep_task = asyncio.create_task(asyncio.sleep(self.settings.poll_seconds))
+        wake_task = asyncio.create_task(self._wake.wait())
+        try:
+            await asyncio.wait({sleep_task, wake_task}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (sleep_task, wake_task):
+                if not task.done():
+                    task.cancel()
+            pending = asyncio.gather(sleep_task, wake_task, return_exceptions=True)
+            try:
+                await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                await pending
+                raise
 
     async def _heartbeat(self, job_id: str) -> None:
         interval = max(1.0, self.settings.lease_seconds / 3)
