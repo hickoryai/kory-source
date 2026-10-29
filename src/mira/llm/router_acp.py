@@ -21,11 +21,12 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   ``MIRA_ROUTER_ACP_TOKEN``, and ``MIRA_ROUTER_ACP_SESSION`` apply only when
   the matching config field is unset. ``KORY_CODE_SESSION_ID`` is not read.
 * ``attribution_key`` is a context variable the benchmark sets around one PR.
-  ``call_log`` records one entry per logical completion (review and judge).
+  ``call_log`` keeps the latest 256 logical completions (review and judge).
 
-Every logical call goes through ``hickory_common.llm_tracing.traced_llm_call``
-when ``LLM_OTLP_ENDPOINT`` is set. A missing tracer or exporter is
-``router_acp_tracing_unavailable``. Tests inject ``tracer`` and ``transport``.
+Every logical call goes through ``hickory_common.llm_tracing.traced_llm_call``.
+An unset ``LLM_OTLP_ENDPOINT``, a missing tracer, or a failed exporter raises
+``router_acp_tracing_unavailable``. ``MIRA_ROUTER_ACP_ALLOW_UNTRACED=1`` is the
+only untraced opt-out. Tests inject ``tracer`` and ``transport``.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import asyncio
 import json
 import logging
 import os
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from typing import Any, ClassVar
@@ -48,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 UNPINNED_MODELS = frozenset({"", "auto", "default", "router-default", "router-acp-default"})
 RETRYABLE_STATES = frozenset({"seat_exhausted", "workstation_outage"})
+_CALL_LOG_LIMIT = 256
 _STATE_CODE = {
     "seat_exhausted": "router_acp_seat_exhausted",
     "workstation_outage": "router_acp_workstation_outage",
@@ -101,11 +104,18 @@ def _note_span(requested: str, actual: str | None = None) -> None:
         logger.debug("router span attribute skipped", exc_info=True)
 
 
-def _shared_tracer() -> Callable[..., Awaitable[Any]] | None:
+def _untraced_allowed() -> bool:
+    return os.environ.get("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "").strip() == "1"
+
+
+def _shared_tracer() -> Callable[..., Awaitable[Any]]:
     global _tracing_ready
     endpoint = os.environ.get("LLM_OTLP_ENDPOINT", "").strip()
     if not endpoint:
-        return None
+        raise LLMError(
+            "router_acp_tracing_unavailable",
+            detail="LLM_OTLP_ENDPOINT is unset",
+        )
     try:
         setup_otlp_tracing, traced_llm_call = _import_tracing()
     except ImportError as exc:
@@ -147,7 +157,7 @@ class RouterAcpProvider:
     supports_tool_calling: bool = False
     supports_temperature: bool = False
     supports_max_tokens: bool = False
-    call_log: ClassVar[list[dict[str, Any]]] = []
+    call_log: ClassVar[deque[dict[str, Any]]] = deque(maxlen=_CALL_LOG_LIMIT)
 
     def __init__(
         self,
@@ -332,6 +342,8 @@ class RouterAcpProvider:
     def _resolve_tracer(self) -> Callable[..., Awaitable[Any]] | None:
         if self._tracer is not None:
             return self._tracer
+        if _untraced_allowed():
+            return None
         return _shared_tracer()
 
     async def _generate(self, prompt: str) -> tuple[str, dict[str, Any] | None]:

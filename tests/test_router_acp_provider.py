@@ -30,6 +30,7 @@ def _provider(transport, **kwargs) -> RouterAcpProvider:
 @pytest.fixture(autouse=True)
 def _isolate_tracing(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("LLM_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
     RouterAcpProvider.call_log.clear()
 
 
@@ -224,7 +225,43 @@ def test_config_rejects_a_public_http_relay_url():
         _config(router_acp_url="http://evil.example/relay")
 
 
+async def test_unset_trace_endpoint_is_visible(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", raising=False)
+    monkeypatch.delenv("LLM_OTLP_ENDPOINT", raising=False)
+
+    async def transport(_request):
+        raise AssertionError("relay called")
+
+    provider = _provider(transport)
+    with pytest.raises(LLMError) as raised:
+        await provider.complete([{"role": "user", "content": "review"}], json_mode=False)
+    assert raised.value.code == "router_acp_tracing_unavailable"
+
+
+async def test_untraced_opt_out_runs_the_call(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    monkeypatch.delenv("LLM_OTLP_ENDPOINT", raising=False)
+
+    async def transport(_request):
+        return {"text": "ok", "actual_model": "grok/grok-4.6", "requested_model": "auto"}
+
+    provider = RouterAcpProvider(_config(), transport=transport, sleep=_no_sleep)
+    assert await provider.complete([{"role": "user", "content": "review"}], json_mode=False) == "ok"
+
+
+def test_call_log_keeps_a_bounded_tail():
+    RouterAcpProvider.call_log.clear()
+    limit = RouterAcpProvider.call_log.maxlen
+    assert limit == 256
+    for index in range(limit + 1):
+        RouterAcpProvider.call_log.append({"n": index})
+    assert len(RouterAcpProvider.call_log) == limit
+    assert RouterAcpProvider.call_log[0]["n"] == 1
+    assert RouterAcpProvider.call_log[-1]["n"] == limit
+
+
 async def test_missing_tracer_is_visible_when_tracing_is_required(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", raising=False)
     monkeypatch.setenv("LLM_OTLP_ENDPOINT", "https://collector.example/v1/traces")
 
     def explode():

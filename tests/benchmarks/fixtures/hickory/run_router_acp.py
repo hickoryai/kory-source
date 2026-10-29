@@ -30,6 +30,8 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "tests"))
 
 os.environ.setdefault("MIRA_INDEX_DIR", "/tmp/kory-source-benchmark-indexes")
+# This run has no trace collector. A production call without the endpoint fails closed.
+os.environ["MIRA_ROUTER_ACP_ALLOW_UNTRACED"] = "1"
 
 from benchmarks import runner  # noqa: E402
 from benchmarks.judge import prf1  # noqa: E402
