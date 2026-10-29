@@ -27,6 +27,8 @@ from mira.platforms.github.webhook import (
     backfill_missing_indexes,
     dispatch_github_event,
 )
+from mira.registry import install as install_registry
+from mira.registry import observe_github
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +112,13 @@ def create_app(
             )
         )
 
+        from mira.registry import run_jobs as run_registry_jobs
+
+        registry_task = asyncio.create_task(run_registry_jobs())
+
         yield
+        if not registry_task.done():
+            registry_task.cancel()
         if backfill_task is not None and not backfill_task.done():
             backfill_task.cancel()
         if forgejo_auth is not None and not fj_task.done():
@@ -156,6 +164,7 @@ def create_app(
             )
         event = request.headers.get("X-GitHub-Event", "")
         payload: dict[str, Any] = await request.json()
+        background_tasks.add_task(observe_github, event, payload)
         status = await dispatch_github_event(event, payload, app_auth, bot_name, background_tasks)
         return _json_status(status)
 
@@ -204,6 +213,7 @@ def create_app(
     from mira.dashboard.api import register_dashboard
 
     register_dashboard(app)
+    install_registry(app)
 
     # UI dist resolution order: env override → Docker image path → repo-local.
     ui_dist_env = os.environ.get("MIRA_UI_DIST")
