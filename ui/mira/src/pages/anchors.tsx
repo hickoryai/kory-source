@@ -18,6 +18,10 @@ function indexedLabel(value: string | null): string {
   return `Indexed ${value.slice(0, 16).replace("T", " ")} UTC`
 }
 
+function countLabel(count: number, singular: string): string {
+  return `${count} ${count === 1 ? singular : `${singular}s`}`
+}
+
 export function AnchorsPage() {
   useDocumentTitle("Anchors")
   const { user } = useAuth()
@@ -73,8 +77,8 @@ export function AnchorsPage() {
                 </p>
                 <p className="text-xs text-muted-foreground">{indexedLabel(repo.last_indexed)}</p>
               </div>
-              <span className="text-sm text-muted-foreground">{repo.file_count} files</span>
-              <span className="text-sm text-muted-foreground">{repo.symbol_count} symbols</span>
+              <span className="text-sm text-muted-foreground">{countLabel(repo.file_count, "file")}</span>
+              <span className="text-sm text-muted-foreground">{countLabel(repo.symbol_count, "symbol")}</span>
               {repo.commit && (
                 <span className="font-mono text-xs text-muted-foreground">{repo.commit.slice(0, 12)}</span>
               )}
