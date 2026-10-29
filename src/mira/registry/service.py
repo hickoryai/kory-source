@@ -776,12 +776,12 @@ class Registry:
         return views
 
     def session_conflicts(self, session: str) -> dict:
-        """Whether ``session`` still holds a conflict nobody has answered for it.
+        """Whether ``session`` still blocks push on an open conflict.
 
-        An answer is stored on the proposal's own session. Another session's
-        keep, supersede, or defer does not clear this one. Defer counts as an
-        answer here; the proposal stays proposed and merge still will not
-        auto-approve it.
+        Keep and supersede clear this session. Defer leaves the conflict in
+        the list with ``answer`` ``defer`` and ``unresolved`` true, so push
+        and PR creation stay blocked while the session continues editing.
+        Another session's answer does not clear this one.
         """
         session = str(session or "").strip()
         if not session:
@@ -793,7 +793,8 @@ class Registry:
             (session,),
         )
         for obj in rows:
-            if self._answer(obj["id"], session) is not None:
+            answer = self._answer(obj["id"], session)
+            if answer is not None and answer["choice"] in ("keep", "supersede"):
                 continue
             for rel in self.relationships(obj["id"], direction="out", type="conflicts_with"):
                 if rel["status"] != "proposed":
@@ -811,7 +812,7 @@ class Registry:
                         "relation": rel["relation"],
                         "new_clause": rel["new_clause"],
                         "existing_clause": rel["existing_clause"],
-                        "answer": None,
+                        "answer": None if answer is None else answer["choice"],
                     }
                 )
         return {"session": session, "unresolved": bool(conflicts), "conflicts": conflicts}
@@ -1043,7 +1044,8 @@ class Registry:
         now = self.clock()
         if choice == "defer":
             # The object stays proposed and the conflict stays open for merge.
-            # The answer is recorded for this object's session only.
+            # The answer is recorded for this object's session only. Defer does
+            # not clear session_conflicts, so push stays blocked.
             self._record_answer(object_id, obj["session"], "defer", actor)
             return self.get(object_id)
         self._record_answer(object_id, obj["session"], choice, actor)

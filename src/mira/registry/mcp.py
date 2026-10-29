@@ -133,9 +133,10 @@ TOOLS = [
     ),
     _tool(
         "session_conflicts",
-        "Does this session hold a conflict nobody has answered for it? True until this "
-        "session's proposal is answered keep, supersede, or defer. A second session does "
-        "not inherit the answer. Call before git push or gh pr create.",
+        "Does this session hold a conflict that still blocks push? True until this "
+        "session's proposal is answered keep or supersede. Defer lets the session "
+        "continue editing, but push and gh pr create stay blocked. A second session "
+        "does not inherit the answer. Call before git push or gh pr create.",
         {"session": _STR},
         ["session"],
     ),

@@ -6,8 +6,9 @@ holds a conflict with an approved decision. This service does not install that
 hook.
 
 An answer is stored on the proposal's session. A second session does not
-inherit it. `defer` answers the session and leaves the proposal `proposed`,
-so a later merge still will not auto-approve it.
+inherit it. `defer` lets the session continue editing and leaves the
+proposal `proposed`, so a later merge still will not auto-approve it. Push
+and PR creation stay blocked until someone answers `keep` or `supersede`.
 
 ## Assumption
 
@@ -46,9 +47,10 @@ Response `structuredContent`:
 }
 ```
 
-`unresolved` is the bit the hook blocks on. It is false once this session's
-proposal has been answered `keep`, `supersede`, or `defer`. Conflicts are
-omitted once answered.
+`unresolved` is the bit the hook blocks on. It stays true after `defer`:
+the conflict remains in the list with `answer` set to `defer`. It becomes
+false only after this session's proposal is answered `keep` or `supersede`.
+Another session's answer does not clear it.
 
 HTTP, same body, dashboard session required by `/api/*` like the other
 registry reads:
@@ -74,8 +76,9 @@ POST /api/registry/objects/{id}/resolve
   `conflicts_with_approved`. The approved object stays approved.
 - `supersede`: the new object becomes `approved` and the old one
   `superseded`. `decided_by` is the person who answered.
-- `defer`: the new object stays `proposed`. The conflict stays open for
-  merge. Only this session stops reporting it as unresolved.
+- `defer`: the new object stays `proposed` and the session can continue
+  editing. Push and PR creation stay blocked until someone answers `keep`
+  or `supersede`. The conflict stays open for merge.
 
 ## Prompt counter
 

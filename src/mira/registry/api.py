@@ -149,12 +149,13 @@ def resolve(object_id: str, body: ResolveBody, request: Request) -> dict:
 
 @router.get("/session-conflicts")
 def session_conflicts(session: str) -> dict:
-    """Does this session still hold a conflict it has not answered?
+    """Does this session still hold a conflict that blocks push?
 
     The hickory-ai push hook calls this, or the MCP tool of the same name,
-    before ``git push`` / ``gh pr create``. ``unresolved`` is true until this
-    session's proposal is answered keep, supersede, or defer. Another session's
-    answer does not clear it. See ``docs/registry-conflict-gate.md``.
+    before ``git push`` / ``gh pr create``. Defer lets the session continue
+    editing, but push and PR creation stay blocked until someone answers
+    keep or supersede. Another session's answer does not clear it. See
+    ``docs/registry-conflict-gate.md``.
     """
     return _call(_reg().session_conflicts, session)
 

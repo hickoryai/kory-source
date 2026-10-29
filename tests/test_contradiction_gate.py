@@ -213,7 +213,9 @@ async def test_replay_quotes_clauses_and_answers_do_not_cross_sessions(
     deferred = await gate.put_object(_claim("sess-c", NARROW, branch="feat/c"), _agent("agent-c"))
     gate.resolve_conflict(deferred["object"]["id"], "defer", OPERATOR)
     assert gate.get(deferred["object"]["id"])["status"] == "proposed"
-    assert gate.session_conflicts("sess-c")["unresolved"] is False
+    deferred_hold = gate.session_conflicts("sess-c")
+    assert deferred_hold["unresolved"] is True
+    assert deferred_hold["conflicts"][0]["answer"] == "defer"
     assert gate.session_conflicts("sess-b")["unresolved"] is True
     view = gate.conflict_views(gate.get(deferred["object"]["id"]))[0]
     assert (view["answer"], view["answered_by"], view["session"]) == ("defer", "operator", "sess-c")
@@ -295,6 +297,25 @@ async def test_review_without_put_decision_quotes_the_pr_clause(gate: Registry, 
     assert len(seat.calls) == calls
 
 
+async def test_defer_keeps_push_blocked_until_keep_or_supersede(gate: Registry):
+    await _approve(gate)
+    first = await gate.put_object(_claim("sess-a", NARROW), _agent("agent-a"))
+    other = await gate.put_object(_claim("sess-b", NARROW, branch="feat/b"), _agent("agent-b"))
+    gate.resolve_conflict(first["object"]["id"], "defer", OPERATOR)
+
+    held = gate.session_conflicts("sess-a")
+    assert held["unresolved"] is True
+    assert held["conflicts"][0]["answer"] == "defer"
+    assert held["conflicts"][0]["object_id"] == first["object"]["id"]
+    assert gate.session_conflicts("sess-b")["unresolved"] is True
+    assert gate.session_conflicts("sess-b")["conflicts"][0]["answer"] is None
+
+    gate.resolve_conflict(first["object"]["id"], "keep", OPERATOR)
+    assert gate.session_conflicts("sess-a")["unresolved"] is False
+    assert gate.get(other["object"]["id"])["status"] == "proposed"
+    assert gate.session_conflicts("sess-b")["unresolved"] is True
+
+
 async def test_deferred_merge_does_not_auto_approve(gate: Registry):
     await _approve(gate)
     out = await gate.put_object(_claim("sess-a", NARROW), _agent("agent-a"))
@@ -303,7 +324,9 @@ async def test_deferred_merge_does_not_auto_approve(gate: Registry):
     stored = gate.get(out["object"]["id"])
     assert stored["status"] == "proposed"
     assert stored["realization"] == "merged_with_conflict"
-    assert gate.session_conflicts("sess-a")["unresolved"] is False
+    held = gate.session_conflicts("sess-a")
+    assert held["unresolved"] is True
+    assert held["conflicts"][0]["answer"] == "defer"
 
 
 async def test_http_and_mcp_session_query(gate: Registry):
