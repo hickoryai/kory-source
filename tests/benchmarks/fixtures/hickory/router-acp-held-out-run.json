@@ -1,0 +1,852 @@
+{
+  "label": "hickory-router-acp-held-out",
+  "git_sha": "5bf967e",
+  "timestamp": "20261029-160000",
+  "source": "hickory",
+  "judge_model": "auto",
+  "config": {
+    "llm": {
+      "model": "auto",
+      "fallback_model": null,
+      "indexing_model": null,
+      "review_model": null,
+      "security_model": null,
+      "review_reasoning_effort": null,
+      "reasoning_effort": null,
+      "temperature": 0.0,
+      "max_tokens": 4096,
+      "max_context_tokens": 120000,
+      "provider": "router-acp",
+      "api_style": "chat",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "region": "us-east-1",
+      "aws_profile": null,
+      "max_retries": 3,
+      "request_timeout": 120,
+      "retry_min_wait": 2,
+      "retry_max_wait": 30,
+      "codex_command": "codex",
+      "codex_home": null,
+      "codex_sandbox": "read-only",
+      "codex_timeout_seconds": 900,
+      "router_acp_url": "http://127.0.0.1:8799",
+      "router_acp_token": "",
+      "router_acp_session": null,
+      "router_acp_timeout_seconds": 900,
+      "router_acp_max_retries": 2,
+      "router_acp_priority": "review"
+    },
+    "filter": {
+      "confidence_threshold": 0.7,
+      "category_confidence_thresholds": {},
+      "max_comments": 5,
+      "min_severity": "nitpick",
+      "exclude_patterns": [
+        "*.lock",
+        "*.lockb",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "Pipfile.lock",
+        "poetry.lock",
+        "go.sum",
+        "*.min.js",
+        "*.min.css",
+        "*.map",
+        "*.svg",
+        "*.png",
+        "*.jpg",
+        "*.jpeg",
+        "*.gif",
+        "*.ico",
+        "*.woff",
+        "*.woff2",
+        "*.ttf",
+        "*.eot",
+        "*.pdf",
+        "*.zip",
+        "*.tar.gz"
+      ],
+      "exclude_deleted": true,
+      "max_files": 50,
+      "allowed_authors": [],
+      "blocked_authors": []
+    },
+    "commands": {
+      "allowed_users": [],
+      "allow_repo_write_access": true,
+      "blocked_users": [],
+      "review": null,
+      "review_rest": null,
+      "help": null,
+      "pause": null,
+      "resume": null,
+      "reject": null,
+      "ask": null
+    },
+    "review": {
+      "context_lines": 3,
+      "max_diff_size": 250000,
+      "max_file_size": 50000,
+      "max_chunks_per_review": 5,
+      "include_summary": true,
+      "focus_only_on_problems": false,
+      "walkthrough": true,
+      "walkthrough_sequence_diagram": true,
+      "pr_summary": "disable",
+      "code_context": true,
+      "context_token_budget": 8000,
+      "max_concurrent_chunks": 5,
+      "ensemble_runs": 1,
+      "ensemble_temperature": 0.3,
+      "self_critique": true,
+      "security_pass": true,
+      "security_agentic": true,
+      "osv_scan": true,
+      "secrets_scan": true,
+      "agentic_tools": true,
+      "jit_java_go": true,
+      "blast_radius": true,
+      "dependency_overlap": true,
+      "overlap": {
+        "enabled": true,
+        "max_candidates": 20,
+        "confidence_floor": 0.6,
+        "title_similarity_threshold": 0.4
+      },
+      "auto_resolve_conversations": true,
+      "review_on_synchronize": true
+    },
+    "index": {
+      "llm_concurrency": 8,
+      "max_file_size": 1048576
+    },
+    "provider": {
+      "type": "github"
+    },
+    "database": {
+      "url": "",
+      "admin_password": ""
+    }
+  },
+  "scores": {
+    "overall": {
+      "tp": 1,
+      "fp": 10,
+      "fn": 42,
+      "precision": 0.0909,
+      "recall": 0.0233,
+      "f1": 3.7,
+      "prs": 10
+    },
+    "by_language": {
+      "mixed": {
+        "tp": 1,
+        "fp": 10,
+        "fn": 42,
+        "precision": 0.0909,
+        "recall": 0.0233,
+        "f1": 3.7,
+        "prs": 10
+      }
+    },
+    "by_source": {
+      "hickory": {
+        "tp": 1,
+        "fp": 10,
+        "fn": 42,
+        "precision": 0.0909,
+        "recall": 0.0233,
+        "f1": 3.7,
+        "prs": 10
+      }
+    }
+  },
+  "median_duration_s": 75.9,
+  "prs": [
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11940",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 36.3,
+      "tokens": 13063,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11932",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 3,
+      "fn": 7,
+      "matched": {},
+      "missed": [
+        "hickory-11932-1",
+        "hickory-11932-2",
+        "hickory-11932-3",
+        "hickory-11932-4",
+        "hickory-11932-5",
+        "hickory-11932-6",
+        "hickory-11932-7"
+      ],
+      "fp_indices": [
+        0,
+        1,
+        2
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": ".github/workflows/build.yml",
+          "line": 3317,
+          "severity": "WARNING",
+          "category": "security",
+          "title": "Run the trigger from the trusted base revision",
+          "body": "This executes `authz_gauntlet_trigger.py` from the PR merge tree. A PR can modify that script to emit `fired=false`, leaving the required trigger job green while the blocking checks job is skipped and therefore satisfies `ci-gate`. The panel workflow already avoids this bypass by extracting the trigger from `HEAD^1`; this job needs the same trust boundary.",
+          "confidence": 0.99,
+          "source_pass": "main"
+        },
+        {
+          "path": ".github/workflows/build.yml",
+          "line": 3352,
+          "severity": "WARNING",
+          "category": "security",
+          "title": "Do not run the blocking checker from PR head",
+          "body": "The migration gate executes `authz_gauntlet_checks.py` from the untrusted PR tree. A PR can replace this script with an unconditional successful exit, so unsafe migrations pass the only blocking static checks. Extract the checker from `HEAD^1` into a trusted temporary directory and use that copy for both `caps-delta` and `migrations`.",
+          "confidence": 0.98,
+          "source_pass": "main"
+        },
+        {
+          "path": ".github/scripts/authz_gauntlet_panel_comment.py",
+          "line": 39,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Reject incomplete lens results instead of reporting merge",
+          "body": "`_valid` accepts any object containing a list of dictionaries, even if `lens` or `verdict` is absent or invalid. `render` then treats every verdict other than exactly `fix-first` as `merge`; consequently a truncated response such as `{\"findings\": []}` is displayed as a clean merge rather than \u201cdid not report,\u201d contradicting the workflow's fail-closed reporting contract. Validate the complete schema, match the embedded lens ID to the requested artifact, and reject inconsistent verdict/severity combinations.",
+          "confidence": 0.97,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 3
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        },
+        {
+          "stage": "noise_filter",
+          "path": ".github/workflows/authz-gauntlet-panel.yml",
+          "line": 274,
+          "title": "\"Read-only\" lens agent can write files via `git log/diff/show --output=`, then t",
+          "severity": "WARNING",
+          "category": "security",
+          "confidence": 0.5,
+          "reason": ""
+        }
+      ],
+      "duration_s": 379.4,
+      "tokens": 66573,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11937",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11937-1"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 82.3,
+      "tokens": 35209,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11929",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [
+        0
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "data-platform/processors/canonical-resolution/tests/test_writeback_evaluator.py",
+          "line": 13061,
+          "severity": "WARNING",
+          "category": "maintainability",
+          "title": "Renamed test still only checks the off side of the Field-Lead gate",
+          "body": "The test was renamed from `test_a_sales_lead_tag_alone_does_not_mint` to `test_a_sales_lead_tag_mints_only_on_the_field_lead_list`, and the PR description says it \"pins both sides of the env gate for mde.\" The body did not change, though. It still runs only under `_flag_on(tenant=\"bellmech\")`, where mde is not on the list, and asserts `rows == []`. No case puts `mde` on `FIELD_LEAD_WRITEBACK_TENANTS` and asserts that a Sales Lead tagged job mints a deal. That is the behavior this PR turns on in prod. So the new name and the class docstring ('A Sales Lead tag mints only while mde is on the Terraform Field-Lead list') claim coverage the test does not have. A regression that stopped mde tagged jobs from minting after the Terraform change would still pass this test.",
+          "confidence": 0.82,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 44.0,
+      "tokens": 16190,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11862",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 3,
+      "fn": 11,
+      "matched": {},
+      "missed": [
+        "hickory-11862-1",
+        "hickory-11862-2",
+        "hickory-11862-3",
+        "hickory-11862-4",
+        "hickory-11862-5",
+        "hickory-11862-6",
+        "hickory-11862-7",
+        "hickory-11862-8",
+        "hickory-11862-9",
+        "hickory-11862-10",
+        "hickory-11862-11"
+      ],
+      "fp_indices": [
+        0,
+        1,
+        2
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "hickory-ui/backend/app/jobs/ccc_open_items.py",
+          "line": 40,
+          "severity": "BLOCKER",
+          "category": "bug",
+          "title": "The initial refresh cannot feed older contacts to cleanup",
+          "body": "The cleanup only considers rows in `processed.ccc_open_items`, but this default refresh excludes every contact older than 365 days. Consequently, those contacts are neither dismissed by the one-time 90-day cleanup nor shown by the worklist afterward, contradicting the stated full-history behavior. The first pre-cleanup refresh must cover the complete contact history; the bounded nightly horizon can only be used after that backlog has been closed.",
+          "confidence": 0.99,
+          "source_pass": "main"
+        },
+        {
+          "path": "hickory-ui/backend/app/services/ccc_worklist.py",
+          "line": 2789,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Filtered-out open contacts still suppress lead rows",
+          "body": "`open_links` contains every linked contact from the nightly table, and this union happens before applying the contact arm's date, channel, category, type, episode, or persona-view filters. A linked old contact can therefore suppress its candidate row even when that contact does not render. For example, a contact from 40 days ago linked to a lead from 10 days ago makes a custom 14-day query return neither row: the contact fails `date_from`, while its unfiltered link removes the in-range lead.",
+          "confidence": 0.94,
+          "source_pass": "main"
+        },
+        {
+          "path": "scripts/cleanup_ccc_backlog.py",
+          "line": 84,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "One fresh brand masks stale brands in the cleanup guard",
+          "body": "Freshness is computed with one `max(computed_at)` across all requested tenants. If any tenant was refreshed recently, `fresh` becomes true even when another requested tenant still has stale rows, so `--apply` can dismiss records using that tenant's obsolete snapshot. Validate freshness independently for every requested tenant, or store and validate refresh-run metadata that also represents a successfully refreshed tenant with zero open rows.",
+          "confidence": 0.9,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 3
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 168.1,
+      "tokens": 139298,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11935",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 1,
+      "matched": {},
+      "missed": [
+        "hickory-11935-1"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 31.3,
+      "tokens": 13060,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11919",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "matched": {},
+      "missed": [],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 43.5,
+      "tokens": 22935,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11927",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 0,
+      "fn": 5,
+      "matched": {},
+      "missed": [
+        "hickory-11927-1",
+        "hickory-11927-2",
+        "hickory-11927-3",
+        "hickory-11927-4",
+        "hickory-11927-5"
+      ],
+      "fp_indices": [],
+      "reasons": {},
+      "comments": [],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 70.6,
+      "tokens": 40507,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11912",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 1,
+      "fp": 2,
+      "fn": 15,
+      "matched": {
+        "hickory-11912-13": 0
+      },
+      "missed": [
+        "hickory-11912-1",
+        "hickory-11912-2",
+        "hickory-11912-3",
+        "hickory-11912-4",
+        "hickory-11912-5",
+        "hickory-11912-6",
+        "hickory-11912-7",
+        "hickory-11912-8",
+        "hickory-11912-9",
+        "hickory-11912-10",
+        "hickory-11912-11",
+        "hickory-11912-12",
+        "hickory-11912-14",
+        "hickory-11912-15",
+        "hickory-11912-16"
+      ],
+      "fp_indices": [
+        1,
+        2
+      ],
+      "reasons": {
+        "hickory-11912-13": "Both flag that add_proposal at lifecycle.py:818 validates too loosely, so it saves proposals owners can't apply."
+      },
+      "comments": [
+        {
+          "path": "hickory-ui/backend/app/services/finance/revops/lifecycle.py",
+          "line": 818,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Validate proposals against the target item",
+          "body": "`_parse_params` only validates against the catalog-wide action and disposition union. Unlike `apply_action`, this path never calls `_state_failure`, so it records proposals that cannot be applied\u2014for example, `billed` for a Close KPI whose dispositions are only `reassigned` and `not_cogs`, or an action invalid for the item's current state. Load the item and run the same KPI/state validation before adding the event.",
+          "confidence": 0.98,
+          "source_pass": "main"
+        },
+        {
+          "path": "hickory-ui/backend/app/api/endpoints/finance/close_tasks.py",
+          "line": 538,
+          "severity": "WARNING",
+          "category": "race-condition",
+          "title": "Serialize creation of new RACI rows",
+          "body": "`FOR UPDATE` locks an existing row, but it locks nothing when this RACI key does not exist. Two concurrent updates can both read `old = None`; the second upsert then overwrites the first while its audit row still records a transition from `None`, corrupting the append-only RACI history. Acquire a transaction-scoped lock for the complete RACI key before reading and upserting, or perform the old-value capture and write atomically.",
+          "confidence": 0.96,
+          "source_pass": "main"
+        },
+        {
+          "path": "hickory-ui/backend/app/api/endpoints/finance/close_tasks.py",
+          "line": 80,
+          "severity": "WARNING",
+          "category": "security",
+          "title": "Enforce the payroll wall per tenant",
+          "body": "`payroll.read` is tenant-scoped, but this collapses the assignee's access across every tenant into one boolean that is then reused for every task. A user with mixed payroll access cannot be evaluated correctly: the same result governs both payroll-authorized and unauthorized brands. Track payroll-enabled tenant IDs and check the specific task or RACI tenant when viewing or assigning pay-carrying work.",
+          "confidence": 0.92,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 3
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        },
+        {
+          "stage": "noise_filter",
+          "path": "hickory-ui/backend/app/api/endpoints/finance/close_tasks.py",
+          "line": 81,
+          "title": "Payroll wall checks payroll.read in any tenant, not the task's brand",
+          "severity": "WARNING",
+          "category": "security",
+          "confidence": 0.5,
+          "reason": ""
+        }
+      ],
+      "duration_s": 238.8,
+      "tokens": 107093,
+      "error": null
+    },
+    {
+      "pr_url": "https://github.com/hickoryai/hickory-ai/pull/11926",
+      "language": "mixed",
+      "source": "hickory",
+      "tp": 0,
+      "fp": 1,
+      "fn": 2,
+      "matched": {},
+      "missed": [
+        "hickory-11926-1",
+        "hickory-11926-2"
+      ],
+      "fp_indices": [
+        0
+      ],
+      "reasons": {},
+      "comments": [
+        {
+          "path": "hickory-ui/frontend/src/components/drips/drafts-inbox.tsx",
+          "line": 789,
+          "severity": "WARNING",
+          "category": "bug",
+          "title": "Saving any edit sends `cc`, which overwrites the rep's CCs on later touches",
+          "body": "`save()` always sends `cc`. When the rep hasn't touched the CC box, that value is `savedCc`, this touch's own list. In `drip_actions.edit_touch`, a non-None `cc` replaces the rep-added addresses on touch `n` and on every later email touch from the same sender (`x[\"n\"] in mine and x[\"n\"] >= n`). Example: the rep adds `pm@x.com` on touch 3 only, then fixes a typo in touch 2's body. The PUT carries touch 2's `cc` (`[]`), and touch 3's `pm@x.com` is silently removed. The PR says an omitted `cc` means unchanged, but the frontend never omits it. Send `cc` only when the CC list actually changed, so body and subject edits leave later touches' copies alone.",
+          "confidence": 0.8,
+          "source_pass": "main"
+        }
+      ],
+      "audit": [
+        {
+          "stage": "agentic",
+          "chunk": 0,
+          "calls": []
+        },
+        {
+          "stage": "drafted",
+          "chunk": 0,
+          "count": 1
+        },
+        {
+          "stage": "drafted",
+          "chunk": "security",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "dependency",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "osv",
+          "count": 0
+        },
+        {
+          "stage": "drafted",
+          "chunk": "secrets",
+          "count": 0
+        }
+      ],
+      "duration_s": 75.9,
+      "tokens": 32560,
+      "error": null
+    }
+  ]
+}

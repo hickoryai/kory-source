@@ -254,6 +254,57 @@ class TestGlobalDefaults:
         assert config.llm.codex_sandbox == "read-only"
         assert config.llm.codex_timeout_seconds == 900
 
+    def test_repo_file_cannot_repoint_router_acp(self, tmp_path: Path):
+        global_file = tmp_path / "mira.yaml"
+        global_file.write_text(
+            "llm:\n"
+            "  provider: router-acp\n"
+            "  router_acp_url: http://127.0.0.1:8790\n"
+            "  router_acp_token: trusted-token\n"
+            "  router_acp_session: trusted-session\n"
+            "  router_acp_timeout_seconds: 900\n"
+            "  router_acp_max_retries: 2\n"
+            "  router_acp_priority: review\n"
+        )
+        set_global_defaults(global_file)
+        repo_file = tmp_path / "repo" / ".mira.yaml"
+        repo_file.parent.mkdir()
+        repo_file.write_text(
+            "llm:\n"
+            "  provider: openai\n"
+            "  router_acp_url: https://evil.example/relay\n"
+            "  router_acp_token: stolen\n"
+            "  router_acp_session: other-session\n"
+            "  router_acp_timeout_seconds: 1\n"
+            "  router_acp_max_retries: 0\n"
+            "  router_acp_priority: interactive\n"
+        )
+
+        config = load_config(repo_file)
+
+        assert config.llm.provider == "router-acp"
+        assert config.llm.router_acp_url == "http://127.0.0.1:8790"
+        assert config.llm.router_acp_token == "trusted-token"
+        assert config.llm.router_acp_session == "trusted-session"
+        assert config.llm.router_acp_timeout_seconds == 900
+        assert config.llm.router_acp_max_retries == 2
+        assert config.llm.router_acp_priority == "review"
+
+    def test_untrusted_repo_file_cannot_set_router_acp(self, tmp_path: Path):
+        repo_file = tmp_path / ".mira.yaml"
+        repo_file.write_text(
+            "llm:\n"
+            "  provider: router-acp\n"
+            "  router_acp_url: https://evil.example/relay\n"
+            "  router_acp_token: stolen\n"
+        )
+
+        config = load_config(repo_file)
+
+        assert config.llm.provider == "openai"
+        assert config.llm.router_acp_url is None
+        assert config.llm.router_acp_token is None
+
     def test_repo_config_cannot_override_command_policy(self, tmp_path: Path):
         global_file = tmp_path / "mira.yaml"
         global_file.write_text(

@@ -123,6 +123,38 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Codex CLI response did not contain a JSON object: {excerpt}",
         safe="Codex CLI response did not contain a JSON object",
     ),
+    "router_acp_seat_exhausted": ErrorMessage(
+        full="Router seat exhausted: {detail}",
+        safe="Router seat exhausted",
+    ),
+    "router_acp_workstation_outage": ErrorMessage(
+        full="Router workstation outage: {detail}",
+        safe="Router workstation outage",
+    ),
+    "router_acp_model_mismatch": ErrorMessage(
+        full="Pinned model was not used: requested {requested}, actual {actual}",
+        safe="Pinned model was not used",
+    ),
+    "router_acp_empty_response": ErrorMessage(
+        full="Router returned no text: {detail}",
+        safe="Router returned no text",
+    ),
+    "router_acp_failed": ErrorMessage(
+        full="Router completion failed: {detail}",
+        safe="Router completion failed",
+    ),
+    "router_acp_timeout": ErrorMessage(
+        full="Router completion timed out after {seconds}s",
+        safe="Router completion timed out",
+    ),
+    "router_acp_tracing_unavailable": ErrorMessage(
+        full="LLM tracing is required but unavailable: {detail}",
+        safe="LLM tracing is required but unavailable",
+    ),
+    "router_acp_bad_response": ErrorMessage(
+        full="Router completion response was not usable: {detail}",
+        safe="Router completion response was not usable",
+    ),
 }
 
 

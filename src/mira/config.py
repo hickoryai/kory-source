@@ -84,6 +84,15 @@ class LLMConfig(BaseModel):
     codex_home: str | None = None
     codex_sandbox: Literal["read-only"] = "read-only"
     codex_timeout_seconds: int = Field(default=900, gt=0)
+    # Router-acp seat provider. None means unset: the provider may read
+    # MIRA_ROUTER_ACP_URL / _TOKEN / _SESSION. A repository file cannot set
+    # these; see _DEPLOYMENT_ONLY_LLM_KEYS.
+    router_acp_url: str | None = None
+    router_acp_token: str | None = None
+    router_acp_session: str | None = None
+    router_acp_timeout_seconds: int = Field(default=900, gt=0)
+    router_acp_max_retries: int = Field(default=2, ge=0)
+    router_acp_priority: Literal["review", "interactive"] = "review"
 
     @field_validator("base_url")
     @classmethod
@@ -96,6 +105,21 @@ class LLMConfig(BaseModel):
                 f"llm.base_url {v!r} uses plain http to a public host — use https "
                 "(http is allowed only for localhost, private IPs, and dotless "
                 "hostnames like docker-compose services)"
+            )
+        return v
+
+    @field_validator("router_acp_url")
+    @classmethod
+    def _validate_router_acp_url(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError(f"llm.router_acp_url must be an http(s) URL, got {v!r}")
+        if parsed.scheme == "http" and not _is_local_host(parsed.hostname):
+            raise ValueError(
+                f"llm.router_acp_url {v!r} uses plain http to a public host — use https "
+                "(http is allowed only for localhost, private IPs, and dotless hostnames)"
             )
         return v
 
@@ -386,6 +410,12 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
         "codex_home",
         "codex_sandbox",
         "codex_timeout_seconds",
+        "router_acp_url",
+        "router_acp_token",
+        "router_acp_session",
+        "router_acp_timeout_seconds",
+        "router_acp_max_retries",
+        "router_acp_priority",
     }
 )
 
