@@ -41,9 +41,27 @@ At the task head, the only fork-authored files are:
 - `tests/benchmarks/fixtures/hickory/run_baseline.py`.
 
 There are no fork-owned divergent files under `src/`, `tests/` outside that
-fixture directory, or `ui/`. The seven fixture files account for 8,730
-insertions under the drift command's path scope; `FORK.md` is outside that
-scope.
+fixture directory, or `ui/` at the baseline snapshot above. The seven fixture
+files account for 8,730 insertions under the drift command's path scope;
+`FORK.md` is outside that scope.
+
+The router-acp seat provider adds these fork-owned files and edits. They are
+the intentional delta after the baseline snapshot:
+
+- `src/mira/llm/router_acp.py` (new provider; prompt in, string out);
+- `src/mira/llm/__init__.py` (factory alias `router-acp` / `router_acp`);
+- `src/mira/config.py` (deployment-only relay URL, token, session, timeout,
+  retries, and priority);
+- `src/mira/error_messages.py` (visible seat, outage, mismatch, empty,
+  timeout, tracing, and bad-response codes);
+- `src/mira/dashboard/model_catalog.py` and `src/mira/llm/models.json`
+  (`router-default`, no provider-key fetch);
+- `tests/test_router_acp_provider.py`;
+- `tests/test_config.py` (a repository file cannot retarget the relay);
+- `tests/benchmarks/fixtures/hickory/run_router_acp.py`.
+
+`src/mira/core/engine.py` is unchanged. Ensemble stays off because the
+provider reports `supports_temperature = false`. Tool calling stays off.
 
 Measure source drift with:
 

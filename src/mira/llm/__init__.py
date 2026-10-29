@@ -21,6 +21,11 @@ def create_llm(config: LLMConfig) -> LLMProviderProtocol:
 
         return CodexCLIProvider(config)
 
+    if config.provider in {"router-acp", "router_acp"}:
+        from mira.llm.router_acp import RouterAcpProvider
+
+        return RouterAcpProvider(config)
+
     if config.api_style == "responses":
         from mira.llm.responses import ResponsesProvider
 
