@@ -253,12 +253,16 @@ have no edits.
 
 Upstream files touched, and why:
 
-- `src/mira/core/engine.py` (18 lines): puts the approved-registry block at
+- `src/mira/core/engine.py`: puts the approved-registry block at
   `custom_rules[0]`, wraps the main review's agentic executor so it can
   answer `search_decisions`, and adds `search_decisions` to
-  `AGENTIC_TOOLS`. The security pass keeps a plain executor (an upstream
-  test asserts its type). If that pass calls the tool, it gets an
-  `unknown tool` reply.
+  `AGENTIC_TOOLS`. HAI-12196 calls `apply_registry` from that same block.
+  The call inserts the block and stashes contradiction findings, which the
+  engine prepends after critique so the noise filter cannot drop the
+  blocker. The security pass keeps a plain executor (an upstream test
+  asserts its type). If that pass calls the tool, it gets an
+  `unknown tool` reply. The fork-delta cap is `engine.py` < 46 against
+  `567ed7e`; the measured total is 45.
 - `src/mira/platforms/server.py` (10 lines): `install_registry(app)`
   (mounts `/api/registry` and `/mcp`), `observe_github` on every GitHub
   webhook as a background task, and the hourly registry job in the
@@ -273,13 +277,19 @@ These files are new and fork-owned:
   or `$MIRA_INDEX_DIR/registry.db`), `model.py` (vocabulary and
   confidence), `service.py` (lifecycle, realization, conflicts, work,
   evidence, import), `conflicts.py` (seat judge), `learned.py` (read-only
-  learned-rule mirror), `prompt.py`, `realization.py`, `auth.py`
-  (registry JWT), `mcp.py`, and `api.py`.
+  learned-rule mirror), `prompt.py`, `review_gate.py` (review-time
+  contradiction findings; they are comments only and do not write a
+  registry object), `realization.py`, `auth.py` (registry JWT), `mcp.py`,
+  and `api.py`.
 - `ui/mira/src/pages/registry.tsx` and `ui/mira/src/lib/api/registry.ts`.
-- `tests/test_decision_registry.py`. It also asserts the `engine.py` (<47)
-  and `server.py` (<25) caps against the fork base. The engine cap moved
-  from 40 to 47 when HAI-12286 added `review_snapshot` (28 lines) beside
-  the registry block (18 lines); the measured total is 46.
+- `docs/registry-conflict-gate.md` (the client contract the hickory-ai
+  push hook calls).
+- `tests/test_decision_registry.py` and `tests/test_contradiction_gate.py`.
+  The registry test asserts the `engine.py` (<46) and `server.py` (<25)
+  caps against the fork base. The engine cap moved from 40 to 47 when
+  HAI-12286 added `review_snapshot` (28 lines) beside the registry block.
+  HAI-12196 fits the contradiction check into that block; the measured
+  total is 45, so the cap is the next integer, 46.
 
 MCP is streamable HTTP at `POST /mcp` and returns JSON responses with no
 SSE. Bearer JWT claims are `kind` (human|agent), `sub`, `model` (required
