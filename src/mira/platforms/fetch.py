@@ -113,6 +113,20 @@ class GitHubRepoFetcher:
             logger.warning("Failed to fetch default branch for %s/%s: %s", owner, repo, exc)
             return "main"
 
+    async def head_commit(self, owner: str, repo: str, ref: str) -> str:
+        """Return the commit SHA at ref, or '' when GitHub cannot answer."""
+        url = f"{self._api}/repos/{owner}/{repo}/commits/{ref}"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers=self._headers(), timeout=15)
+                if resp.status_code == 404:
+                    return ""
+                resp.raise_for_status()
+                return str(resp.json().get("sha", "") or "")
+        except Exception as exc:
+            logger.warning("Failed to fetch head commit for %s/%s: %s", owner, repo, exc)
+            return ""
+
     async def repo_tree(self, owner: str, repo: str, branch: str) -> list[str]:
         url = f"{self._api}/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
         async with httpx.AsyncClient() as client:

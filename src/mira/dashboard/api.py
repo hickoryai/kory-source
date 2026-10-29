@@ -179,6 +179,37 @@ class RelationshipsResponse(BaseModel):
     groups: list[RepoGroupModel]
 
 
+class AnchorModel(BaseModel):
+    id: str
+    owner: str
+    repo: str
+    symbol_kind: str = ""
+    qualified_name: str
+    path: str
+    resolution_status: str
+    last_resolved_commit: str = ""
+    proposal_path: str = ""
+    proposal_qualified_name: str = ""
+    proposal_score: float = 0
+    proposal_reason: str = ""
+
+
+class RepoFreshnessModel(BaseModel):
+    owner: str
+    repo: str
+    last_indexed: str | None = None
+    commit: str = ""
+    file_count: int = 0
+    symbol_count: int = 0
+    pending_count: int = 0
+    dangling_count: int = 0
+
+
+class AnchorsResponse(BaseModel):
+    repos: list[RepoFreshnessModel]
+    anchors: list[AnchorModel]
+
+
 class RelatedRepoModel(BaseModel):
     repo: str
     relationship_type: str
@@ -1293,6 +1324,7 @@ class TimeSeriesPoint(BaseModel):
 # isort: off
 import mira.dashboard.routers.admin  # noqa: E402,F401
 import mira.dashboard.routers.core  # noqa: E402,F401
+import mira.dashboard.routers.anchors  # noqa: E402,F401
 import mira.dashboard.routers.relationships  # noqa: E402,F401
 import mira.dashboard.routers.rules  # noqa: E402,F401
 import mira.dashboard.routers.vulnerabilities  # noqa: E402,F401

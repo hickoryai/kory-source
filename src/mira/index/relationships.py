@@ -53,6 +53,27 @@ _TERRAFORM_SOURCE = re.compile(r"github\.com/([^/]+/[^/\s?]+)(?://|$)")
 _GITLAB_URL = re.compile(r"gitlab\.com/([^/]+/[^/\s#?]+)")
 _GITLAB_SSH = re.compile(r"git@gitlab\.com:([^/]+/[^/\s.]+)")
 
+
+def github_repo_mentions(text: str, *, limit: int = 20) -> list[str]:
+    """Return owner/repo pairs mentioned as github.com URLs.
+
+    The cap keeps one generated file from attaching an unbounded ref list.
+    """
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for match in _GITHUB_URL.finditer(text):
+        repo = match.group(1).rstrip("/").removesuffix(".git")
+        if repo in seen:
+            continue
+        seen.add(repo)
+        found.append(repo)
+        if len(found) >= limit:
+            break
+    return found
+
+
 # Words to ignore when comparing summaries for domain overlap
 _STOP_WORDS = {
     "the",

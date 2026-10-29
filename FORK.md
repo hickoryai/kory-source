@@ -146,3 +146,39 @@ The baseline smoke check used `GET http://127.0.0.1:8765/health` and received
 5. After review and merge, update the fixture/baseline only when the monthly
    benchmark policy calls for it; do not expose golden comments to reviewer
    prompts or configuration.
+
+## Symbol anchors and the indexer
+
+The fork keeps Mira's index and adds rename-safe anchors on top of it. These
+files are the intentional delta. Extractor changes are general (qualified
+Python methods, TypeScript methods, interfaces, type aliases, enums, and
+`export default function`) and should be offered upstream.
+
+- `src/mira/index/fingerprint.py`
+- `src/mira/index/anchor_model.py`
+- `src/mira/index/anchor_rows.py`
+- `src/mira/index/anchors.py`
+- `src/mira/index/symbols.py`
+- `src/mira/index/local.py`
+- `src/mira/index/extract.py` (qualified names and TypeScript declarations)
+- `src/mira/index/store.py` and `src/mira/index/pg_store.py` (fingerprint columns, `symbol_anchors`, `index_runs`)
+- `src/mira/index/indexer.py` (resolve anchors at the end of every index run)
+- `src/mira/index/relationships.py` (`github_repo_mentions`)
+- `src/mira/platforms/fetch.py` (`head_commit`)
+- `src/mira/cli.py` (`mira index-repos`)
+- `src/mira/dashboard/api.py` and `src/mira/dashboard/routers/anchors.py`
+- `ui/mira/src/pages/anchors.tsx` and the anchors API client
+- `tests/test_symbol_anchors.py`
+
+`mira index-repos` is the Cloud Run job command. It reads `DATABASE_URL`.
+The database login is IAM: the Cloud SQL Auth Proxy runs with
+`--auto-iam-authn`, and the URL has no password. The service account is
+`kory-source-{env}`. A workstation uses `kory-source-indexer-{env}` and
+passes `owner/repo=/checkout` so `git diff -M` can see renames. The workstation indexes tracked files only, so caches and virtualenvs on disk stay out of the graph. The image
+does not contain git, so the Cloud Run job resolves anchors by path and by
+fingerprint only.
+
+The relink step is a `RelinkProposer`. The default records a pending
+proposal from body similarity and does not call a model. A later provider
+can implement the same interface. Pending and dangling rows stay in
+`symbol_anchors` until a person confirms or retires them.

@@ -1,5 +1,6 @@
 import {
   Activity,
+  Anchor,
   BookOpen,
   Brain,
   ChevronRight,
@@ -76,6 +77,7 @@ const navItems = [
   { to: "/packages", icon: Package, label: "Packages" },
   { to: "/vulnerabilities", icon: ShieldAlert, label: "Vulnerabilities" },
   { to: "/relationships", icon: GitFork, label: "Relationships" },
+  { to: "/anchors", icon: Anchor, label: "Anchors" },
   { to: "/rules", icon: BookOpen, label: "Rules" },
   { to: "/learnings", icon: Brain, label: "Learnings" },
   { to: "/users", icon: Users, label: "Users", adminOnly: true },
@@ -96,6 +98,7 @@ const PAGE_LABELS: Record<string, string> = {
   packages: "Packages",
   vulnerabilities: "Vulnerabilities",
   relationships: "Relationships",
+  anchors: "Anchors",
   rules: "Rules",
   learnings: "Learnings",
   settings: "Settings",

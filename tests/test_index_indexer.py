@@ -45,6 +45,14 @@ class TestShouldIndex:
     def test_node_modules(self):
         assert _should_index("node_modules/pkg/index.js") is False
 
+    def test_nested_node_modules(self):
+        assert _should_index("pkg/node_modules/dep/index.js") is False
+
+    def test_virtualenv(self):
+        assert _should_index(".venv/lib/pkg.py") is False
+        assert _should_index("services/api/.venv/lib/pkg.py") is False
+        assert _should_index("venv/lib/pkg.py") is False
+
     def test_vendor(self):
         assert _should_index("vendor/lib/main.go") is False
 

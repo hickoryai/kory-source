@@ -40,12 +40,20 @@ _PY_CLASS = re.compile(r"^(\s*)class\s+(\w+)")
 _PY_DECORATOR = re.compile(r"^\s*@")
 
 # JS/TS patterns
-_JS_FUNCTION = re.compile(r"^(\s*)(?:export\s+)?(?:async\s+)?function\s+(\w+)")
+_JS_FUNCTION = re.compile(r"^(\s*)(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\*?\s+(\w+)")
 _JS_ARROW = re.compile(
-    r"^(\s*)(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?(?:\([^)]*\)|[^=])\s*=>"
+    r"^(\s*)(?:export\s+)?(?:const|let|var)\s+(\w+)\s*(?::[^=]+)?=\s*(?:async\s+)?"
+    r"(?:\([^)]*\)|\w+)\s*(?::\s*[^=]+)?=>"
 )
 _JS_CLASS = re.compile(r"^(\s*)(?:export\s+)?(?:default\s+)?class\s+(\w+)")
-_JS_METHOD = re.compile(r"^(\s*)(?:async\s+)?(\w+)\s*\([^)]*\)\s*\{")
+_JS_INTERFACE = re.compile(r"^(\s*)(?:export\s+)?(?:default\s+)?interface\s+(\w+)")
+_JS_TYPE = re.compile(r"^(\s*)(?:export\s+)?type\s+(\w+)\s*=")
+_JS_ENUM = re.compile(r"^(\s*)(?:export\s+)?(?:const\s+)?enum\s+(\w+)")
+# Group 3 is "{" when the declaration opens a body on this line.
+_JS_METHOD = re.compile(
+    r"^(\s*)(?:(?:public|private|protected|static|readonly|async|get|set|abstract|override)\s+)*"
+    r"(\w+)\s*(?:<[^>]*>)?\([^)]*\)\s*(?::\s*[^;{=]+\s*;)?\s*(\{)?\s*$"
+)
 
 # Go patterns
 _GO_FUNC = re.compile(r"^func\s+(?:\(\s*\w+\s+\*?(\w+)(?:\[[^\]]*\])?\s*\)\s+)?(\w+)\s*\(")
@@ -130,9 +138,15 @@ def _detect_style(source: str, language: str) -> str:
 
 
 def _extract_indentation_based(source: str) -> list[SymbolSpan]:
-    """Extract symbols from indentation-based languages (Python)."""
+    """Extract symbols from indentation-based languages (Python).
+
+    Methods and nested classes carry a qualified name (``Outer.Inner.method``).
+    The bare ``name`` stays the identifier used by call graphs.
+    """
     lines = source.splitlines()
     symbols: list[SymbolSpan] = []
+    # (qualified class name, indent of the class statement)
+    class_stack: list[tuple[str, int]] = []
 
     i = 0
     while i < len(lines):
@@ -144,13 +158,16 @@ def _extract_indentation_based(source: str) -> list[SymbolSpan]:
 
         if match:
             indent = len(match.group(1))
+            while class_stack and class_stack[-1][1] >= indent:
+                class_stack.pop()
             if def_match:
                 name = def_match.group(3)
-                kind = "function" if indent == 0 else "method"
+                kind = "method" if class_stack else "function"
             else:
                 assert cls_match is not None
                 name = cls_match.group(2)
                 kind = "class"
+            qualified = f"{class_stack[-1][0]}.{name}" if class_stack else ""
 
             start = i
             while start > 0 and _PY_DECORATOR.match(lines[start - 1]):
@@ -175,11 +192,13 @@ def _extract_indentation_based(source: str) -> list[SymbolSpan]:
                     start_line=start + 1,
                     end_line=end,
                     source=body,
+                    qualified_name=qualified,
                 )
             )
 
             # Stay on the class line so inner methods get found on the next iteration.
             if kind == "class":
+                class_stack.append((qualified or name, indent))
                 i += 1
             else:
                 i = end
@@ -204,39 +223,110 @@ def _extract_brace_based(source: str, language: str) -> list[SymbolSpan]:
     return _extract_js_ts(lines)
 
 
+_JS_CONTROL = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "else",
+    "do",
+    "try",
+    "return",
+    "new",
+    "typeof",
+    "instanceof",
+    "await",
+    "yield",
+    "void",
+    "delete",
+    "import",
+    "export",
+    "function",
+    "class",
+    "case",
+    "var",
+    "let",
+    "const",
+    "super",
+    "this",
+}
+
+
 def _extract_js_ts(lines: list[str]) -> list[SymbolSpan]:
-    """Extract symbols from JavaScript/TypeScript."""
+    """Extract symbols from JavaScript/TypeScript.
+
+    Class bodies are descended into so methods are symbols too. A method
+    whose line has no opening brace is a single-line declaration; the brace
+    matcher is not asked to swallow the rest of the file.
+    """
     symbols: list[SymbolSpan] = []
+    # (qualified class name, line index of the class's closing brace)
+    class_stack: list[tuple[str, int]] = []
 
     i = 0
     while i < len(lines):
+        while class_stack and class_stack[-1][1] < i:
+            class_stack.pop()
         line = lines[i]
 
         cls_match = _JS_CLASS.match(line)
         if cls_match:
             end = _find_brace_end(lines, i)
+            name = cls_match.group(2)
+            qualified = f"{class_stack[-1][0]}.{name}" if class_stack else ""
             symbols.append(
                 SymbolSpan(
-                    name=cls_match.group(2),
+                    name=name,
                     kind="class",
                     start_line=i + 1,
                     end_line=end + 1,
                     source="\n".join(lines[i : end + 1]),
+                    qualified_name=qualified,
                 )
             )
-            i = end + 1
+            class_stack.append((qualified or name, end))
+            i += 1
             continue
+
+        declared = _extract_js_declaration(lines, i)
+        if declared is not None:
+            symbols.append(declared[0])
+            i = declared[1]
+            continue
+
+        if class_stack:
+            method_match = _JS_METHOD.match(line)
+            if method_match and method_match.group(2) not in _JS_CONTROL:
+                name = method_match.group(2)
+                has_brace = method_match.group(3) == "{"
+                end = _find_brace_end(lines, i) if has_brace else i
+                symbols.append(
+                    SymbolSpan(
+                        name=name,
+                        kind="method",
+                        start_line=i + 1,
+                        end_line=end + 1,
+                        source="\n".join(lines[i : end + 1]),
+                        qualified_name=f"{class_stack[-1][0]}.{name}",
+                    )
+                )
+                i = end + 1
+                continue
 
         fn_match = _JS_FUNCTION.match(line)
         if fn_match:
             end = _find_brace_end(lines, i)
+            name = fn_match.group(2)
+            qualified = f"{class_stack[-1][0]}.{name}" if class_stack else ""
             symbols.append(
                 SymbolSpan(
-                    name=fn_match.group(2),
+                    name=name,
                     kind="function",
                     start_line=i + 1,
                     end_line=end + 1,
                     source="\n".join(lines[i : end + 1]),
+                    qualified_name=qualified,
                 )
             )
             i = end + 1
@@ -245,13 +335,16 @@ def _extract_js_ts(lines: list[str]) -> list[SymbolSpan]:
         arrow_match = _JS_ARROW.match(line)
         if arrow_match:
             end = _find_brace_end(lines, i)
+            name = arrow_match.group(2)
+            qualified = f"{class_stack[-1][0]}.{name}" if class_stack else ""
             symbols.append(
                 SymbolSpan(
-                    name=arrow_match.group(2),
+                    name=name,
                     kind="function",
                     start_line=i + 1,
                     end_line=end + 1,
                     source="\n".join(lines[i : end + 1]),
+                    qualified_name=qualified,
                 )
             )
             i = end + 1
@@ -260,6 +353,35 @@ def _extract_js_ts(lines: list[str]) -> list[SymbolSpan]:
         i += 1
 
     return symbols
+
+
+def _extract_js_declaration(lines: list[str], i: int) -> tuple[SymbolSpan, int] | None:
+    """Interface, type alias, or enum. Returns the symbol and the next index."""
+    line = lines[i]
+    iface = _JS_INTERFACE.match(line)
+    enum = _JS_ENUM.match(line)
+    alias = _JS_TYPE.match(line)
+    match = iface or enum or alias
+    if match is None:
+        return None
+    end = _find_brace_end(lines, i) if iface or enum or "{" in line else i
+    if iface:
+        kind = "interface"
+    elif enum:
+        kind = "enum"
+    else:
+        kind = "type"
+    name = match.group(2)
+    return (
+        SymbolSpan(
+            name=name,
+            kind=kind,
+            start_line=i + 1,
+            end_line=end + 1,
+            source="\n".join(lines[i : end + 1]),
+        ),
+        end + 1,
+    )
 
 
 def _extract_go(lines: list[str]) -> list[SymbolSpan]:

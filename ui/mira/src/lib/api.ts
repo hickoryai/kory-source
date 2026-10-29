@@ -4,6 +4,7 @@
 // keeps working everywhere.
 
 import { activityApi } from "./api/activity"
+import { anchorsApi } from "./api/anchors"
 import { contributorsApi } from "./api/contributors"
 import { packagesApi } from "./api/packages"
 import { relationshipsApi } from "./api/relationships"
@@ -21,6 +22,7 @@ export * from "./api/types"
 
 export const api = {
   ...activityApi,
+  ...anchorsApi,
   ...systemApi,
   ...settingsApi,
   ...statsApi,

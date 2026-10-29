@@ -10,6 +10,13 @@ import time
 from dataclasses import dataclass, field
 
 from mira.index._store_shared import _StoreSharedMixin
+from mira.index.anchor_model import IndexedSymbol, IndexRun, SymbolAnchor
+from mira.index.anchor_rows import (
+    anchor_from_row,
+    anchor_tuple,
+    index_run_from_row,
+    indexed_from_row,
+)
 from mira.models import PRFingerprint
 
 logger = logging.getLogger(__name__)
@@ -32,8 +39,41 @@ CREATE TABLE IF NOT EXISTS symbols (
     kind TEXT NOT NULL DEFAULT 'function',
     signature TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
+    qualified_name TEXT NOT NULL DEFAULT '',
+    body_fingerprint TEXT NOT NULL DEFAULT '',
+    body_simhash TEXT NOT NULL DEFAULT '',
+    last_seen_commit TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (file_path, name),
     FOREIGN KEY (file_path) REFERENCES files(path) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS symbol_anchors (
+    id TEXT PRIMARY KEY,
+    symbol_kind TEXT NOT NULL DEFAULT '',
+    qualified_name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    body_fingerprint TEXT NOT NULL DEFAULT '',
+    body_simhash TEXT NOT NULL DEFAULT '',
+    last_resolved_commit TEXT NOT NULL DEFAULT '',
+    resolution_status TEXT NOT NULL DEFAULT 'resolved',
+    proposal_path TEXT NOT NULL DEFAULT '',
+    proposal_qualified_name TEXT NOT NULL DEFAULT '',
+    proposal_fingerprint TEXT NOT NULL DEFAULT '',
+    proposal_score REAL NOT NULL DEFAULT 0,
+    proposal_reason TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_anchors_status
+    ON symbol_anchors(resolution_status);
+
+CREATE TABLE IF NOT EXISTS index_runs (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    indexed_at REAL NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    file_count INTEGER NOT NULL DEFAULT 0,
+    symbol_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS imports (
@@ -213,6 +253,10 @@ class SymbolInfo:
     kind: str  # "function", "class", "method", "constant"
     signature: str  # e.g. "def authenticate(token: str) -> Session"
     description: str  # one-line description
+    qualified_name: str = ""
+    body_fingerprint: str = ""
+    body_simhash: str = ""
+    last_seen_commit: str = ""
 
 
 @dataclass
@@ -410,6 +454,10 @@ class IndexStore(_StoreSharedMixin):
             self._conn.execute(
                 "ALTER TABLE learned_rules ADD COLUMN created_by TEXT NOT NULL DEFAULT ''"
             )
+        sym_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(symbols)").fetchall()}
+        for col in ("qualified_name", "body_fingerprint", "body_simhash", "last_seen_commit"):
+            if col not in sym_cols:
+                self._conn.execute(f"ALTER TABLE symbols ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
         self._conn.commit()
 
     @classmethod
@@ -503,9 +551,21 @@ class IndexStore(_StoreSharedMixin):
             # Two symbols can share a name in one file (overloads, or LLM dupes)
             # and collide on the PK — keep the last, don't raise.
             self._conn.execute(
-                "INSERT OR REPLACE INTO symbols (file_path, name, kind, signature, description) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (summary.path, sym.name, sym.kind, sym.signature, sym.description),
+                "INSERT OR REPLACE INTO symbols ("
+                "file_path, name, kind, signature, description, qualified_name, "
+                "body_fingerprint, body_simhash, last_seen_commit"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    summary.path,
+                    sym.name,
+                    sym.kind,
+                    sym.signature,
+                    sym.description,
+                    sym.qualified_name,
+                    sym.body_fingerprint,
+                    sym.body_simhash,
+                    sym.last_seen_commit,
+                ),
             )
         self._conn.execute("DELETE FROM imports WHERE source_path = ?", (summary.path,))
         for target in set(summary.imports):
@@ -655,6 +715,98 @@ class IndexStore(_StoreSharedMixin):
                         entry.affected_symbols.append(caller_symbol)
 
         return sorted(entries.values(), key=lambda e: (e.depth, e.path))
+
+    def count_symbols(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) FROM symbols").fetchone()
+        return int(row[0]) if row else 0
+
+    def list_indexed_symbols(self) -> list[IndexedSymbol]:
+        rows = self._conn.execute(
+            "SELECT file_path, name, kind, qualified_name, body_fingerprint, "
+            "body_simhash, last_seen_commit FROM symbols"
+        ).fetchall()
+        return [indexed_from_row(tuple(row)) for row in rows]
+
+    def list_anchors(self) -> list[SymbolAnchor]:
+        rows = self._conn.execute(
+            "SELECT id, symbol_kind, qualified_name, path, body_fingerprint, body_simhash, "
+            "last_resolved_commit, resolution_status, proposal_path, proposal_qualified_name, "
+            "proposal_fingerprint, proposal_score, proposal_reason, created_at, updated_at "
+            "FROM symbol_anchors ORDER BY path, qualified_name"
+        ).fetchall()
+        return [anchor_from_row(tuple(row)) for row in rows]
+
+    def get_anchor(self, anchor_id: str) -> SymbolAnchor | None:
+        row = self._conn.execute(
+            "SELECT id, symbol_kind, qualified_name, path, body_fingerprint, body_simhash, "
+            "last_resolved_commit, resolution_status, proposal_path, proposal_qualified_name, "
+            "proposal_fingerprint, proposal_score, proposal_reason, created_at, updated_at "
+            "FROM symbol_anchors WHERE id = ?",
+            (anchor_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return anchor_from_row(tuple(row))
+
+    def insert_anchor(self, anchor: SymbolAnchor) -> None:
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO symbol_anchors ("
+            "id, symbol_kind, qualified_name, path, body_fingerprint, body_simhash, "
+            "last_resolved_commit, resolution_status, proposal_path, proposal_qualified_name, "
+            "proposal_fingerprint, proposal_score, proposal_reason, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            anchor_tuple(anchor, now),
+        )
+        anchor.created_at = anchor.created_at or now
+        anchor.updated_at = now
+        self._conn.commit()
+
+    def save_anchor(self, anchor: SymbolAnchor) -> None:
+        now = time.time()
+        self._conn.execute(
+            "UPDATE symbol_anchors SET symbol_kind=?, qualified_name=?, path=?, "
+            "body_fingerprint=?, body_simhash=?, last_resolved_commit=?, resolution_status=?, "
+            "proposal_path=?, proposal_qualified_name=?, proposal_fingerprint=?, "
+            "proposal_score=?, proposal_reason=?, updated_at=? WHERE id=?",
+            (
+                anchor.symbol_kind,
+                anchor.qualified_name,
+                anchor.path,
+                anchor.body_fingerprint,
+                anchor.body_simhash,
+                anchor.last_resolved_commit,
+                anchor.resolution_status,
+                anchor.proposal_path,
+                anchor.proposal_qualified_name,
+                anchor.proposal_fingerprint,
+                anchor.proposal_score,
+                anchor.proposal_reason,
+                now,
+                anchor.id,
+            ),
+        )
+        anchor.updated_at = now
+        self._conn.commit()
+
+    def get_index_run(self) -> IndexRun | None:
+        row = self._conn.execute(
+            "SELECT indexed_at, head_sha, file_count, symbol_count FROM index_runs WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return index_run_from_row(tuple(row))
+
+    def record_index_run(self, *, commit: str, file_count: int, symbol_count: int) -> None:
+        now = time.time()
+        self._conn.execute(
+            "INSERT INTO index_runs (id, indexed_at, head_sha, file_count, symbol_count) "
+            "VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "indexed_at=excluded.indexed_at, head_sha=excluded.head_sha, "
+            "file_count=excluded.file_count, symbol_count=excluded.symbol_count",
+            (now, commit, file_count, symbol_count),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         """Close the database connection."""
@@ -1121,10 +1273,23 @@ class IndexStore(_StoreSharedMixin):
 
     def _load_symbols(self, path: str) -> list[SymbolInfo]:
         rows = self._conn.execute(
-            "SELECT name, kind, signature, description FROM symbols WHERE file_path = ?",
+            "SELECT name, kind, signature, description, qualified_name, body_fingerprint, "
+            "body_simhash, last_seen_commit FROM symbols WHERE file_path = ?",
             (path,),
         ).fetchall()
-        return [SymbolInfo(name=r[0], kind=r[1], signature=r[2], description=r[3]) for r in rows]
+        return [
+            SymbolInfo(
+                name=row[0],
+                kind=row[1],
+                signature=row[2],
+                description=row[3],
+                qualified_name=row[4] or "",
+                body_fingerprint=row[5] or "",
+                body_simhash=row[6] or "",
+                last_seen_commit=row[7] or "",
+            )
+            for row in rows
+        ]
 
     def _load_imports(self, path: str) -> list[str]:
         rows = self._conn.execute(
