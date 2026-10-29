@@ -72,6 +72,11 @@ _SKIP_PATTERNS = [
     "*.so",
     "*.dylib",
     "node_modules/*",
+    "*/node_modules/*",
+    ".venv/*",
+    "*/.venv/*",
+    "venv/*",
+    "*/venv/*",
     "vendor/*",
     ".git/*",
     "__pycache__/*",
@@ -341,6 +346,107 @@ async def _summarize_batch(
     return results
 
 
+def _annotate_and_store(
+    store: IndexStore,
+    summary: FileSummary,
+    content: str,
+    commit: str,
+    *,
+    preserve_existing: bool,
+) -> None:
+    """Stamp extractor fingerprints, then write the summary.
+
+    ``preserve_existing`` keeps a previous model summary when this pass did
+    not call the model. Extracted symbols still replace the stored symbols.
+    """
+    from mira.index.symbols import annotate_summary
+
+    if preserve_existing:
+        existing = store.get_summary(summary.path)
+        if existing is not None:
+            if existing.summary:
+                summary.summary = existing.summary
+            if existing.imports and not summary.imports:
+                summary.imports = list(existing.imports)
+            if existing.symbol_refs and not summary.symbol_refs:
+                summary.symbol_refs = list(existing.symbol_refs)
+            if existing.external_refs:
+                summary.external_refs = list(existing.external_refs)
+            if existing.symbols and not summary.symbols:
+                summary.symbols = list(existing.symbols)
+            if existing.language:
+                summary.language = existing.language
+    annotate_summary(summary, content, commit)
+    store.upsert_summary(summary)
+
+
+def _finish_index(
+    store: IndexStore,
+    owner: str,
+    repo: str,
+    commit: str,
+    checkout: str | None,
+    indexed_count: int,
+) -> None:
+    """Resolve anchors, then record when this repository was indexed."""
+    from mira.index.anchors import UnwiredRelinkProposer, git_rename_map, resolve_anchors
+
+    anchors = store.list_anchors()
+    if anchors:
+        symbols = store.list_indexed_symbols()
+        checkout_path = Path(checkout) if checkout else None
+        rename_maps: dict[str, dict[str, str]] = {}
+        if checkout_path is not None and commit:
+            olds = {
+                anchor.last_resolved_commit
+                for anchor in anchors
+                if anchor.resolution_status != "retired"
+                and anchor.last_resolved_commit
+                and anchor.last_resolved_commit != commit
+            }
+            for old in olds:
+                mapping = git_rename_map(checkout_path, old, commit)
+                if mapping:
+                    rename_maps[old] = mapping
+        resolve_anchors(
+            anchors,
+            symbols,
+            commit=commit,
+            rename_maps=rename_maps,
+            proposer=UnwiredRelinkProposer(),
+        )
+        for anchor in anchors:
+            store.save_anchor(anchor)
+    store.record_index_run(
+        commit=commit,
+        file_count=len(store.all_paths()),
+        symbol_count=store.count_symbols(),
+    )
+    _bump_repo_freshness(owner, repo, indexed_count)
+
+
+def _bump_repo_freshness(owner: str, repo: str, files_indexed: int) -> None:
+    """Best-effort stamp on the app registry. SQLite indexes carry their own run row."""
+    url = os.environ.get("DATABASE_URL", "")
+    if not (url.startswith("postgresql://") or url.startswith("postgres://")):
+        return
+    try:
+        from mira.dashboard.db import AppDatabase
+
+        database = AppDatabase(url)
+        if not database.get_repo_any_platform(owner, repo):
+            database.register_repo(owner, repo)
+        database.set_repo_status(
+            owner,
+            repo,
+            "ready",
+            files_indexed=files_indexed,
+            bump_last_indexed=True,
+        )
+    except Exception as exc:
+        logger.debug("repo freshness bump skipped for %s/%s: %s", owner, repo, exc)
+
+
 async def index_repo(
     owner: str,
     repo: str,
@@ -352,6 +458,9 @@ async def index_repo(
     branch: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
     fetcher: RepoFetcher | None = None,
+    commit: str = "",
+    checkout: str | None = None,
+    symbols_only: bool = False,
 ) -> int:
     """Index a full repository. Returns number of files indexed.
 
@@ -365,7 +474,7 @@ async def index_repo(
     """
     if config is None:
         config = load_config()
-    if llm is None:
+    if llm is None and not symbols_only:
         from mira.dashboard.models_config import llm_config_for
 
         llm = create_llm(llm_config_for("indexing", config.llm))
@@ -454,9 +563,24 @@ async def index_repo(
         store.remove_paths(list(deleted))
         logger.info("Removed %d deleted files from index", len(deleted))
 
+    if symbols_only:
+        trivial_pairs.extend(file_pairs)
+        file_pairs = []
+
+    head = commit
+    if not head and fetcher is not None:
+        head_fn = getattr(fetcher, "head_commit", None)
+        if head_fn is not None:
+            try:
+                head = await head_fn(owner, repo, branch) or ""
+            except Exception as exc:
+                logger.warning("head commit lookup failed for %s/%s: %s", owner, repo, exc)
+                head = ""
+
     # Persist trivial files immediately — no LLM, no batch quota.
     for path, content in trivial_pairs:
-        store.upsert_summary(
+        _annotate_and_store(
+            store,
             FileSummary(
                 path=path,
                 language=_language_from_path(path),
@@ -466,7 +590,10 @@ async def index_repo(
                 external_refs=[],
                 content_hash=_content_hash(content),
                 loc=content.count("\n") + (0 if content.endswith("\n") else 1) if content else 0,
-            )
+            ),
+            content,
+            head,
+            preserve_existing=True,
         )
 
     # Batch summarize. The previous `for batch in batches: await ...` pattern
@@ -504,7 +631,7 @@ async def index_repo(
             for path, content, data in results:
                 try:
                     summary = _build_file_summary(path, content, data)
-                    store.upsert_summary(summary)
+                    _annotate_and_store(store, summary, content, head, preserve_existing=False)
                     indexed_count += 1
                 except Exception as exc:
                     logger.warning("Skipping file %s in %s/%s: %s", path, owner, repo, exc)
@@ -557,8 +684,11 @@ async def index_repo(
     except Exception as exc:
         logger.debug("Failed to schedule vuln poll for %s/%s: %s", owner, repo, exc)
 
-    # Directory summarization pass
-    await _summarize_directories(store, llm, llm_sem)
+    # Directory summarization pass. A symbols-only run has no model.
+    if not symbols_only and llm is not None:
+        await _summarize_directories(store, llm, llm_sem)
+
+    _finish_index(store, owner, repo, head, checkout, indexed_count)
 
     logger.info("Indexing complete: %d files indexed for %s/%s", indexed_count, owner, repo)
     return indexed_count
@@ -843,6 +973,8 @@ async def index_diff(
     removed_paths: list[str] | None = None,
     branch: str = "main",
     fetcher: RepoFetcher | None = None,
+    commit: str = "",
+    checkout: str | None = None,
 ) -> int:
     """Incremental index for changed files. Returns number of files re-indexed."""
     if config is None:
@@ -855,6 +987,16 @@ async def index_diff(
         store = IndexStore.open(owner, repo)
     if fetcher is None:
         fetcher = make_fetcher("github", token or "")
+
+    head = commit
+    if not head and fetcher is not None:
+        head_fn = getattr(fetcher, "head_commit", None)
+        if head_fn is not None:
+            try:
+                head = await head_fn(owner, repo, branch) or ""
+            except Exception as exc:
+                logger.warning("head commit lookup failed for %s/%s: %s", owner, repo, exc)
+                head = ""
 
     # Remove deleted files
     if removed_paths:
@@ -875,11 +1017,13 @@ async def index_diff(
         logger.warning("Manifest refresh failed for %s/%s: %s", owner, repo, exc)
 
     if not changed_paths:
+        _finish_index(store, owner, repo, head, checkout, 0)
         return 0
 
     # Filter to indexable files
     to_index = [p for p in changed_paths if _should_index(p, config.filter.exclude_patterns)]
     if not to_index:
+        _finish_index(store, owner, repo, head, checkout, 0)
         return 0
 
     # Fetch content
@@ -911,7 +1055,7 @@ async def index_diff(
         for results in all_results:
             for path, content, data in results:
                 summary = _build_file_summary(path, content, data)
-                store.upsert_summary(summary)
+                _annotate_and_store(store, summary, content, head, preserve_existing=False)
                 indexed_count += 1
 
     # Re-generate directory summaries for affected parent dirs
@@ -927,6 +1071,7 @@ async def index_diff(
         logger.info("Re-generating summaries for %d affected directories", len(affected_dirs))
         await _summarize_directories_selective(store, llm, llm_sem, affected_dirs)
 
+    _finish_index(store, owner, repo, head, checkout, indexed_count)
     logger.info(
         "Incremental index: %d files re-indexed for %s/%s",
         indexed_count,

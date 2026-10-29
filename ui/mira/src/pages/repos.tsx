@@ -124,6 +124,9 @@ export function ReposPage() {
                         {r.repo}
                       </p>
                       <p className="text-sm text-muted-foreground">{r.owner}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {r.last_indexed ? `Indexed ${r.last_indexed.slice(0, 10)}` : "Not indexed"}
+                      </p>
                     </div>
                     <div className="ml-auto flex items-center gap-2">
                       <StatusBadge status={r.status} error={r.error} />

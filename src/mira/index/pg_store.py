@@ -14,6 +14,13 @@ from contextlib import contextmanager, suppress
 from typing import Any
 
 from mira.index._store_shared import _StoreSharedMixin
+from mira.index.anchor_model import IndexedSymbol, IndexRun, SymbolAnchor
+from mira.index.anchor_rows import (
+    anchor_from_row,
+    anchor_tuple,
+    index_run_from_row,
+    indexed_from_row,
+)
 from mira.index.store import (
     BlastRadiusEntry,
     DirectorySummary,
@@ -53,7 +60,45 @@ CREATE TABLE IF NOT EXISTS symbols (
     kind TEXT NOT NULL DEFAULT 'function',
     signature TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
+    qualified_name TEXT NOT NULL DEFAULT '',
+    body_fingerprint TEXT NOT NULL DEFAULT '',
+    body_simhash TEXT NOT NULL DEFAULT '',
+    last_seen_commit TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (owner, repo, file_path, name)
+);
+
+CREATE TABLE IF NOT EXISTS symbol_anchors (
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    id TEXT NOT NULL,
+    symbol_kind TEXT NOT NULL DEFAULT '',
+    qualified_name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    body_fingerprint TEXT NOT NULL DEFAULT '',
+    body_simhash TEXT NOT NULL DEFAULT '',
+    last_resolved_commit TEXT NOT NULL DEFAULT '',
+    resolution_status TEXT NOT NULL DEFAULT 'resolved',
+    proposal_path TEXT NOT NULL DEFAULT '',
+    proposal_qualified_name TEXT NOT NULL DEFAULT '',
+    proposal_fingerprint TEXT NOT NULL DEFAULT '',
+    proposal_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+    proposal_reason TEXT NOT NULL DEFAULT '',
+    created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner, repo, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_anchors_status
+    ON symbol_anchors(owner, repo, resolution_status);
+
+CREATE TABLE IF NOT EXISTS index_runs (
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    indexed_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    head_sha TEXT NOT NULL DEFAULT '',
+    file_count INTEGER NOT NULL DEFAULT 0,
+    symbol_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (owner, repo)
 );
 
 CREATE TABLE IF NOT EXISTS imports (
@@ -292,6 +337,17 @@ def _get_conn(url: str) -> Any:
                     "ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS created_by "
                     "TEXT NOT NULL DEFAULT ''"
                 )
+                for col in (
+                    "qualified_name",
+                    "body_fingerprint",
+                    "body_simhash",
+                    "last_seen_commit",
+                ):
+                    cur.execute(
+                        "ALTER TABLE symbols ADD COLUMN IF NOT EXISTS "
+                        + col
+                        + " TEXT NOT NULL DEFAULT ''"
+                    )
             _schema_initialized = True
         return _pg_conn
 
@@ -600,11 +656,14 @@ class PgIndexStore(_StoreSharedMixin):
                 # Two symbols can share a name in one file (overloads, or LLM
                 # dupes) and collide on the PK — keep the last, don't crash.
                 cur.execute(
-                    "INSERT INTO symbols (owner, repo, file_path, name, kind, signature, description) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                    "INSERT INTO symbols (owner, repo, file_path, name, kind, signature, "
+                    "description, qualified_name, body_fingerprint, body_simhash, last_seen_commit) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                     "ON CONFLICT (owner, repo, file_path, name) DO UPDATE SET "
                     "kind=EXCLUDED.kind, signature=EXCLUDED.signature, "
-                    "description=EXCLUDED.description",
+                    "description=EXCLUDED.description, qualified_name=EXCLUDED.qualified_name, "
+                    "body_fingerprint=EXCLUDED.body_fingerprint, body_simhash=EXCLUDED.body_simhash, "
+                    "last_seen_commit=EXCLUDED.last_seen_commit",
                     (
                         self._owner,
                         self._repo,
@@ -613,6 +672,10 @@ class PgIndexStore(_StoreSharedMixin):
                         sym.kind,
                         sym.signature,
                         sym.description,
+                        sym.qualified_name,
+                        sym.body_fingerprint,
+                        sym.body_simhash,
+                        sym.last_seen_commit,
                     ),
                 )
             # Replace imports (dedup)
@@ -1266,11 +1329,24 @@ class PgIndexStore(_StoreSharedMixin):
 
     def _load_symbols(self, path: str) -> list[SymbolInfo]:
         rows = self._fetchall(
-            "SELECT name, kind, signature, description FROM symbols "
+            "SELECT name, kind, signature, description, qualified_name, body_fingerprint, "
+            "body_simhash, last_seen_commit FROM symbols "
             "WHERE owner=%s AND repo=%s AND file_path=%s",
             (self._owner, self._repo, path),
         )
-        return [SymbolInfo(name=r[0], kind=r[1], signature=r[2], description=r[3]) for r in rows]
+        return [
+            SymbolInfo(
+                name=row[0],
+                kind=row[1],
+                signature=row[2],
+                description=row[3],
+                qualified_name=row[4] or "",
+                body_fingerprint=row[5] or "",
+                body_simhash=row[6] or "",
+                last_seen_commit=row[7] or "",
+            )
+            for row in rows
+        ]
 
     def _load_imports(self, path: str) -> list[str]:
         rows = self._fetchall(
@@ -1809,6 +1885,110 @@ class PgIndexStore(_StoreSharedMixin):
             (self._owner, self._repo),
         )
         return {r[0]: r[1] for r in rows}
+
+    def count_symbols(self) -> int:
+        rows = self._fetchall(
+            "SELECT COUNT(*) FROM symbols WHERE owner=%s AND repo=%s",
+            (self._owner, self._repo),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    def list_indexed_symbols(self) -> list[IndexedSymbol]:
+        rows = self._fetchall(
+            "SELECT file_path, name, kind, qualified_name, body_fingerprint, "
+            "body_simhash, last_seen_commit FROM symbols WHERE owner=%s AND repo=%s",
+            (self._owner, self._repo),
+        )
+        return [indexed_from_row(tuple(row)) for row in rows]
+
+    def list_anchors(self) -> list[SymbolAnchor]:
+        rows = self._fetchall(
+            "SELECT id, symbol_kind, qualified_name, path, body_fingerprint, body_simhash, "
+            "last_resolved_commit, resolution_status, proposal_path, proposal_qualified_name, "
+            "proposal_fingerprint, proposal_score, proposal_reason, created_at, updated_at "
+            "FROM symbol_anchors WHERE owner=%s AND repo=%s ORDER BY path, qualified_name",
+            (self._owner, self._repo),
+        )
+        return [anchor_from_row(tuple(row)) for row in rows]
+
+    def get_anchor(self, anchor_id: str) -> SymbolAnchor | None:
+        rows = self._fetchall(
+            "SELECT id, symbol_kind, qualified_name, path, body_fingerprint, body_simhash, "
+            "last_resolved_commit, resolution_status, proposal_path, proposal_qualified_name, "
+            "proposal_fingerprint, proposal_score, proposal_reason, created_at, updated_at "
+            "FROM symbol_anchors WHERE owner=%s AND repo=%s AND id=%s",
+            (self._owner, self._repo, anchor_id),
+        )
+        if not rows:
+            return None
+        return anchor_from_row(tuple(rows[0]))
+
+    def insert_anchor(self, anchor: SymbolAnchor) -> None:
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO symbol_anchors ("
+                "owner, repo, id, symbol_kind, qualified_name, path, body_fingerprint, "
+                "body_simhash, last_resolved_commit, resolution_status, proposal_path, "
+                "proposal_qualified_name, proposal_fingerprint, proposal_score, proposal_reason, "
+                "created_at, updated_at"
+                ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (self._owner, self._repo, *anchor_tuple(anchor, now)),
+            )
+        anchor.created_at = anchor.created_at or now
+        anchor.updated_at = now
+
+    def save_anchor(self, anchor: SymbolAnchor) -> None:
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE symbol_anchors SET symbol_kind=%s, qualified_name=%s, path=%s, "
+                "body_fingerprint=%s, body_simhash=%s, last_resolved_commit=%s, "
+                "resolution_status=%s, proposal_path=%s, proposal_qualified_name=%s, "
+                "proposal_fingerprint=%s, proposal_score=%s, proposal_reason=%s, updated_at=%s "
+                "WHERE owner=%s AND repo=%s AND id=%s",
+                (
+                    anchor.symbol_kind,
+                    anchor.qualified_name,
+                    anchor.path,
+                    anchor.body_fingerprint,
+                    anchor.body_simhash,
+                    anchor.last_resolved_commit,
+                    anchor.resolution_status,
+                    anchor.proposal_path,
+                    anchor.proposal_qualified_name,
+                    anchor.proposal_fingerprint,
+                    anchor.proposal_score,
+                    anchor.proposal_reason,
+                    now,
+                    self._owner,
+                    self._repo,
+                    anchor.id,
+                ),
+            )
+        anchor.updated_at = now
+
+    def get_index_run(self) -> IndexRun | None:
+        rows = self._fetchall(
+            "SELECT indexed_at, head_sha, file_count, symbol_count FROM index_runs "
+            "WHERE owner=%s AND repo=%s",
+            (self._owner, self._repo),
+        )
+        if not rows:
+            return None
+        return index_run_from_row(tuple(rows[0]))
+
+    def record_index_run(self, *, commit: str, file_count: int, symbol_count: int) -> None:
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO index_runs (owner, repo, indexed_at, head_sha, file_count, symbol_count) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (owner, repo) DO UPDATE SET indexed_at=EXCLUDED.indexed_at, "
+                "head_sha=EXCLUDED.head_sha, file_count=EXCLUDED.file_count, "
+                "symbol_count=EXCLUDED.symbol_count",
+                (self._owner, self._repo, now, commit, file_count, symbol_count),
+            )
 
     def close(self) -> None:
         """No-op — connection is shared across all instances."""

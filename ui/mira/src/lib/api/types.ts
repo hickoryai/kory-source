@@ -413,3 +413,35 @@ export interface OpenPr {
   waiting_on: string[]
   reviewers: OpenPrReviewer[]
 }
+
+
+export interface AnchorModel {
+  id: string
+  owner: string
+  repo: string
+  symbol_kind: string
+  qualified_name: string
+  path: string
+  resolution_status: string
+  last_resolved_commit: string
+  proposal_path: string
+  proposal_qualified_name: string
+  proposal_score: number
+  proposal_reason: string
+}
+
+export interface RepoFreshnessModel {
+  owner: string
+  repo: string
+  last_indexed: string | null
+  commit: string
+  file_count: number
+  symbol_count: number
+  pending_count: number
+  dangling_count: number
+}
+
+export interface AnchorsResponse {
+  repos: RepoFreshnessModel[]
+  anchors: AnchorModel[]
+}

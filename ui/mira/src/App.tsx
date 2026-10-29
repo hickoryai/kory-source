@@ -8,6 +8,7 @@ import { UninstallModal } from "@/components/dashboard/uninstall-modal"
 import { api } from "@/lib/api"
 import { useAuth } from "@/lib/auth"
 import { ActivityPage } from "@/pages/activity"
+import { AnchorsPage } from "@/pages/anchors"
 import { ContributorDetailPage } from "@/pages/contributor-detail"
 import { ContributorsPage } from "@/pages/contributors"
 import { DashboardPage } from "@/pages/dashboard"
@@ -208,6 +209,7 @@ export function App() {
           <Route path="contributors/:login" element={<ContributorDetailPage />} />
           <Route path="packages" element={<PackagesPage />} />
           <Route path="relationships" element={<RelationshipsPage />} />
+          <Route path="anchors" element={<AnchorsPage />} />
           <Route path="rules" element={<RulesPage />} />
           <Route path="learnings" element={<LearnedRulesPage />} />
           <Route path="learnings/new" element={<LearningFormPage />} />

@@ -534,3 +534,74 @@ def backfill_contributors(
             backfill_all_repos(app_auth, since=since_epoch, include_commits=include_commits)
         )
         click.echo(f"Backfill complete: {totals}")
+
+
+def _split_repo_spec(spec: str) -> tuple[str, str, str | None]:
+    """Parse owner/repo or owner/repo=/checkout."""
+    checkout: str | None = None
+    repo_spec = spec
+    if "=" in spec:
+        repo_spec, checkout = spec.split("=", 1)
+    if repo_spec.count("/") != 1:
+        raise click.UsageError("--repo must be owner/repo or owner/repo=/checkout")
+    owner, repo = repo_spec.split("/", 1)
+    return owner, repo, checkout or None
+
+
+@main.command("index-repos")
+@click.option(
+    "--repo",
+    "repo_specs",
+    multiple=True,
+    help="owner/repo, or owner/repo=/path/to/checkout so git can detect renames",
+)
+@click.option(
+    "--symbols-only/--with-llm",
+    default=True,
+    help="Extract symbols without a model. --with-llm also writes file summaries.",
+)
+def index_repos(repo_specs: tuple[str, ...], symbols_only: bool) -> None:
+    """Index repositories into the code graph.
+
+    Cloud Run runs this command. Set DATABASE_URL to the Cloud SQL instance.
+    Login is IAM only: run the Cloud SQL Auth Proxy with --auto-iam-authn and
+    use a URL with no password. The service account is kory-source-{env}.
+    A workstation indexer uses the kory-source-indexer-{env} account the same
+    way, and passes owner/repo=/checkout so git can detect renames.
+
+    With no --repo, the command indexes hickory-ai, goose, router-acp, and
+    kory-source from GitHub. Rename detection runs only for a checkout path.
+    """
+    import asyncio
+    import os
+    import time
+    from pathlib import Path
+
+    from mira.index.indexer import index_repo
+    from mira.index.local import DEFAULT_INDEX_REPOS, index_checkout
+    from mira.index.store import IndexStore
+
+    specs = list(repo_specs) or list(DEFAULT_INDEX_REPOS)
+    for spec in specs:
+        owner, repo, checkout = _split_repo_spec(spec)
+        store = IndexStore.open(owner, repo)
+        try:
+            if checkout:
+                stats = index_checkout(owner, repo, Path(checkout), store)
+                click.echo(
+                    f"{owner}/{repo}: {stats.symbols} symbols, {stats.files} files, "
+                    f"{stats.seconds:.1f}s, commit {stats.commit[:12]}"
+                )
+                continue
+            started = time.perf_counter()
+            token = os.environ.get("MIRA_GIT_TOKEN") or os.environ.get("GITHUB_TOKEN")
+            count = asyncio.run(
+                index_repo(owner, repo, token=token, store=store, symbols_only=symbols_only)
+            )
+            elapsed = time.perf_counter() - started
+            click.echo(
+                f"{owner}/{repo}: {store.count_symbols()} symbols, "
+                f"{count} files indexed, {elapsed:.1f}s"
+            )
+        finally:
+            store.close()
