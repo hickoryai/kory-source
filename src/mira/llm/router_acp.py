@@ -22,6 +22,10 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   the matching config field is unset. ``KORY_CODE_SESSION_ID`` is not read.
 * ``attribution_key`` is a context variable the benchmark sets around one PR.
   ``call_log`` keeps the latest 256 logical completions (review and judge).
+* ``call_observer`` is a context variable holding a callback. The review API
+  sets it around one job so each job sees only its own completions, however
+  many jobs share ``call_log``. A reply the provider cannot parse is reported
+  as a ``bad_response`` entry after the ``ok`` transport entry.
 
 Every logical call goes through ``hickory_common.llm_tracing.traced_llm_call``.
 An unset ``LLM_OTLP_ENDPOINT``, a missing tracer, or a failed exporter raises
@@ -68,6 +72,9 @@ _STATUS_KIND = {
 }
 
 attribution_key: ContextVar[str] = ContextVar("mira_router_acp_attribution", default="")
+call_observer: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
+    "mira_router_acp_call_observer", default=None
+)
 _tracing_ready = False
 
 
@@ -215,16 +222,30 @@ class RouterAcpProvider:
         return headers
 
     def _record(self, *, state: str, requested: str, actual: str, attempts: int) -> None:
-        self.call_log.append(
-            {
-                "state": state,
-                "requested_model": requested,
-                "actual_model": actual,
-                "attempts": attempts,
-                "priority": self._priority(),
-                "attribution": attribution_key.get(),
-            }
-        )
+        entry = {
+            "state": state,
+            "requested_model": requested,
+            "actual_model": actual,
+            "attempts": attempts,
+            "priority": self._priority(),
+            "attribution": attribution_key.get(),
+        }
+        self.call_log.append(entry)
+        observer = call_observer.get()
+        if observer is not None:
+            observer(dict(entry))
+
+    def _checked_json(self, raw: str) -> str:
+        try:
+            return self._extract_json_object(raw)
+        except LLMError:
+            self._record(
+                state="bad_response",
+                requested=self._requested_model(),
+                actual="unknown",
+                attempts=1,
+            )
+            raise
 
     def _fail(
         self,
@@ -471,7 +492,7 @@ class RouterAcpProvider:
         if json_mode:
             prompt += "\n\n## Required output\nReturn ONLY one valid JSON object. No markdown fences or explanatory text."
         raw, usage = await self._generate(prompt)
-        result = self._extract_json_object(raw) if json_mode else raw
+        result = self._checked_json(raw) if json_mode else raw
         self._account(prompt, result, usage)
         return result
 
@@ -483,7 +504,7 @@ class RouterAcpProvider:
     ) -> str:
         prompt = self._tool_prompt(messages, tools)
         raw, usage = await self._generate(prompt)
-        result = self._extract_json_object(raw)
+        result = self._checked_json(raw)
         self._account(prompt, result, usage)
         return result
 
