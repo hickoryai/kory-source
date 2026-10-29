@@ -200,3 +200,57 @@ The relink step is a `RelinkProposer`. The default records a pending
 proposal from body similarity and does not call a model. A later provider
 can implement the same interface. Pending and dangling rows stay in
 `symbol_anchors` until a person confirms or retires them.
+
+## Work and decision registry (HAI-11605)
+
+The registry lives in `src/mira/registry/`. It is the system of record for
+work, decisions, rules, constraints, requirements, concepts, and
+verification evidence. Mira's own rules code is unchanged: `rules.py`,
+`analysis/feedback.py`, the learnings UI, `index/store.py`,
+`platforms/github/webhook.py`, `core/passes.py`, and `llm/prompts/review.py`
+have no edits.
+
+Upstream files touched, and why:
+
+- `src/mira/core/engine.py` (18 lines): puts the approved-registry block at
+  `custom_rules[0]`, wraps the main review's agentic executor so it can
+  answer `search_decisions`, and adds `search_decisions` to
+  `AGENTIC_TOOLS`. The security pass keeps a plain executor (an upstream
+  test asserts its type). If that pass calls the tool, it gets an
+  `unknown tool` reply.
+- `src/mira/platforms/server.py` (10 lines): `install_registry(app)`
+  (mounts `/api/registry` and `/mcp`), `observe_github` on every GitHub
+  webhook as a background task, and the hourly registry job in the
+  lifespan.
+- `ui/mira/src/App.tsx` (the `/registry` route) and
+  `ui/mira/src/components/dashboard/layout.tsx` (nav item and breadcrumb
+  label).
+
+These files are new and fork-owned:
+
+- `src/mira/registry/`: `db.py` (one org-wide database, `DATABASE_URL`
+  or `$MIRA_INDEX_DIR/registry.db`), `model.py` (vocabulary and
+  confidence), `service.py` (lifecycle, realization, conflicts, work,
+  evidence, import), `conflicts.py` (seat judge), `learned.py` (read-only
+  learned-rule mirror), `prompt.py`, `realization.py`, `auth.py`
+  (registry JWT), `mcp.py`, and `api.py`.
+- `ui/mira/src/pages/registry.tsx` and `ui/mira/src/lib/api/registry.ts`.
+- `tests/test_decision_registry.py`. It also asserts the `engine.py` (<40)
+  and `server.py` (<25) caps against the fork base.
+
+MCP is streamable HTTP at `POST /mcp` and returns JSON responses with no
+SSE. Bearer JWT claims are `kind` (human|agent), `sub`, `model` (required
+for agents), and `exp`. HS256 verifies against `REGISTRY_JWT_SECRET`, and
+RS256 against `REGISTRY_JWT_PUBLIC_KEY`. A dashboard username and a human
+JWT `sub` must use the same identity, because `resolve_conflict` refuses
+the proposal's author.
+
+The HAI-11606 import seam is `Registry.import_items()`, exposed to admins
+at `POST /api/registry/import`. `/api/*` requires a dashboard session, so
+an out-of-process sync job calls the Python seam or uses an admin session.
+
+Drift, measured with `git diff --stat upstream/main -- src tests ui` at
+upstream `e01f1e062c49536c7e12b6b7fa383e2dd28da14b`: **100 paths, 17,840
+insertions, 5,856 deletions**. The total includes upstream commits that
+have not been synced. Compared with this branch's base `b238ff1`, the
+registry adds 18 paths and 4,107 insertions, all listed above.

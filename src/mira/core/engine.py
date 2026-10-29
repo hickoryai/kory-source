@@ -34,6 +34,7 @@ from mira.exceptions import MiraError, ResponseParseError
 from mira.index.context import build_code_context
 from mira.index.manifests import _is_lockfile_path, is_manifest
 from mira.index.store import IndexStore
+from mira.llm.agentic_tools import AGENTIC_TOOLS
 from mira.llm.prompts.review import (
     build_review_prompt,
     build_walkthrough_prompt,
@@ -63,9 +64,14 @@ from mira.models import (
     build_review_stats,
 )
 from mira.providers.base import BaseProvider
+from mira.registry.prompt import SEARCH_DECISIONS_TOOL
 from mira.security.secrets_scan import scan_secrets
 
 logger = logging.getLogger(__name__)
+
+# Kory Source: `search_decisions` joins `read_file` and `grep_repo`.
+if SEARCH_DECISIONS_TOOL not in AGENTIC_TOOLS:
+    AGENTIC_TOOLS.append(SEARCH_DECISIONS_TOOL)
 
 
 def _audit_drop(c: ReviewComment, stage: str, reason: str = "") -> dict:
@@ -1310,6 +1316,16 @@ class ReviewEngine:
                             custom_rules.insert(0, {"title": title, "content": content})
                 except Exception:
                     pass
+
+                # Kory Source registry: approved objects on these paths, ahead of everything.
+                try:
+                    from mira.registry.prompt import registry_rule
+
+                    registry_block = registry_rule(pr_info, [f.path for f in filtered])
+                    if registry_block:
+                        custom_rules.insert(0, registry_block)
+                except Exception as exc:
+                    logger.debug("Registry prompt block skipped: %s", exc)
         except Exception:
             pass
 
@@ -1370,11 +1386,13 @@ class ReviewEngine:
                     )
                     if use_agentic:
                         from mira.llm.agentic_tools import AgenticToolExecutor
+                        from mira.registry.prompt import with_registry_tool
 
                         executor = AgenticToolExecutor(
                             source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
                             repo_tree=list(self._agentic_repo_tree),
                         )
+                        executor = with_registry_tool(executor, getattr(self, "_pr_info", None))
                         raw_response = await agentic_review_loop(self.llm, messages, executor)
                         audit.append({"stage": "agentic", "chunk": idx, "calls": executor.call_log})
                     if not raw_response:

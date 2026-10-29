@@ -16,6 +16,7 @@ import { LearnedRulesPage } from "@/pages/learned-rules"
 import { LearningFormPage } from "@/pages/learning-form"
 import { LoginPage } from "@/pages/login"
 import { PackagesPage } from "@/pages/packages"
+import { RegistryPage } from "@/pages/registry"
 import { RepoDetailPage } from "@/pages/repo-detail"
 import { RelationshipsPage } from "@/pages/relationships"
 import { ReposPage } from "@/pages/repos"
@@ -210,6 +211,7 @@ export function App() {
           <Route path="packages" element={<PackagesPage />} />
           <Route path="relationships" element={<RelationshipsPage />} />
           <Route path="anchors" element={<AnchorsPage />} />
+          <Route path="registry" element={<RegistryPage />} />
           <Route path="rules" element={<RulesPage />} />
           <Route path="learnings" element={<LearnedRulesPage />} />
           <Route path="learnings/new" element={<LearningFormPage />} />
