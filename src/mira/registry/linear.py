@@ -10,7 +10,8 @@ Linear: the client refuses any GraphQL mutation. It has three parts:
   will not carry yet.
 - ``LinearImporter``: resumable walks over issues and comments. Each page's
   cursor is saved after the page is imported, so a restart resumes where it
-  stopped and a replayed page is a no-op.
+  stopped and a replayed page is a no-op. Issues still waiting on a link target
+  are re-read at the end of each issue walk.
 
 Run with ``python -m mira.registry.linear inventory|import --team HAI``.
 ``import`` is a dry run unless ``--apply`` is given.
@@ -55,6 +56,7 @@ STATE_DELIVERY = {
     "canceled": "canceled",
 }
 RELATIONS_PAGE = 50  # the relations(first:) in ISSUES_QUERY
+PENDING_BATCH = 50  # ids per ``id: {in: [...]}`` re-read of pending issues
 
 # Field names follow hickory-ai's production Linear poller
 # (hickory-ui/backend/app/services/engineering_metrics/linear_poller.py).
@@ -94,6 +96,14 @@ query RegistryComments($filter: CommentFilter!, $after: String, $first: Int!) {
 
 class LinearError(RuntimeError):
     """Linear refused or failed a request after retries."""
+
+
+class LinearGraphQLError(LinearError):
+    """Linear answered with GraphQL errors. These are not retried."""
+
+
+class LinearCursorRejected(LinearError):
+    """Linear refused a saved cursor: a GraphQL error on a resumed walk's first page."""
 
 
 def to_epoch(iso: str | None) -> float:
@@ -164,7 +174,7 @@ class LinearClient:
                     body = resp.json()
                     if body.get("errors"):
                         messages = "; ".join(e.get("message", "") for e in body["errors"])
-                        raise LinearError(f"GraphQL error: {messages}")
+                        raise LinearGraphQLError(f"GraphQL error: {messages}")
                     return body["data"]
             if attempt < MAX_ATTEMPTS - 1:
                 self._sleep(min(2.0**attempt, 30.0))
@@ -173,9 +183,21 @@ class LinearClient:
     def pages(
         self, document: str, connection: str, filt: dict, after: str | None = None
     ) -> Iterator[tuple[list[dict], str | None]]:
-        """Yield ``(nodes, end_cursor)`` per page. ``end_cursor`` is None on the last page."""
+        """Yield ``(nodes, end_cursor)`` per page. ``end_cursor`` is None on the last page.
+
+        A GraphQL error on the first page of a resumed walk means Linear rejected
+        the saved cursor, so it raises ``LinearCursorRejected`` instead.
+        """
+        resumed = after is not None
+        first = True
         while True:
-            data = self.query(document, {"filter": filt, "after": after, "first": PAGE_SIZE})
+            try:
+                data = self.query(document, {"filter": filt, "after": after, "first": PAGE_SIZE})
+            except LinearGraphQLError as exc:
+                if resumed and first:
+                    raise LinearCursorRejected(str(exc)) from exc
+                raise
+            first = False
             conn = data[connection]
             info = conn.get("pageInfo") or {}
             after = info.get("endCursor") if info.get("hasNextPage") else None
@@ -273,11 +295,9 @@ def inventory(client: LinearClient, teams: list[str]) -> dict:
             if (rels.get("pageInfo") or {}).get("hasNextPage"):
                 truncated.append(node.get("identifier") or node["id"])
     comments: Counter[str] = Counter()
-    for nodes, _ in client.pages(COMMENTS_QUERY, "comments", {}):
+    for nodes, _ in client.pages(COMMENTS_QUERY, "comments", {"issue": _team_filter(teams)}):
         for node in nodes:
-            if not node.get("issue"):
-                comments["not_on_issue"] += 1
-            elif _comment_team(node) in teams:
+            if _comment_team(node) in teams:
                 comments["on_team_issues"] += 1
                 comments["archived"] += bool(node.get("archivedAt"))
     unmapped = {t: n for t, n in relation_types.items() if t not in RELATION_LINKS}
@@ -287,10 +307,6 @@ def inventory(client: LinearClient, teams: list[str]) -> dict:
             f"projects: {len(projects)} referenced; not imported yet, so issues carry no "
             "project link"
         )
-    if comments["not_on_issue"]:
-        exceptions.append(
-            f"comments: {comments['not_on_issue']} on documents or projects, not imported"
-        )
     for rel_type, count in sorted(unmapped.items()):
         exceptions.append(f"relations: {count} of type {rel_type!r}, not imported")
     if truncated:
@@ -298,7 +314,10 @@ def inventory(client: LinearClient, teams: list[str]) -> dict:
             f"relations: {len(truncated)} issues hold more than {RELATIONS_PAGE}; only the "
             f"first {RELATIONS_PAGE} import ({', '.join(truncated[:20])})"
         )
-    exceptions.append("documents: not inventoried or imported by this importer")
+    exceptions.append(
+        "documents and comments on documents or projects: not inventoried or imported "
+        "by this importer"
+    )
     return {
         "teams": teams,
         "issues": dict(issues),
@@ -320,7 +339,11 @@ class LinearImporter:
     ``WATERMARK_OVERLAP``. After each page is imported its end cursor is saved;
     a restart resumes from that cursor with the same lower bound. If Linear
     rejects a saved cursor, the walk restarts from its lower bound, which only
-    re-reads pages that are already imported.
+    re-reads pages that are already imported. Any other failure, including
+    retries running out, leaves the saved cursor for the next run.
+
+    Linear does not resend an issue when a link target arrives, so before an
+    issue walk completes it re-reads every issue still ``pending_links``.
     """
 
     def __init__(
@@ -385,22 +408,47 @@ class LinearImporter:
         filt: dict = {"updatedAt": {"gte": to_iso(st["walk_since"])}}
         if stream == "issues":
             filt = {"and": [_team_filter(self.teams), filt]}
+        else:
+            filt = {"and": [{"issue": _team_filter(self.teams)}, filt]}
         document = ISSUES_QUERY if stream == "issues" else COMMENTS_QUERY
         totals: Counter[str] = Counter()
         errors: list[dict] = []
         after = st["after_cursor"] or None
         try:
             self._pages(stream, document, filt, after, st, apply, totals, errors)
-        except LinearError as exc:
-            if after is None:
-                raise
+        except LinearCursorRejected as exc:
             logger.warning("Linear %s cursor rejected (%s); restarting walk", stream, exc)
             totals["walk_restarted"] += 1
             self._pages(stream, document, filt, None, st, apply, totals, errors)
+        retried: dict = {}
+        if apply and stream == "issues":
+            retried = self._retry_pending(errors)
         if apply:
             st.update(watermark=st["walk_started_at"], after_cursor="")
             self._save(stream, st)
-        return {"totals": dict(totals), "errors": errors}
+        return {"totals": dict(totals), "errors": errors, "retried": retried}
+
+    def _retry_pending(self, errors: list[dict]) -> dict:
+        """Re-read the issues still waiting on a link target and import them again.
+
+        An issue read before its parent or blocker is written without that link.
+        Linear does not resend it when the target arrives, so the walk re-reads it.
+        """
+        counts: Counter[str] = Counter()
+        pending = self.registry.pending_link_sources(SOURCE_SYSTEM)
+        for start in range(0, len(pending), PENDING_BATCH):
+            ids = pending[start : start + PENDING_BATCH]
+            filt = {"and": [_team_filter(self.teams), {"id": {"in": ids}}]}
+            for nodes, _ in self.client.pages(ISSUES_QUERY, "issues", filt):
+                items = [issue_item(n) for n in nodes]
+                results = self.registry.import_items(SOURCE_SYSTEM, items, IMPORT_ACTOR)
+                counts["read"] += len(results)
+                for res in results:
+                    if res["outcome"] == "error" or res.get("link_errors"):
+                        errors.append(res)
+                    synced = res.get("sync_status") == "synced"
+                    counts["resolved" if synced else "still_pending"] += 1
+        return dict(counts)
 
     def _pages(
         self,

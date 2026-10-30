@@ -385,6 +385,14 @@ Fork-owned, with no upstream drift:
     so a reversed parent link is replaced when the child is re-parented.
   - A concurrent insert of the same source row retries the item against the
     winner's row instead of failing the batch.
+- **Pending links resolve on the next issue walk.** Linear does not resend an
+  issue when its parent or blocker arrives, so each issue walk re-reads the
+  issues still `pending_links` (`id: {in: [...]}`, same team filter). This
+  also covers a crash between pages.
+- **Walks filter on team.** Comments are filtered by `issue.team`, and the
+  client-side team check is kept as a backstop. A cursor is restarted only when
+  Linear rejects it on the first page of a resumed walk; retries running out
+  keep the saved cursor.
 
 Drift, measured with `git diff --stat upstream/main -- src tests ui` at
 upstream `e01f1e062c49536c7e12b6b7fa383e2dd28da14b`: **100 paths, 17,840

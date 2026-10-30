@@ -1635,37 +1635,42 @@ class Registry:
                 self.clock(),
             )
             with self.db.transaction():
-                rows = self.db.execute(
-                    "SELECT source_version FROM registry_comments "
-                    "WHERE source_system = ? AND source_id = ?",
-                    (source_system, source_id),
-                )
-                if rows and version == rows[0][0]:
-                    outcome = "unchanged"
-                elif rows and version < rows[0][0]:
-                    outcome = "stale"
-                elif rows:
-                    outcome = "updated"
-                    self.db.execute(
-                        "UPDATE registry_comments SET parent_source_id = ?, author = ?, "
-                        "body = ?, source_url = ?, source_version = ?, source_created_at = ?, "
-                        "archived = ?, synced_at = ? WHERE source_system = ? AND source_id = ?",
-                        (parent, *values, source_system, source_id),
-                    )
-                else:
-                    outcome = "created"
-                    # ON CONFLICT DO NOTHING: a concurrent importer's row wins and
-                    # the next run compares versions against it.
-                    self.db.execute(
-                        "INSERT INTO registry_comments (id, source_system, source_id, "
-                        "parent_source_id, author, body, source_url, source_version, "
-                        "source_created_at, archived, synced_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                        "ON CONFLICT (source_system, source_id) DO NOTHING",
-                        (new_id("cmt_"), source_system, source_id, parent, *values),
-                    )
+                outcome = self._upsert_comment(source_system, source_id, parent, version, values)
             results.append({"source_id": source_id, "outcome": outcome})
         return results
+
+    def _upsert_comment(
+        self, source_system: str, source_id: str, parent: str, version: int, values: tuple
+    ) -> str:
+        select = (
+            "SELECT source_version FROM registry_comments WHERE source_system = ? AND source_id = ?"
+        )
+        rows = self.db.execute(select, (source_system, source_id))
+        if not rows:
+            # ON CONFLICT DO NOTHING: when a concurrent importer inserted the row
+            # first, nothing is returned and the outcome is read from its row.
+            inserted = self.db.execute(
+                "INSERT INTO registry_comments (id, source_system, source_id, "
+                "parent_source_id, author, body, source_url, source_version, "
+                "source_created_at, archived, synced_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (source_system, source_id) DO NOTHING RETURNING id",
+                (new_id("cmt_"), source_system, source_id, parent, *values),
+            )
+            if inserted:
+                return "created"
+            rows = self.db.execute(select, (source_system, source_id))
+        if version == rows[0][0]:
+            return "unchanged"
+        if version < rows[0][0]:
+            return "stale"
+        self.db.execute(
+            "UPDATE registry_comments SET parent_source_id = ?, author = ?, "
+            "body = ?, source_url = ?, source_version = ?, source_created_at = ?, "
+            "archived = ?, synced_at = ? WHERE source_system = ? AND source_id = ?",
+            (parent, *values, source_system, source_id),
+        )
+        return "updated"
 
     def comments_for(self, obj: dict) -> list[dict]:
         """Mirrored comments on ``obj``, oldest first. Archived ones are left out."""
@@ -1694,3 +1699,12 @@ class Registry:
             (source_system,),
         )
         return {r[0]: r[1] for r in rows}
+
+    def pending_link_sources(self, source_system: str) -> list[str]:
+        """Source ids of imported work still waiting on a link target."""
+        rows = self.db.execute(
+            "SELECT source_id FROM registry_objects WHERE source_system = ? AND kind = 'work' "
+            "AND sync_status = 'pending_links' ORDER BY source_id",
+            (source_system,),
+        )
+        return [r[0] for r in rows]

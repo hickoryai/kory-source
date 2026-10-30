@@ -94,6 +94,12 @@ class FakeLinear:
                 return False
             if key == "team" and node["team"]["key"] != cond["key"]["eq"]:
                 return False
+            if key == "id" and node["id"] not in cond["in"]:
+                return False
+            if key == "issue" and (
+                node["issue"] is None or not FakeLinear._match(node["issue"], cond)
+            ):
+                return False
             if key == "updatedAt" and lin.to_epoch(node["updatedAt"]) < lin.to_epoch(cond["gte"]):
                 return False
         return True
@@ -316,6 +322,22 @@ def test_import_creates_work_links_and_comments(reg, client, fake, clock):
     assert reg.work_context(reg.work_by_ticket("HAI-3")["id"])["dependencies"]["relates"] == []
 
 
+def test_walks_ask_linear_only_for_the_team(reg, client, fake, clock):
+    seed(fake)
+    out = importer(reg, client, clock).run(apply=True)
+    assert out["comments"]["totals"]["read"] == 2  # OPS-1's comment is never sent
+    assert out["comments"]["totals"]["skipped_other_team_or_not_on_issue"] == 0
+    filters = [r["variables"]["filter"] for r in fake.requests if "RegistryComments" in r["query"]]
+    assert filters and all(f["and"][0] == {"issue": lin._team_filter(["HAI"])} for f in filters)
+
+
+def test_several_teams_filter_with_or(reg, client, fake, clock):
+    seed(fake)
+    out = LinearImporter(reg, client, ["HAI", "OPS"], clock=clock).run(apply=True)
+    assert out["issues"]["totals"]["created"] == 5
+    assert out["comments"]["totals"]["created"] == 3
+
+
 async def test_get_context_takes_a_ticket_key(reg, client, fake, clock):
     from mira.registry.mcp import call_tool
 
@@ -400,6 +422,23 @@ def test_rejected_cursor_restarts_the_walk(reg, client, fake, clock):
     assert len(reg.works()) == 4
 
 
+def test_retries_running_out_on_a_resumed_walk_keep_the_cursor(reg, client, fake, clock):
+    seed(fake)
+    imp = importer(reg, client, clock)
+    imp._save(
+        "issues",
+        {"watermark": 0.0, "walk_since": 0.0, "walk_started_at": T0, "after_cursor": "c2"},
+    )
+    fake.fail_next = [503] * lin.MAX_ATTEMPTS
+    fake.requests.clear()
+    with pytest.raises(LinearError, match="after 5 attempts"):
+        imp.run(apply=True)
+    # Not a rejection, so no restart from the top: every attempt resumed at c2.
+    assert {r["variables"]["after"] for r in fake.requests} == {"c2"}
+    assert imp.state("issues")["after_cursor"] == "c2"
+    assert reg.works() == []
+
+
 def test_crash_between_object_and_links_is_retried(reg, client, fake, clock, monkeypatch):
     seed(fake)
     real = Registry._import_links
@@ -415,11 +454,22 @@ def test_crash_between_object_and_links_is_retried(reg, client, fake, clock, mon
     assert child["sync_status"] == "pending_links"
 
     monkeypatch.setattr(Registry, "_import_links", real)
-    reg.db.execute("DELETE FROM registry_sync_state")
     importer(reg, client, clock).run(apply=True)
     ctx = reg.work_context(child["id"])
     assert ctx["dependencies"]["parent"]["ticket"] == "HAI-1"
     assert reg.sync_status("linear") == {"synced": 4}
+
+
+def test_child_read_before_its_parent_gets_its_parent_link(reg, client, fake, clock):
+    # The epic was edited after its child, so the child is on an earlier page.
+    fake.issue("HAI-2", t=T0 - 5000, parent={"id": "uuid-HAI-1"})
+    fake.issue("HAI-9", t=T0 - 4500)
+    fake.issue("HAI-1", t=T0 - 4000, title="Epic")
+    out = importer(reg, client, clock).run(apply=True)
+    child = reg.work_by_ticket("HAI-2")
+    assert child["sync_status"] == "synced"
+    assert reg.work_context(child["id"])["dependencies"]["parent"]["ticket"] == "HAI-1"
+    assert out["issues"]["retried"] == {"read": 1, "resolved": 1}
 
 
 def test_concurrent_insert_of_the_same_ticket_keeps_one_row(reg, monkeypatch):
@@ -437,6 +487,31 @@ def test_concurrent_insert_of_the_same_ticket_keeps_one_row(reg, monkeypatch):
     [res] = reg.import_items("linear", [item], HUMAN)
     assert res["outcome"] == "unchanged"
     assert len(reg.works()) == 1
+
+
+def test_comment_insert_lost_to_a_concurrent_importer_reports_the_winner(reg, monkeypatch):
+    comment = {
+        "source_id": "cm-1",
+        "parent_source_id": "uuid-HAI-1",
+        "source_version": 5,
+        "body": "A",
+    }
+    reg.import_comments("linear", [comment])
+    real = reg.db.execute
+    calls = {"n": 0}
+
+    def racing(sql, params=()):
+        # The first lookup misses, as if another importer inserted just after it.
+        if sql.startswith("SELECT source_version FROM registry_comments"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return []
+        return real(sql, params)
+
+    monkeypatch.setattr(reg.db, "execute", racing)
+    [res] = reg.import_comments("linear", [comment])
+    assert res["outcome"] == "unchanged"
+    assert reg.db.execute("SELECT COUNT(*) FROM registry_comments") == [(1,)]
 
 
 def test_duplicate_deliveries_of_an_issue_in_one_batch(reg):
@@ -605,13 +680,13 @@ def test_inventory_counts_and_names_exceptions(client, fake):
     out = lin.inventory(client, ["HAI"])
     assert out["issues"]["total"] == 5
     assert (out["issues"]["archived"], out["issues"]["trashed"]) == (1, 1)
-    assert out["comments"] == {"on_team_issues": 2, "archived": 0, "not_on_issue": 1}
+    assert out["comments"] == {"on_team_issues": 2, "archived": 0}
     assert out["projects_referenced"] == 1
     joined = "\n".join(out["exceptions"])
     assert "projects: 1 referenced" in joined
-    assert "1 on documents or projects" in joined
+    assert "comments on documents or projects" in joined
     assert "of type 'similar'" in joined
-    assert "documents: not inventoried" in joined
+    assert "documents and comments on documents or projects: not inventoried" in joined
 
 
 # ── transactions ────────────────────────────────────────────────────────
