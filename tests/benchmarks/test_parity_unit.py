@@ -40,6 +40,17 @@ from .parity_stats import model_family, parity_verdict, registry_ab, totals
 HICKORY = Path(__file__).parent / "fixtures" / "hickory"
 SHA_A, SHA_B, HEAD = "a" * 40, "b" * 40, "f" * 40
 
+
+@pytest.fixture(autouse=True)
+def _restore_registry_hooks(monkeypatch):
+    """install_arm patches module globals; undo it so other test files see the shipped hooks."""
+    import mira.core.engine as engine_module
+    import mira.registry.prompt as registry_prompt
+
+    monkeypatch.setattr(engine_module, "apply_registry", engine_module.apply_registry)
+    monkeypatch.setattr(registry_prompt, "registry_rule", registry_prompt.registry_rule)
+
+
 GREPTILE_BODY = (
     '<a href="#"><img alt="P1" src="https://greptile-static-assets.s3.amazonaws.com/badges/p1.svg"></a> '
     "**Null token crashes refresh**\n\n`refresh()` dereferences `token` before the check. Greptile thinks so."
@@ -602,8 +613,6 @@ async def test_registry_as_of_drops_later_approvals(monkeypatch):
 async def test_arm_owns_the_engine_registry_hook(monkeypatch):
     import mira.core.engine as engine_module
 
-    monkeypatch.setattr(engine_module, "apply_registry", engine_module.apply_registry)
-    monkeypatch.setattr("mira.registry.prompt.registry_rule", parity_runner._registry_rule_off)
     monkeypatch.setattr("mira.registry.get_registry", lambda create=True: FakeRegistry())
     pr_info = SimpleNamespace(owner="o", repo="r")
     files = [SimpleNamespace(path="a.py")]
