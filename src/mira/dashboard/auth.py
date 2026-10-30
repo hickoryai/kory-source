@@ -20,7 +20,7 @@ SESSION_COOKIE = "mira_session"
 _PUBLIC_PATHS = {"/api/auth/login", "/docs", "/openapi.json", "/redoc"}
 # The badge SVG must be public so GitHub can embed it as an image
 _PUBLIC_SVG = re.compile(r"/api/repos/[^/]+/[^/]+/blast-radius\.svg")
-_REVIEW_API = re.compile(r"/api/reviews(?:/[^/]+(?:/report)?)?")
+_REVIEW_API = re.compile(r"/api/reviews(?:/[^/]+(?:/report|/work/[^/]+)?)?")
 
 
 class LoginRequest(BaseModel):

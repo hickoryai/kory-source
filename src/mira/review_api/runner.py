@@ -1,8 +1,12 @@
 """Run one review-API job: capture the snapshot, review it, classify the outcome.
 
-Every model role uses the router-acp seat provider. There is no cloud-key or
-local fallback, ensemble sampling and tool calling stay off, and cross-PR
-overlap detection is skipped because it reads other PRs. Each job observes
+Every model role uses the router-acp seat provider. Kory Source runs no
+inference for a job: each logical model call becomes a ``review_api_work``
+row that the client who submitted the job runs on its own seats and posts
+back (HAI-12330). The relay URL, token, and session are never read here.
+There is no cloud-key or local fallback, ensemble sampling and tool calling
+stay off, and cross-PR overlap detection is skipped because it reads other
+PRs. Each job observes
 its own model calls through ``router_acp.call_observer``. A failed call in
 any pass, including the optional passes the engine tolerates, fails the job
 with a code that names the cause, so a seat failure never reads as a clean
@@ -11,7 +15,9 @@ review.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -24,7 +30,7 @@ from mira.review_api.snapshot import (
     SnapshotError,
     SnapshotReader,
 )
-from mira.review_api.store import ReviewJob
+from mira.review_api.store import ReviewJob, ReviewJobStore
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +56,10 @@ _CODE_ERRORS = {
 CustomRulesProvider = Callable[[FrozenSnapshot], Awaitable[list[dict[str, str]]]]
 custom_rules_providers: list[CustomRulesProvider] = []
 
+# How often a waiting call re-reads its work row. The answer may land on any
+# instance, so the database is polled; 500 ms keeps a small Cloud SQL quiet.
+WORK_POLL_SECONDS = 0.5
+
 
 class JobFailure(Exception):
     def __init__(self, code: str, message: str) -> None:
@@ -71,11 +81,61 @@ StageCallback = Callable[..., None]
 ReaderFactory = Callable[[str, str], Awaitable[SnapshotReader]]
 
 
-def _build_engine(provider: ReadOnlySnapshotProvider):  # type: ignore[no-untyped-def]
+def _work_store() -> ReviewJobStore:
+    from mira.review_api import service
+
+    svc = service.current()
+    if svc is not None:
+        return svc.store
+    from mira.dashboard.api import _app_db
+
+    return ReviewJobStore(_app_db)
+
+
+def requester_transport(
+    store: ReviewJobStore, job_id: str
+) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
+    """A ``RouterAcpProvider`` transport that parks each attempt as a work row.
+
+    It returns ``{text, actual_model}`` once the requester answers, or raises
+    ``RouterTransportError`` with the same ``kind`` values the HTTP transport
+    uses, so retries and the pin check stay in the provider.
+    """
+    from mira.llm.router_acp import RouterTransportError
+
+    async def transport(request: dict[str, Any]) -> dict[str, Any]:
+        body = request["body"]
+        work_id = store.create_work(
+            job_id, body["prompt"], body["model"], int(body["timeout_seconds"])
+        )
+        try:
+            while True:
+                work = store.get_work(work_id)
+                if work is None or work.state == "expired":
+                    raise RouterTransportError("work item expired", kind="router_failed")
+                if work.state == "answered":
+                    return {"text": work.text, "actual_model": work.actual_model}
+                if work.state == "failed":
+                    raise RouterTransportError(
+                        f"requester reported {work.error_code}",
+                        kind=work.error_code,
+                        body={"actual_model": work.actual_model or "unknown"},
+                    )
+                if time.time() > work.deadline_at and store.time_out_work(work_id):
+                    raise RouterTransportError("no answer before the work deadline", kind="timeout")
+                await asyncio.sleep(WORK_POLL_SECONDS)
+        except asyncio.CancelledError:
+            # A sibling failed or the job deadline fired. Not a second failure.
+            store.expire_work(work_id=work_id)
+            raise
+
+    return transport
+
+
+def _build_engine(provider: ReadOnlySnapshotProvider, job_id: str):  # type: ignore[no-untyped-def]
     from mira.config import load_config
     from mira.core.engine import ReviewEngine
     from mira.dashboard.models_config import llm_config_for
-    from mira.llm import create_llm
     from mira.llm.router_acp import RouterAcpProvider
 
     config = load_config()
@@ -93,15 +153,15 @@ def _build_engine(provider: ReadOnlySnapshotProvider):  # type: ignore[no-untype
         }
     )
     config = config.model_copy(update={"review": review})
-    llms = {
-        role: create_llm(llm_config_for(role, config.llm))
-        for role in ("review", "indexing", "security")
-    }
-    for role, llm in llms.items():
-        if not isinstance(llm, RouterAcpProvider):
+    transport = requester_transport(_work_store(), job_id)
+    llms = {}
+    for role in ("review", "indexing", "security"):
+        role_config = llm_config_for(role, config.llm)
+        if role_config.provider not in {"router-acp", "router_acp"}:
             raise JobFailure(
                 "seat_provider_unconfigured", f"The {role} model is not a router-acp seat."
             )
+        llms[role] = RouterAcpProvider(role_config, transport=transport, relay=False)
     return ReviewEngine(
         config=config,
         llm=llms["review"],
@@ -178,7 +238,7 @@ def _failed_call(calls: list[dict[str, Any]]) -> JobFailure | None:
 async def run_job(
     job: ReviewJob, reader_factory: ReaderFactory, set_stage: StageCallback
 ) -> JobOutcome:
-    from mira.llm.router_acp import call_observer
+    from mira.llm.router_acp import call_observer, job_llm
 
     calls: list[dict[str, Any]] = []
     try:
@@ -198,12 +258,14 @@ async def run_job(
             merge_base_sha=snapshot.merge_base_sha,
         )
         provider = ReadOnlySnapshotProvider(reader, snapshot)
-        engine = _build_engine(provider)
+        engine = _build_engine(provider, job.id)
         extra_rules: list[dict[str, str]] = []
         for rules_provider in custom_rules_providers:
             extra_rules.extend(await rules_provider(snapshot))
 
         token = call_observer.set(calls.append)
+        # The registry judge reads this, so its calls are this job's work too.
+        judge_token = job_llm.set(engine.llm)
         try:
             result = await engine.review_snapshot(
                 snapshot.pr_info(),
@@ -212,6 +274,7 @@ async def run_job(
                 extra_custom_rules=extra_rules or None,
             )
         finally:
+            job_llm.reset(judge_token)
             call_observer.reset(token)
 
         if provider.write_attempts:

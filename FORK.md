@@ -154,6 +154,43 @@ needs CPU between requests, which the `kory_source` module provides whenever
 `min_instance_count >= 1`: prod already sets 1; dev sets 0 and must be raised
 before the executor is enabled there.
 
+## Requester-run review seats (HAI-12330)
+
+Review-API model calls run on the submitting client's router-acp seats, not
+on a relay Kory Source dials. Each attempt is a `review_api_work` row that
+the client reads from `pending_work` and answers through
+`POST /api/reviews/{id}/work/{work_id}`. The worker polls the row every
+500 ms, so any instance sharing the database can take the answer. Contract:
+`docs/review-api.md`. Files changed:
+
+- `src/mira/review_api/store.py` (the `review_api_work` table, created
+  idempotently; conditional answer, timeout, and expiry; `finish` and
+  `interrupt_expired` expire pending work);
+- `src/mira/review_api/runner.py` (`requester_transport`; providers built
+  with `relay=False`; `job_llm` set around `review_snapshot`);
+- `src/mira/dashboard/routers/reviews.py` (`pending_work` on the job view
+  and the work route) and `src/mira/dashboard/auth.py` (bearer regex admits
+  `/work/{work_id}`);
+- `src/mira/llm/router_acp.py` (`relay=False`, `job_llm`,
+  `UnconfiguredSeatProvider`, `refuse_unrequested_seat`; the HTTP transport
+  stays for the benchmark harness), `src/mira/llm/__init__.py` (factory
+  returns `UnconfiguredSeatProvider`), `src/mira/error_messages.py`
+  (`seat_provider_unconfigured`);
+- `src/mira/registry/conflicts.py` (`requester_judge` reads `job_llm`; the
+  process-wide `Registry.judge` is never swapped);
+- `src/mira/platforms/handlers.py` and `src/mira/platforms/index_handlers.py`
+  (fail closed with `seat_provider_unconfigured` before any GitHub write or
+  index call when `llm.provider` is router-acp);
+- `docs/review-api.md`, `tests/benchmarks/fixtures/hickory/README.md`, and
+  the `run_router_acp.py` docstring;
+- `tests/test_review_api.py`, `tests/test_api_routes.py`,
+  `tests/test_router_acp_provider.py`.
+
+`src/mira/core/engine.py` and `src/mira/platforms/server.py` are unchanged.
+Webhook reviews, push indexing, PR commands, and the CLI review command have
+no requester yet; they fail with `seat_provider_unconfigured` until a
+follow-up gives them one.
+
 ## Local Python boot (SQLite)
 
 Docker is not required. From the repository root:

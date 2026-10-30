@@ -13,13 +13,25 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   ``default``, ``router-default``, and ``router-acp-default`` are unpinned.
   A pin that does not run raises ``router_acp_model_mismatch``. The provider
   never substitutes another model.
-* Transport is HTTP ``POST {router_acp_url}/api/agent/llm-complete``. The
-  relay owns ``router-acp`` and its credentials. This module does not launch
-  a provider binary and does not read session files.
-* Set ``router_acp_url``, ``router_acp_token``, and ``router_acp_session`` in
-  deployment config. Environment variables ``MIRA_ROUTER_ACP_URL``,
-  ``MIRA_ROUTER_ACP_TOKEN``, and ``MIRA_ROUTER_ACP_SESSION`` apply only when
-  the matching config field is unset. ``KORY_CODE_SESSION_ID`` is not read.
+* The default transport is HTTP ``POST {router_acp_url}/api/agent/llm-complete``.
+  Only a direct ``RouterAcpProvider(config)`` uses it (the benchmark harness
+  and its tests). The relay owns ``router-acp`` and its credentials. This
+  module does not launch a provider binary and does not read session files.
+* For that HTTP path, set ``router_acp_url``, ``router_acp_token``, and
+  ``router_acp_session`` in config. Environment variables
+  ``MIRA_ROUTER_ACP_URL``, ``MIRA_ROUTER_ACP_TOKEN``, and
+  ``MIRA_ROUTER_ACP_SESSION`` apply only when the matching config field is
+  unset. ``KORY_CODE_SESSION_ID`` is not read.
+* ``relay=False`` sends only ``{"body", "timeout"}`` to the injected
+  transport and never reads the relay URL, token, or session. The review API
+  uses it to hand each call to the requester that submitted the job
+  (HAI-12330). Kory Source stores no relay for reviews.
+* ``create_llm`` does not build this provider. It returns
+  ``UnconfiguredSeatProvider``, which fails every completion with
+  ``seat_provider_unconfigured``. Webhook reviews and indexing call
+  ``refuse_unrequested_seat`` first so they fail before any GitHub write.
+* ``job_llm`` is a context variable holding the running review job's
+  requester-backed provider. The registry judge uses it during a job.
 * ``attribution_key`` is a context variable the benchmark sets around one PR.
   ``call_log`` keeps the latest 256 logical completions (review and judge).
 * ``call_observer`` is a context variable holding a callback. The review API
@@ -75,6 +87,7 @@ attribution_key: ContextVar[str] = ContextVar("mira_router_acp_attribution", def
 call_observer: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
     "mira_router_acp_call_observer", default=None
 )
+job_llm: ContextVar[Any] = ContextVar("mira_router_acp_job_llm", default=None)
 _tracing_ready = False
 
 
@@ -173,8 +186,10 @@ class RouterAcpProvider:
         transport: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
         tracer: Callable[..., Awaitable[Any]] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        relay: bool = True,
     ) -> None:
         self.config = config
+        self._relay = relay
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self._transport = transport or self._http_transport
@@ -298,14 +313,14 @@ class RouterAcpProvider:
             "priority": self._priority(),
             "timeout_seconds": self.config.router_acp_timeout_seconds,
         }
-        return await self._transport(
-            {
-                "url": f"{self._relay_url()}/api/agent/llm-complete",
-                "headers": self._headers(),
-                "body": body,
-                "timeout": self.config.router_acp_timeout_seconds,
-            }
-        )
+        request: dict[str, Any] = {
+            "body": body,
+            "timeout": self.config.router_acp_timeout_seconds,
+        }
+        if self._relay:
+            request["url"] = f"{self._relay_url()}/api/agent/llm-complete"
+            request["headers"] = self._headers()
+        return await self._transport(request)
 
     async def _complete_raw(self, prompt: str, requested: str) -> dict[str, Any]:
         attempts = 0
@@ -527,3 +542,29 @@ class RouterAcpProvider:
         from mira.llm.tool_schemas import SUBMIT_WALKTHROUGH_TOOL
 
         return await self.complete_with_tools(messages, tools=[SUBMIT_WALKTHROUGH_TOOL])
+
+
+def _is_router_acp(config: LLMConfig) -> bool:
+    return config.provider in {"router-acp", "router_acp"}
+
+
+def refuse_unrequested_seat(config: LLMConfig, caller: str) -> None:
+    """Raise before a caller with no requester would use a router-acp seat."""
+    if _is_router_acp(config):
+        raise LLMError(
+            "seat_provider_unconfigured",
+            detail=f"{caller} has no requester to run router-acp calls",
+        )
+
+
+class UnconfiguredSeatProvider(RouterAcpProvider):
+    """What ``create_llm`` returns for router-acp: no relay, no requester."""
+
+    def __init__(self, config: LLMConfig) -> None:
+        super().__init__(config, transport=self._refuse, relay=False)
+
+    async def _refuse(self, request: dict[str, Any]) -> dict[str, Any]:
+        raise LLMError("seat_provider_unconfigured", detail="no requester for this call")
+
+    async def _generate(self, prompt: str) -> tuple[str, dict[str, Any] | None]:
+        raise LLMError("seat_provider_unconfigured", detail="no requester for this call")

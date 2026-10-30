@@ -24,3 +24,12 @@ GITHUB_TOKEN="$(gh auth token)" CODEX_HOME=/home/devagent/.codex \
 The command creates three raw run artifacts and `baseline-codex-cli.json` in
 this directory. The summary records population σ for F1, precision, recall,
 all per-PR latency observations, and each PR across the three runs.
+
+## Router-acp harness
+
+`run_router_acp.py` must run on the box that owns the relay, with
+`MIRA_ROUTER_ACP_URL` (or its loopback relay entry) pointing at that box's
+loopback relay. It constructs `RouterAcpProvider` directly with that URL.
+Kory Source itself stores no relay URL for reviews: the review API hands
+each model call to the client that submitted the job (HAI-12330), and
+`create_llm("router-acp")` fails with `seat_provider_unconfigured`.

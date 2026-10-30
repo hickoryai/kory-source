@@ -9,6 +9,7 @@ from mira.config import load_config
 from mira.index.indexer import index_diff, index_repo
 from mira.index.store import IndexStore
 from mira.llm import create_llm
+from mira.llm.router_acp import refuse_unrequested_seat
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,13 @@ async def run_incremental_index(
     app_db = _get_app_db()
     config = load_config()
     from mira.dashboard.models_config import llm_config_for
+
+    # No requester owns a router-acp seat for push indexing (HAI-12330).
+    try:
+        refuse_unrequested_seat(config.llm, "push indexing")
+    except Exception as exc:
+        logger.warning("Skipping incremental index for %s/%s: %s", owner, repo, exc)
+        return
 
     llm = create_llm(llm_config_for("indexing", config.llm))
     store = IndexStore.open(owner, repo, platform=platform)

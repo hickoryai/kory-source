@@ -2,8 +2,10 @@
 
 These tests boot the real app (``create_app`` + lifespan), the real job
 executor, and the real review engine. GitHub is an ``httpx.MockTransport``
-that fails any non-GET request; the router-acp relay is a fake transport.
-The database is SQLite under a temporary ``MIRA_INDEX_DIR``.
+that fails any non-GET request. Model calls are answered the way the Kory
+Code client answers them (HAI-12330): poll ``pending_work`` and post each
+completion to ``/api/reviews/{id}/work/{work_id}``. The relay HTTP transport
+must never run. The database is SQLite under a temporary ``MIRA_INDEX_DIR``.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -144,7 +147,7 @@ class FakeGitHub:
 
 
 class FakeSeat:
-    """Stands in for the relay's ``/api/agent/llm-complete``."""
+    """Stands in for the requester's seat: one prompt in, one completion out."""
 
     def __init__(self) -> None:
         self.prompts: list[str] = []
@@ -193,6 +196,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path / "idx"))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("LLM_OTLP_ENDPOINT", raising=False)
+    # Set to values that would fail if read: the review API has no relay.
+    monkeypatch.setenv("MIRA_ROUTER_ACP_URL", "http://relay.example.com")
+    monkeypatch.setenv("MIRA_ROUTER_ACP_TOKEN", "must-not-be-sent")
+    monkeypatch.setenv("MIRA_ROUTER_ACP_SESSION", "must-not-be-sent")
+    monkeypatch.setattr(review_runner, "WORK_POLL_SECONDS", 0.01)
     monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
     monkeypatch.setenv("MIRA_REVIEW_API_ENABLED", "1")
     monkeypatch.setenv(
@@ -235,10 +243,14 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     github = FakeGitHub()
     seat = FakeSeat()
 
-    async def seat_transport(self, request):  # type: ignore[no-untyped-def]
-        return seat.respond(request["body"]["prompt"])
+    relay_calls: list[dict[str, Any]] = []
 
-    monkeypatch.setattr(RouterAcpProvider, "_http_transport", seat_transport)
+    async def relay_spy(self, request):  # type: ignore[no-untyped-def]
+        relay_calls.append(request)
+        raise AssertionError("the review API dialed the relay")
+
+    monkeypatch.setattr(RouterAcpProvider, "_http_transport", relay_spy)
+    monkeypatch.setattr(sys.modules[__name__], "_SEAT", seat)
     RouterAcpProvider.call_log.clear()
 
     original_factory = review_service.github_reader_factory
@@ -257,7 +269,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("mira.platforms.server.backfill_missing_indexes", no_backfill)
     monkeypatch.setattr("mira.security.poller.run_forever", no_poller)
     monkeypatch.setattr(review_runner, "custom_rules_providers", [])
-    return {"db": db, "github": github, "seat": seat, "tmp": tmp_path}
+    return {"db": db, "github": github, "seat": seat, "tmp": tmp_path, "relay_calls": relay_calls}
 
 
 class FakeAppAuth:
@@ -282,13 +294,41 @@ def _submit(client: TestClient, token: str = ENGINEER_TOKEN, **body: Any) -> htt
     return client.post("/api/reviews", json=payload, headers=_auth(token))
 
 
-def _wait(client: TestClient, job_id: str, token: str = ENGINEER_TOKEN) -> dict[str, Any]:
+_SEAT: FakeSeat | None = None
+
+
+def _seat_payload(seat: FakeSeat, prompt: str) -> dict[str, Any]:
+    try:
+        return seat.respond(prompt)
+    except RouterTransportError as exc:
+        return {"error": exc.kind}
+
+
+def _answer(
+    client: TestClient, job_id: str, item: dict[str, Any], token: str = ENGINEER_TOKEN
+) -> httpx.Response:
+    assert _SEAT is not None
+    return client.post(
+        f"/api/reviews/{job_id}/work/{item['work_id']}",
+        json=_seat_payload(_SEAT, item["prompt"]),
+        headers=_auth(token),
+    )
+
+
+def _wait(
+    client: TestClient, job_id: str, token: str = ENGINEER_TOKEN, *, answer: bool = True
+) -> dict[str, Any]:
+    """Poll like the Kory Code client: run each pending prompt, post it back."""
     deadline = time.time() + 20
     while time.time() < deadline:
         body = client.get(f"/api/reviews/{job_id}", headers=_auth(token)).json()
         if body["state"] in {"succeeded", "failed", "interrupted"}:
+            assert body["pending_work"] == []
             return body
-        time.sleep(0.05)
+        for item in body["pending_work"] if answer else []:
+            resp = _answer(client, job_id, item, token)
+            assert resp.status_code in {200, 409}, resp.text
+        time.sleep(0.02)
     raise AssertionError(f"job {job_id} did not finish")
 
 
@@ -336,6 +376,7 @@ def test_review_succeeds_without_touching_github(env):
         assert "Nothing was posted to GitHub." in report.text
 
     _assert_no_side_effects(env)
+    assert env["relay_calls"] == []
     reads = env["github"].requests
     for r in reads:
         path = r.url.path
@@ -525,6 +566,34 @@ def _reader_factory(github: FakeGitHub):
     return factory
 
 
+async def _run_answered(env: dict[str, Any], job: Any, set_stage: Any = None) -> JobOutcome:
+    """Run one job in-process while a fake requester answers its work rows."""
+    store = ReviewJobStore(env["db"])
+    claimed = store.claim_next("w_test", lease_seconds=60, deadline_seconds=60, max_running=10)
+    assert claimed is not None and claimed.id == job.id
+
+    async def requester() -> None:
+        while True:
+            for work in store.pending_work(job.id):
+                payload = _seat_payload(env["seat"], work.prompt)
+                store.answer_work(
+                    job.id,
+                    work.id,
+                    text=payload.get("text", ""),
+                    actual_model=payload.get("actual_model", "unknown"),
+                    error_code=payload.get("error", ""),
+                )
+            await asyncio.sleep(0.01)
+
+    answering = asyncio.create_task(requester())
+    try:
+        return await run_job(
+            claimed, _reader_factory(env["github"]), set_stage or (lambda *a, **k: None)
+        )
+    finally:
+        answering.cancel()
+
+
 async def test_head_moving_before_capture_fails_cleanly(env):
     store = ReviewJobStore(env["db"])
     job = _job_row(store)
@@ -550,9 +619,7 @@ async def test_push_after_capture_does_not_change_the_review(env):
 
     seat.respond = push_then_respond  # type: ignore[method-assign]
     stages: list[tuple[str, dict]] = []
-    outcome = await run_job(
-        job, _reader_factory(github), lambda stage, **f: stages.append((stage, f))
-    )
+    outcome = await _run_answered(env, job, lambda stage, **f: stages.append((stage, f)))
     assert outcome.state == "succeeded"
     assert stages[0] == (
         "reviewing",
@@ -577,6 +644,7 @@ async def test_push_after_capture_does_not_change_the_review(env):
         (["seat_exhausted", "seat_exhausted"], "seat_exhausted"),
         (["workstation_outage", "workstation_outage"], "workstation_outage"),
         (["model_mismatch"], "model_mismatch"),
+        (["timeout"], "model_timeout"),
     ],
 )
 def test_seat_failures_are_distinct(env, states, code):
@@ -637,9 +705,250 @@ async def test_custom_rules_hook_reaches_the_prompt(env, monkeypatch):
 
     monkeypatch.setattr(review_runner, "custom_rules_providers", [registry_rules])
     store = ReviewJobStore(env["db"])
-    outcome = await run_job(_job_row(store), _reader_factory(env["github"]), lambda *a, **k: None)
+    outcome = await _run_answered(env, _job_row(store))
     assert outcome.state == "succeeded"
     assert any("Never divide by a literal zero." in p for p in env["seat"].prompts)
+
+
+# ── requester work: protocol, auth, clocks ─────────────────────────
+
+
+def _first_pending(client: TestClient, job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        body = client.get(f"/api/reviews/{job_id}", headers=_auth()).json()
+        if body["pending_work"]:
+            return body, body["pending_work"][0]
+        assert body["state"] in {"queued", "running"}, body["error"]
+        time.sleep(0.02)
+    raise AssertionError("no work became pending")
+
+
+def test_pending_work_shape_and_relay_never_dialed(env):
+    with _client() as client:
+        created = _submit(client).json()
+        assert created["pending_work"] == []
+        view, item = _first_pending(client, created["id"])
+        assert (view["state"], view["stage"]) == ("running", "reviewing")
+        assert set(item) == {"work_id", "prompt", "model", "timeout_seconds"}
+        assert item["work_id"].startswith("wrk_") and len(item["work_id"]) == 36
+        assert item["model"] == "auto"
+        assert item["timeout_seconds"] == 900
+        assert "Mira" in item["prompt"]
+        report = client.get(f"/api/reviews/{created['id']}/report", headers=_auth())
+        assert item["prompt"] not in report.text
+        done = _wait(client, created["id"])
+    assert done["state"] == "succeeded"
+    assert done["models"]["actual"] == ["grok/grok-4.6"]
+    assert env["relay_calls"] == []
+
+
+def test_only_the_submitting_token_can_answer(env):
+    with _client() as client:
+        job_id = _submit(client).json()["id"]
+        _, item = _first_pending(client, job_id)
+        url = f"/api/reviews/{job_id}/work/{item['work_id']}"
+        good = {"text": "x", "actual_model": "grok/grok-4.6"}
+
+        other = client.post(url, json=good, headers=_auth(RELAY_TOKEN))
+        assert other.status_code == 404
+        assert other.json()["error"]["code"] == "review_not_found"
+        assert client.post(url, json=good).status_code == 401
+        assert client.post(url, json=good, headers=_auth("wrong")).status_code == 401
+        still = client.get(f"/api/reviews/{job_id}", headers=_auth()).json()["pending_work"]
+        assert item["work_id"] in {w["work_id"] for w in still}
+
+        missing = client.post(f"/api/reviews/{job_id}/work/wrk_nope", json=good, headers=_auth())
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "work_not_found"
+
+        for bad in (
+            {"text": "x", "actual_model": "m", "error": "timeout"},
+            {"text": "   ", "actual_model": "m"},
+            {"text": "x"},
+            {"text": "x", "actual_model": "m" * 201},
+            {"error": "on_fire"},
+            {"text": "x", "actual_model": "m", "extra": 1},
+        ):
+            resp = client.post(url, json=bad, headers=_auth())
+            assert resp.status_code == 422, bad
+            assert resp.json()["error"]["code"] == "invalid_request"
+        still = client.get(f"/api/reviews/{job_id}", headers=_auth()).json()["pending_work"]
+        assert item["work_id"] in {w["work_id"] for w in still}
+
+        login = client.post("/api/auth/login", json={"username": "admin", "password": "pw"})
+        assert login.status_code == 200
+        session = client.post(url, json=good)
+        assert session.status_code == 403
+        assert session.json()["error"]["code"] == "token_required"
+        client.cookies.clear()
+
+        first = _answer(client, job_id, item)
+        assert first.status_code == 200
+        assert first.json() == {"work_id": item["work_id"], "state": "answered"}
+        again = _answer(client, job_id, item)
+        assert again.status_code == 409
+        assert again.json()["error"]["code"] == "work_not_pending"
+        done = _wait(client, job_id)
+        assert done["state"] == "succeeded"
+        late = _answer(client, job_id, item)
+        assert late.json()["error"]["code"] == "work_not_pending"
+
+
+def test_bearer_reaches_the_work_route_only(env):
+    with _client() as client:
+        job_id = _submit(client).json()["id"]
+        _, item = _first_pending(client, job_id)
+        for path in (
+            f"/api/reviews/{job_id}/work",
+            f"/api/reviews/{job_id}/work/{item['work_id']}/x",
+            f"/api/reviews/{job_id}/other/{item['work_id']}",
+        ):
+            assert client.post(path, json={}, headers=_auth()).status_code == 401, path
+        _wait(client, job_id)
+
+
+def test_unanswered_work_times_out_without_findings(env, monkeypatch):
+    monkeypatch.setattr(
+        mira.config,
+        "_global_defaults",
+        {
+            "llm": {"provider": "router-acp", "model": "auto", "router_acp_timeout_seconds": 1},
+            "review": {"self_critique": False},
+        },
+    )
+    with _client() as client:
+        job_id = _submit(client).json()["id"]
+        _, item = _first_pending(client, job_id)
+        assert item["timeout_seconds"] == 1
+        done = _wait(client, job_id, answer=False)
+        late = _answer(client, job_id, item)
+    assert done["state"] == "failed"
+    assert done["error"]["code"] == "model_timeout"
+    assert done["findings"] is None
+    assert any(c["state"] == "timeout" for c in done["model_calls"])
+    assert late.status_code == 409
+    rows = (
+        env["db"]
+        ._sqlite_conn.execute("SELECT state FROM review_api_work WHERE job_id = ?", (job_id,))
+        .fetchall()
+    )
+    assert {r[0] for r in rows} <= {"failed", "answered", "expired"}
+
+
+def test_pinned_model_answered_by_another_fails(env, monkeypatch):
+    monkeypatch.setattr(
+        mira.config,
+        "_global_defaults",
+        {
+            "llm": {"provider": "router-acp", "model": "grok/grok-4.6"},
+            "review": {"self_critique": False},
+        },
+    )
+    env["seat"].actual_model = "claude/sonnet-5.5"
+    with _client() as client:
+        done = _wait(client, _submit(client).json()["id"])
+    assert done["state"] == "failed"
+    assert done["error"]["code"] == "model_mismatch"
+    assert done["findings"] is None
+    assert done["models"]["requested"] == ["grok/grok-4.6"]
+
+
+def test_retry_opens_a_new_work_item(env):
+    env["seat"].fail_main = ["workstation_outage"]
+    with _client() as client:
+        job_id = _submit(client).json()["id"]
+        done = _wait(client, job_id)
+    assert done["state"] == "succeeded"
+    rows = (
+        env["db"]
+        ._sqlite_conn.execute(
+            "SELECT state, error_code FROM review_api_work WHERE job_id = ?", (job_id,)
+        )
+        .fetchall()
+    )
+    assert ("failed", "workstation_outage") in rows
+    assert sum(1 for r in rows if r[0] == "answered") >= 2
+
+
+async def test_finishing_a_job_expires_its_pending_work(env):
+    store = ReviewJobStore(env["db"])
+    job = _job_row(store)
+    claimed = store.claim_next("w1", lease_seconds=30, deadline_seconds=60, max_running=2)
+    assert claimed is not None
+    work_id = store.create_work(job.id, "p", "auto", 900)
+    assert [w.id for w in store.pending_work(job.id)] == [work_id]
+    assert store.finish(job.id, "w1", state="failed", error_code="deadline_exceeded")
+    assert store.get_work(work_id).state == "expired"  # type: ignore[union-attr]
+    assert store.pending_work(job.id) == []
+    assert not store.answer_work(job.id, work_id, text="x", actual_model="m")
+
+
+async def test_cancelled_waiter_expires_its_item_without_a_failure(env):
+    store = ReviewJobStore(env["db"])
+    job = _job_row(store)
+    store.claim_next("w1", lease_seconds=30, deadline_seconds=60, max_running=2)
+    transport = review_runner.requester_transport(store, job.id)
+    task = asyncio.create_task(
+        transport({"body": {"prompt": "p", "model": "auto", "timeout_seconds": 900}})
+    )
+    await asyncio.sleep(0.05)
+    (work,) = store.pending_work(job.id)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.get_work(work.id).state == "expired"  # type: ignore[union-attr]
+
+
+async def test_registry_judge_uses_the_job_requester(env):
+    from mira.exceptions import LLMError
+    from mira.llm.router_acp import job_llm
+    from mira.registry.conflicts import default_judge
+
+    judge = default_judge()
+    assert judge is not None
+    new = {"id": "", "kind": "rule", "title": "New", "summary": "", "body": ""}
+    old = {"id": "dec_1", "kind": "rule", "title": "Old", "summary": "", "body": ""}
+    with pytest.raises(LLMError) as exc:
+        await judge(new, old)
+    assert exc.value.code == "seat_provider_unconfigured"
+    assert env["relay_calls"] == []
+
+    class Seat:
+        async def complete(self, messages, json_mode=True):  # type: ignore[no-untyped-def]
+            return json.dumps({"relation": "none", "new_clause": "", "existing_clause": ""})
+
+    token = job_llm.set(Seat())
+    try:
+        assert (await judge(new, old))["relation"] == "none"
+    finally:
+        job_llm.reset(token)
+
+
+async def test_webhook_review_fails_before_any_github_write(env, monkeypatch):
+    from mira.core.review_status import tracker
+    from mira.exceptions import LLMError
+    from mira.platforms import handlers
+
+    entered: list[str] = []
+
+    async def review_pr(self, pr_url):  # type: ignore[no-untyped-def]
+        entered.append(pr_url)
+
+    monkeypatch.setattr(handlers.ReviewEngine, "review_pr", review_pr)
+
+    class NoWrites:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"provider.{name} was used")
+
+    with pytest.raises(LLMError) as exc:
+        await handlers.run_pr_review(
+            NoWrites(), OWNER, REPO, 7, "https://github.com/hickoryai/widget/pull/7", False, "kory"
+        )
+    assert exc.value.code == "seat_provider_unconfigured"
+    assert entered == []
+    assert tracker.try_start(f"{OWNER}/{REPO}", 7, "", "u")  # the slot was released
+    tracker.complete(f"{OWNER}/{REPO}", 7)
 
 
 # ── read-only provider ─────────────────────────────────────────────

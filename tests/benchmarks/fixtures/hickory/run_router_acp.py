@@ -8,6 +8,11 @@ to ReviewEngine.
 
 MIRA_ROUTER_ACP_BENCH_LIMIT=1 reviews the first held-out PR only and writes
 the summary under /tmp.
+
+Run this on the box that owns the relay. The harness constructs
+RouterAcpProvider directly with that box's loopback URL. Kory Source stores
+no relay URL for reviews (HAI-12330): the review API hands each call to the
+client that submitted the job, and create_llm("router-acp") refuses calls.
 """
 
 from __future__ import annotations

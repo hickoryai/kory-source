@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 
 import pytest
 from pydantic import ValidationError
@@ -9,7 +10,12 @@ from mira.config import LLMConfig
 from mira.dashboard.model_catalog import active_backend, build_options, fetch_catalog
 from mira.exceptions import LLMError, NonRetriableLLMError
 from mira.llm import create_llm
-from mira.llm.router_acp import RouterAcpProvider, RouterTransportError, attribution_key
+from mira.llm.router_acp import (
+    RouterAcpProvider,
+    RouterTransportError,
+    attribution_key,
+    refuse_unrequested_seat,
+)
 
 
 def _config(**kwargs) -> LLMConfig:
@@ -40,6 +46,47 @@ def test_factory_selects_router_provider():
     assert provider.supports_tool_calling is False
     assert provider.supports_temperature is False
     assert provider.supports_json_mode is True
+
+
+async def test_factory_provider_has_no_requester_and_reads_no_relay(monkeypatch):
+    # HAI-12330: a router-acp call made outside a review-API job has no seat.
+    monkeypatch.setenv("MIRA_ROUTER_ACP_URL", "http://relay.example.com")
+
+    async def dial(self, request):  # type: ignore[no-untyped-def]
+        raise AssertionError("factory provider dialed the relay")
+
+    monkeypatch.setattr(RouterAcpProvider, "_http_transport", dial)
+    monkeypatch.setattr(RouterAcpProvider, "_relay_url", dial)
+    provider = create_llm(_config())
+    for call in (
+        provider.complete([{"role": "user", "content": "hi"}]),
+        provider.walkthrough([{"role": "user", "content": "hi"}]),
+    ):
+        with pytest.raises(LLMError) as exc:
+            await call
+        assert exc.value.code == "seat_provider_unconfigured"
+    assert RouterAcpProvider.call_log == deque()
+
+
+def test_refuse_unrequested_seat_only_for_router_acp():
+    with pytest.raises(LLMError) as exc:
+        refuse_unrequested_seat(_config(), "webhook review")
+    assert exc.value.code == "seat_provider_unconfigured"
+    refuse_unrequested_seat(LLMConfig(provider="openrouter", model="x/y"), "webhook review")
+
+
+async def test_relay_false_sends_no_url_or_credentials(monkeypatch):
+    monkeypatch.setenv("MIRA_ROUTER_ACP_URL", "http://relay.example.com")
+    seen = {}
+
+    async def transport(request):
+        seen.update(request)
+        return {"text": "ok", "actual_model": "grok/grok-4.6"}
+
+    provider = RouterAcpProvider(_config(), transport=transport, sleep=_no_sleep, relay=False)
+    assert await provider.complete([{"role": "user", "content": "x"}], json_mode=False) == "ok"
+    assert set(seen) == {"body", "timeout"}
+    assert seen["body"]["model"] == "auto"
 
 
 def test_catalog_treats_router_like_a_local_backend():

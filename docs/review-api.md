@@ -13,6 +13,12 @@ Callers:
 Both clients live in their own repositories. This service only provides the
 API.
 
+Kory Source runs no model inference for these reviews. Each model call the
+review needs is handed back to the client that submitted the job as a
+pending work item. The client runs the prompt on its own router-acp seats
+and posts the completion back (see [Requester work](#requester-work)). A
+client that never answers gets `model_timeout`, never findings.
+
 ## Flow
 
 1. `POST /api/reviews` with the repository, PR number, and the head SHA the
@@ -26,10 +32,13 @@ API.
    again first; if the PR moved, the job fails with `head_sha_mismatch`
    before any model call. Pushes after capture do not change the review.
 5. The engine reviews the frozen diff. Every file read, tree listing, and
-   history lookup is pinned to the frozen head SHA.
+   history lookup is pinned to the frozen head SHA. Each model call appears
+   in the job's `pending_work`; the caller runs it and posts the answer to
+   `POST /api/reviews/{id}/work/{work_id}`.
 6. The result is written to the database, then the state becomes
    `succeeded`.
-7. The caller polls `GET /api/reviews/{id}` until the state is terminal.
+7. The caller polls `GET /api/reviews/{id}`, answering `pending_work` as it
+   appears, until the state is terminal.
 
 ## Authentication
 
@@ -38,11 +47,12 @@ or over plain HTTP to a loopback host (`localhost`, `127.0.0.1`, `::1`).
 Behind a TLS-terminating proxy such as Cloud Run, `X-Forwarded-Proto: https`
 counts as HTTPS.
 
-A review token reaches `/api/reviews` routes only. It is not a dashboard
-login and never grants admin access; using one anywhere else returns `401`.
-Logged-in dashboard users can read any job and open its report with their
-session cookie. They cannot submit, because a submission must come from a
-token with a repository allowlist.
+A review token reaches `/api/reviews`, `/api/reviews/{id}`,
+`/api/reviews/{id}/report`, and `/api/reviews/{id}/work/{work_id}` only. It is
+not a dashboard login and never grants admin access; using one anywhere else
+returns `401`. Logged-in dashboard users can read any job and open its report
+with their session cookie. They cannot submit or answer work, because both
+must come from the token that owns the job.
 
 ### Token configuration (server)
 
@@ -199,6 +209,7 @@ Errors use one shape:
      "attempts": 1, "priority": "review", "attribution": ""}
   ],
   "error": null,
+  "pending_work": [],
   "status_url": "https://.../api/reviews/rev_5f0c...",
   "report_url": "https://.../api/reviews/rev_5f0c.../report"
 }
@@ -211,6 +222,9 @@ Errors use one shape:
 - `coverage.skipped[].reason` is one of `patch_unavailable` (GitHub returned
   no patch: binary or too large), `excluded_by_filter` (matched the review
   file filter), or `size_or_priority_cap` (cut by the diff size budget).
+- `pending_work` lists model calls waiting for the submitting client. It is
+  always an array, oldest first, and empty when nothing is waiting, on
+  submit, and once the job is terminal. See [Requester work](#requester-work).
 - `models.requested` and `models.actual` are the distinct router model IDs
   this job asked for and got. `model_calls` lists each logical completion
   with its outcome and attempt count. They cover this job only, even when
@@ -234,13 +248,13 @@ Failure codes (`error.code`):
 | `pr_not_found`, `repo_not_installed`, `github_unavailable` | GitHub lookup failed during capture. |
 | `diff_unavailable` | GitHub could not compare the base and head commits. |
 | `diff_incomplete` | GitHub returned fewer files than the PR changes (over the 300-file compare limit). The service will not report partial coverage as a full review. |
-| `seat_exhausted` | No router-acp seat was free after the configured retries. Retry later. |
-| `workstation_outage` | The workstation behind the relay is unreachable. Retry after it recovers. |
-| `model_timeout` | A seat did not answer in time. |
-| `model_mismatch` | A pinned model was not the model that ran. |
-| `model_call_failed` | Any other failed or unparseable model reply. |
+| `seat_exhausted` | The client posted `seat_exhausted` on every attempt (first try plus `llm.router_acp_max_retries`). Retry later. |
+| `workstation_outage` | The client posted `workstation_outage` on every attempt. Retry after it recovers. |
+| `model_timeout` | A work item got no answer within its `timeout_seconds`, or the client posted `timeout`. |
+| `model_mismatch` | A pinned model was not the model that ran: the client posted `model_mismatch`, or its `actual_model` differs from the pin. |
+| `model_call_failed` | Any other failed or unparseable model reply, including empty text. |
 | `seat_provider_unconfigured` | The deployment is not configured for router-acp. There is no fallback. |
-| `deadline_exceeded` | The job ran past its deadline. |
+| `deadline_exceeded` | The job ran past its `deadline_at`. Pending work is expired. |
 | `write_blocked` | The engine tried to write to GitHub and was refused. This is a bug; report it. |
 | `review_failed` | The engine failed for another reason, such as an unparseable diff. |
 | `internal_error` | The worker crashed. |
@@ -253,8 +267,86 @@ is never reported as a clean one.
 
 ### Polling
 
-Poll `status_url` every 5–10 seconds until the state is terminal. A review
-usually takes one to several minutes. Stop after the job's `deadline_at`.
+Poll `status_url` every 1–2 seconds while the job is `running`, so work items
+are picked up quickly, and every 5–10 seconds while it is `queued`. Answer
+each new `pending_work` item as it appears. A review usually takes one to
+several minutes. Stop after the job's `deadline_at`.
+
+## Requester work
+
+Kory Source does not call a relay for API reviews. It does not call
+`POST /api/agent/llm-complete` and does not read `MIRA_ROUTER_ACP_URL`,
+`MIRA_ROUTER_ACP_TOKEN`, or `MIRA_ROUTER_ACP_SESSION`, even when they are set.
+Each attempt of each logical model call is one work item:
+
+```json
+{"work_id": "wrk_<32 hex>", "prompt": "<full prompt, untruncated>", "model": "auto", "timeout_seconds": 900}
+```
+
+- `model` is the requested router model: `auto`, or a pin such as
+  `grok/grok-4.6`. `auto`, `default`, `router-default`, and
+  `router-acp-default` are unpinned.
+- `timeout_seconds` is `llm.router_acp_timeout_seconds` (default 900),
+  counted from when the item was created.
+- Run the prompt with `priority: review`. Priority is not a field on the item.
+- Several items may be pending at once (walkthrough, review chunks, security
+  pass, registry judge). The server does not cap them; bound your own seat
+  queue.
+- Anyone who can read the job can read the prompts. Only the submitting
+  token can answer them. The HTML report does not show prompts.
+
+### `POST /api/reviews/{id}/work/{work_id}`
+
+Send exactly one of these bodies. Extra fields are rejected.
+
+```json
+{"text": "<the completion, non-empty>", "actual_model": "<router model that ran, max 200 chars>"}
+```
+
+```json
+{"error": "seat_exhausted", "actual_model": "<optional, default unknown>"}
+```
+
+`error` is one of `seat_exhausted`, `workstation_outage`, `model_mismatch`,
+or `timeout`.
+
+`200` returns `{"work_id": "wrk_...", "state": "answered"}` or
+`{"work_id": "wrk_...", "state": "failed", "error": "seat_exhausted"}`. This
+does not finish the job; keep polling.
+
+| Status | Code | When |
+| --- | --- | --- |
+| 401 | (plain `error` string) | No token or an unknown token. |
+| 403 | (plain `error` string) | Token sent over plain HTTP to a non-loopback host. |
+| 403 | `token_required` | A dashboard session tried to answer. |
+| 404 | `review_not_found` | No such job, or another token's job. The item is untouched. |
+| 404 | `work_not_found` | This job has no such work item. |
+| 409 | `work_not_pending` | The item was already answered, failed, timed out, or expired, or the job is no longer running. |
+| 422 | `invalid_request` | `text` and `error` together, blank `text`, missing `actual_model` with `text`, an unknown `error`, or extra fields. The item stays pending. |
+
+What the server does with an answer:
+
+- `text`: returned to the engine. If the item's `model` is pinned and
+  `actual_model` differs, the call fails `model_mismatch`. The server never
+  substitutes a model.
+- `seat_exhausted` or `workstation_outage`: counts as one attempt. While
+  `llm.router_acp_max_retries` allows, a new item with a new `work_id`
+  appears after a short backoff. When attempts run out the job fails with
+  that code.
+- `timeout` or `model_mismatch`: the call fails at once. `timeout` becomes
+  job error `model_timeout`.
+
+### Two clocks
+
+- Each work item expires at its creation time plus `timeout_seconds`. With
+  no answer by then the job fails `model_timeout`. A later post gets `409
+  work_not_pending`.
+- The job expires at `deadline_at`. The job then fails `deadline_exceeded`
+  and every pending item is expired.
+
+Either way `findings` is `null`, never `[]`, and `model_calls` lists the
+failed call. One failed call fails the job, including passes the webhook
+review would tolerate.
 
 ## `GET /api/reviews/{id}/report`
 
@@ -264,10 +356,16 @@ Open it with the same bearer token, or in a browser with a dashboard login.
 ## Models
 
 Every model role (review, indexing, security) uses the router-acp seat
-provider. The job fails with `seat_provider_unconfigured` if
-`llm.provider` is not `router-acp`; there is no cloud-key or local fallback.
-Ensemble sampling, tool calling, and cross-PR overlap detection are off for
-API reviews. Seat retries follow `llm.router_acp_max_retries`.
+provider, run by the requester through [Requester work](#requester-work).
+The job fails with `seat_provider_unconfigured` if `llm.provider` is not
+`router-acp`; there is no cloud-key or local fallback. Ensemble sampling,
+tool calling, and cross-PR overlap detection are off for API reviews. Seat
+retries follow `llm.router_acp_max_retries`. Registry contradiction checks
+during a job are work items on the same job.
+
+GitHub webhook reviews, push indexing, and PR commands have no requester.
+When `llm.provider` is `router-acp` they fail with
+`seat_provider_unconfigured` before any GitHub write.
 
 ## Execution
 
@@ -291,9 +389,11 @@ cap. A worker renews its lease while the job runs. Running jobs whose lease
 lapsed are marked `interrupted` at startup and on every poll. On shutdown a
 worker cancels its jobs and marks them `interrupted`.
 
-Jobs live in the `review_api_jobs` table of the application database
-(SQLite or PostgreSQL). The table is created at startup if missing; no
-existing table changes.
+Jobs live in the `review_api_jobs` table and work items in the
+`review_api_work` table of the application database (SQLite or PostgreSQL).
+Both are created at startup if missing; no existing table changes. A waiting
+call re-reads its work row every 500 ms, so an answer posted to any instance
+that shares the database is picked up.
 
 ### Cloud Run
 
@@ -320,11 +420,30 @@ repository. HAI-11605 registers the registry's provider here.
 ## Example
 
 ```bash
-curl -sS -X POST "$KORY_SOURCE_URL/api/reviews" \
-  -H "Authorization: Bearer $KORY_SOURCE_REVIEW_TOKEN" \
+AUTH="Authorization: Bearer $KORY_SOURCE_REVIEW_TOKEN"
+
+# 1. Submit.
+curl -sS -X POST "$KORY_SOURCE_URL/api/reviews" -H "$AUTH" \
   -H "Content-Type: application/json" \
   -d "{\"repo\":\"hickoryai/kory-source\",\"pr_number\":42,\"head_sha\":\"$(git rev-parse HEAD)\"}"
+# 202 {"id": "rev_5f0c...", "state": "queued", "pending_work": [], ...}
 
-curl -sS "$KORY_SOURCE_URL/api/reviews/rev_5f0c..." \
-  -H "Authorization: Bearer $KORY_SOURCE_REVIEW_TOKEN"
+# 2. Poll until work appears.
+curl -sS "$KORY_SOURCE_URL/api/reviews/rev_5f0c..." -H "$AUTH"
+# {"state": "running", "stage": "reviewing",
+#  "pending_work": [{"work_id": "wrk_9a1e...", "prompt": "You are running as Mira's ...",
+#                    "model": "auto", "timeout_seconds": 900}], ...}
+
+# 3. Run the prompt on your own seat (priority review), then post the result.
+curl -sS -X POST "$KORY_SOURCE_URL/api/reviews/rev_5f0c.../work/wrk_9a1e..." -H "$AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "{\"summary\": \"...\", \"change_groups\": []}", "actual_model": "grok/grok-4.6"}'
+# 200 {"work_id": "wrk_9a1e...", "state": "answered"}
+
+# 4. Repeat 2 and 3 until the state is terminal.
+curl -sS "$KORY_SOURCE_URL/api/reviews/rev_5f0c..." -H "$AUTH"
+# {"state": "succeeded", "pending_work": [],
+#  "findings": [{"id": "f1", "severity": "blocker", "title": "Division by zero", ...}],
+#  "models": {"requested": ["auto"], "actual": ["grok/grok-4.6"]},
+#  "report_url": "https://.../api/reviews/rev_5f0c.../report", ...}
 ```
