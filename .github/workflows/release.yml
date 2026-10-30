@@ -1,8 +1,10 @@
 name: Release
 
-# Gated release: pushing a v* tag runs the eval gate first; the container is
-# built and pushed ONLY if the evals pass. This is the ordering that matters —
-# evals run *before* the artifact ships, never alongside it.
+# Gated release: pushing a v* tag runs the offline test suite first; the
+# container is built and pushed ONLY if the tests pass. The gate needs no
+# provider API key (HAI-12329): plain `uv run pytest` skips the `eval` and
+# `benchmark` markers via pyproject `addopts`. The LLM evals stay in
+# evals.yml (manual dispatch, and the beta release gate).
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
@@ -12,13 +14,28 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # Gate: the stable eval suite (excludes the noisy benchmark scorecard).
-  evals:
-    uses: ./.github/workflows/evals.yml
-    secrets: inherit
+  # Gate: the offline test suite (no secrets, no `production` environment).
+  tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra serve --extra bedrock
+
+      - name: Run tests
+        run: uv run pytest
 
   build-and-push:
-    needs: evals # ← only builds/pushes if the eval gate is green
+    needs: tests # ← only builds/pushes if the test gate is green
     runs-on: ubuntu-latest
     permissions:
       contents: read

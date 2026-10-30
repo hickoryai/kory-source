@@ -191,6 +191,20 @@ Webhook reviews, push indexing, PR commands, and the CLI review command have
 no requester yet; they fail with `seat_provider_unconfigured` until a
 follow-up gives them one.
 
+## Release workflow (HAI-12329)
+
+`.github/workflows/release.yml` gates the image on an inline `tests` job
+that runs plain `uv run pytest` on Python 3.12 (installing the `dev`,
+`serve`, and `bedrock` extras, as CI does). Pyproject `addopts`
+deselects the `eval` and `benchmark` markers, so the gate needs no provider
+API key, no `production` environment, and no inherited secrets. A
+`vX.Y.Z` tag pushes `ghcr.io/hickoryai/kory-source:X.Y.Z` and `:X.Y`.
+
+`evals.yml` and `release-beta.yml` are unchanged: beta tags (`v*-beta*`)
+still call `evals.yml` and still need `OPENROUTER_API_KEY` in the
+`production` environment. Run `evals.yml` by hand to check model quality
+before a stable tag.
+
 ## Local Python boot (SQLite)
 
 Docker is not required. From the repository root:
