@@ -101,6 +101,7 @@ def parity_verdict(
     judge_family_overlap: bool,
     rule: dict = DEFAULT_RULE,
     judge_error_rate: float = 0.0,
+    budget_exhausted: bool = False,
 ) -> dict[str, Any]:
     """``per_unit`` rows: pr_url, kory_weighted_tp (mean over runs), greptile_weighted_tp."""
     by_pr: dict[str, list[float]] = {}
@@ -129,6 +130,8 @@ def parity_verdict(
         reasons.append(
             f"judge failed on {judge_error_rate:.0%} of units > {rule['max_judge_error_rate']:.0%}"
         )
+    if budget_exhausted:
+        reasons.append("the seat budget ran out before every review and judge call finished")
     if reasons or ci["lo"] is None:
         verdict = "inconclusive"
     elif ci["lo"] > 0 and precision_ok:

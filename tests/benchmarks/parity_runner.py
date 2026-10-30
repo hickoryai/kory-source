@@ -64,6 +64,51 @@ class ParityConfig:
     registry_override: str = ""
     allow_same_family_judge: bool = False
     rule: dict = field(default_factory=lambda: dict(DEFAULT_RULE))
+    seat_budget: int = 0
+
+
+class SeatBudgetExhausted(RuntimeError):
+    pass
+
+
+class SeatMeter:
+    """Hard seat cap: every transport request is one seat session.
+
+    Once ``used`` reaches ``budget`` (0 = no cap), each further request raises
+    ``seat_budget_exhausted`` before it reaches the relay.
+    """
+
+    def __init__(self, budget: int) -> None:
+        self.budget = budget
+        self.used = 0
+        self.refused = 0
+
+    @property
+    def exhausted(self) -> bool:
+        return bool(self.budget) and self.used >= self.budget
+
+    def guard(self, llm: Any) -> Any:
+        inner = getattr(llm, "_transport", None)
+        if inner is None:
+            return llm
+
+        async def _metered(request: dict[str, Any]) -> dict[str, Any]:
+            if self.exhausted:
+                self.refused += 1
+                raise SeatBudgetExhausted(f"seat_budget_exhausted: {self.used}/{self.budget} used")
+            self.used += 1
+            return await inner(request)
+
+        llm._transport = _metered
+        return llm
+
+    def as_dict(self) -> dict:
+        return {
+            "budget": self.budget,
+            "used": self.used,
+            "refused": self.refused,
+            "exhausted": self.exhausted or self.refused > 0,
+        }
 
 
 def _epoch(stamp: str) -> float | None:
@@ -291,13 +336,20 @@ async def run_parity(
         except Exception as exc:
             reverts[pr_url] = f"error: {str(exc)[:200]}"
 
-    judge_llm = llm_factory(cfg.judge_llm)
+    meter = SeatMeter(cfg.seat_budget)
+
+    def metered_factory(config: LLMConfig) -> Any:
+        return meter.guard(llm_factory(config))
+
+    judge_llm = metered_factory(cfg.judge_llm)
     records: list[dict] = []
 
-    async def _one(u: Unit, arm: str, run: int) -> dict:
+    async def _one(u: Unit, arm: str, run: int) -> dict | None:
         async with semaphore:
+            if meter.exhausted:
+                return None
             review = await review_unit(
-                u, arm, run, cfg.reviewer_llm, github_token, provider_factory, llm_factory
+                u, arm, run, cfg.reviewer_llm, github_token, provider_factory, metered_factory
             )
             label = f"{arm}|r{run}"
             attribution = f"judge|{arm}|r{run}|{u.unit_id}"
@@ -330,7 +382,8 @@ async def run_parity(
     for arm in cfg.arms:
         install_arm(arm)
         for run in range(1, cfg.runs + 1):
-            records.extend(await asyncio.gather(*(_one(u, arm, run) for u in scored)))
+            done = await asyncio.gather(*(_one(u, arm, run) for u in scored))
+            records.extend(r for r in done if r is not None)
 
     # Cross-check every flagged location against the merged PR, once per unit.
     async def _evidence(u: Unit) -> None:
@@ -362,6 +415,7 @@ async def run_parity(
             "allow_same_family_judge": cfg.allow_same_family_judge,
             "rule": cfg.rule,
         },
+        "seat_meter": meter.as_dict(),
         "units": [u.as_dict() for u in units],
         "snapshots": {
             uid: {
@@ -410,7 +464,10 @@ def _seat_usage(records: list[dict]) -> dict:
     def _block(calls: list[dict]) -> dict:
         return {
             "logical_calls": len(calls),
-            "seat_sessions": sum(int(c.get("attempts") or 0) for c in calls),
+            # A bad_response entry follows the ok entry for the same seat session.
+            "seat_sessions": sum(
+                int(c.get("attempts") or 0) for c in calls if c.get("state") != "bad_response"
+            ),
             "failed": sum(
                 1 for c in calls if c.get("state") not in (None, "ok", "success", "completed")
             ),
@@ -428,6 +485,7 @@ def summarize(artifact: dict) -> dict:
     units = artifact["units"]
     scored_units = [u for u in units if u["greptile_reviewed"]]
     usage = _seat_usage(artifact["records"])
+    meter = artifact.get("seat_meter") or {}
 
     judge_models = set(usage["judge"]["actual_models"]) or {cfg["judge_llm"]["model"]}
     review_models = set(usage["review"]["actual_models"]) or {cfg["reviewer_llm"]["model"]}
@@ -520,6 +578,7 @@ def summarize(artifact: dict) -> dict:
                     if arm_rows
                     else 0.0
                 ),
+                budget_exhausted=bool(meter.get("exhausted")),
             ),
             "per_unit": per_unit,
         }
@@ -560,6 +619,7 @@ def summarize(artifact: dict) -> dict:
         },
         "reverts": artifact.get("reverts", {}),
         "seat_usage": usage,
+        "seat_meter": meter,
         "arms": arms,
         "registry_ab": ab,
         "shipped_arm": shipped,
@@ -625,6 +685,13 @@ def render_markdown(summary: dict) -> str:
         "",
         f"- review: {usage['review']['logical_calls']} calls, {usage['review']['seat_sessions']} seat sessions, models {usage['review']['actual_models']}",
         f"- judge: {usage['judge']['logical_calls']} calls, {usage['judge']['seat_sessions']} seat sessions, models {usage['judge']['actual_models']}",
+    ]
+    meter = summary.get("seat_meter") or {}
+    if meter:
+        lines.append(
+            f"- metered: {meter['used']} of {meter['budget'] or 'unlimited'} seat sessions, {meter['refused']} refused at the cap"
+        )
+    lines += [
         "",
         "`fixed_later` is biased toward Greptile (authors fixed what Greptile showed them) and can include base-branch merges into the PR's own files.",
     ]

@@ -215,6 +215,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         registry_override=args.registry_override,
         allow_same_family_judge=args.allow_same_family_judge,
         rule=dict(DEFAULT_RULE),
+        seat_budget=args.seat_budget,
     )
     inputs = {
         **{k: v for k, v in plan.items() if k != "unit_ids"},
@@ -317,7 +318,10 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--seed", type=int, default=11607)
     run.add_argument("--concurrency", type=int, default=2)
     run.add_argument(
-        "--seat-budget", type=int, default=0, help="abort if the estimate exceeds this"
+        "--seat-budget",
+        type=int,
+        default=0,
+        help="abort if the estimate exceeds this; refuse every seat session past it",
     )
     run.add_argument(
         "--registry-db", default="", help="registry.db snapshot for the registry-on arm"

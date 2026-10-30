@@ -624,6 +624,40 @@ async def test_arm_owns_the_engine_registry_hook(monkeypatch):
         assert bool(rules) is expect_block
 
 
+async def test_seat_meter_refuses_past_the_cap():
+    sent = []
+
+    async def transport(request):
+        sent.append(request)
+        return {"ok": True}
+
+    meter = parity_runner.SeatMeter(2)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    await llm._transport({})
+    await llm._transport({})
+    with pytest.raises(parity_runner.SeatBudgetExhausted):
+        await llm._transport({})
+    assert len(sent) == 2 and meter.as_dict() == {
+        "budget": 2,
+        "used": 2,
+        "refused": 1,
+        "exhausted": True,
+    }
+    assert parity_runner.SeatMeter(0).exhausted is False  # 0 = no cap
+
+
+def test_exhausted_budget_is_inconclusive():
+    rows = [
+        {"pr_url": f"p{i}", "kory_weighted_tp": 3, "greptile_weighted_tp": 1} for i in range(30)
+    ]
+    tot = {"precision": 1.0}
+    assert parity_verdict(rows, tot, tot, 1.0, False)["verdict"] == "better"
+    capped = parity_verdict(rows, tot, tot, 1.0, False, budget_exhausted=True)
+    assert (
+        capped["verdict"] == "inconclusive" and "seat budget" in capped["inconclusive_reasons"][0]
+    )
+
+
 def test_router_acp_llm_is_built_directly():
     from mira.llm.router_acp import RouterAcpProvider, UnconfiguredSeatProvider
 

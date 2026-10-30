@@ -175,4 +175,12 @@ GITHUB_TOKEN="$(gh auth token)" uv run python tests/benchmarks/fixtures/hickory/
 - the later-fix evidence and the reverts.
 
 `rescore` uses nothing else. `run` aborts before any call if the seat-session
-estimate exceeds `--seat-budget`.
+estimate exceeds `--seat-budget`. The budget is also a hard cap during the
+run: every relay request counts as one seat session, and once the count
+reaches the budget each further request fails with `seat_budget_exhausted`
+and no new unit starts. A run that hits the cap is `inconclusive`.
+
+Both arms replace the engine's whole registry hook with the prompt block
+alone. The contradiction check (HAI-12196) does not run in either arm: it
+would judge decisions approved after Greptile's review, and its seat calls
+fall outside the A/B and the budget estimate.
