@@ -19,6 +19,7 @@ from mira.dashboard.models_config import llm_config_for
 from mira.index.store import IndexStore
 from mira.llm import create_llm
 from mira.llm.prompts.review import build_conversation_prompt
+from mira.llm.router_acp import refuse_unrequested_seat
 from mira.llm.tool_schemas import SUBMIT_THREAD_REPLY_TOOL
 from mira.llm.utils import strip_code_fences, strip_think_blocks
 from mira.platforms.command_policy import is_command_allowed
@@ -124,6 +125,14 @@ async def run_pr_review(
     config = load_config()
     from mira.dashboard.models_config import llm_config_for
 
+    # Router-acp seats belong to the client that asked (HAI-12330); a webhook
+    # has none. Fail before review_pr can post a placeholder comment.
+    try:
+        refuse_unrequested_seat(config.llm, "webhook review")
+    except Exception as exc:
+        review_tracker.fail(repo_full, number, str(exc))
+        raise
+
     llm = create_llm(llm_config_for("review", config.llm))
     indexing_llm = create_llm(llm_config_for("indexing", config.llm))
     security_llm = create_llm(llm_config_for("security", config.llm))
@@ -223,6 +232,9 @@ async def run_pr_command(
         return
 
     from mira.dashboard.models_config import llm_config_for
+
+    if command != "help":
+        refuse_unrequested_seat(config.llm, f"PR command {command}")
 
     llm = create_llm(llm_config_for("review", config.llm))
     indexing_llm = create_llm(llm_config_for("indexing", config.llm))

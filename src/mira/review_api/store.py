@@ -10,6 +10,13 @@ Lifecycle: ``queued`` → ``running`` → ``succeeded`` | ``failed`` |
 the global running cap. A running job holds a lease that its worker renews;
 a job whose lease lapses becomes ``interrupted`` and is never re-run,
 because its model calls may already have been paid for.
+
+Each model call a running job makes is a ``review_api_work`` row that the
+submitting client answers (HAI-12330). Work is ``pending`` until it is
+``answered``, ``failed``, or ``expired``. Every transition out of
+``pending`` is one conditional ``UPDATE``, so an answer, a timeout, and an
+expiry cannot both win. The row is the source of truth: any instance that
+shares the database can accept the answer.
 """
 
 from __future__ import annotations
@@ -52,10 +59,30 @@ CREATE TABLE IF NOT EXISTS review_api_jobs (
     finished_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS review_api_jobs_state_idx ON review_api_jobs (state, created_at);
+CREATE TABLE IF NOT EXISTS review_api_work (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    model TEXT NOT NULL,
+    timeout_seconds INTEGER NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    deadline_at DOUBLE PRECISION NOT NULL,
+    text TEXT NOT NULL DEFAULT '',
+    actual_model TEXT NOT NULL DEFAULT '',
+    error_code TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS review_api_work_job_idx ON review_api_work (job_id, state);
 """
 
 ACTIVE_STATES = ("queued", "running")
 TERMINAL_STATES = ("succeeded", "failed", "interrupted")
+WORK_ERRORS = ("seat_exhausted", "workstation_outage", "model_mismatch", "timeout")
+
+_WORK_COLUMNS = (
+    "id, job_id, state, prompt, model, timeout_seconds, created_at, deadline_at, text, "
+    "actual_model, error_code"
+)
 
 _COLUMNS = (
     "id, principal, platform, owner, repo, pr_number, requested_head_sha, reviewed_head_sha, "
@@ -98,6 +125,21 @@ class ReviewJob:
     @property
     def model_calls(self) -> list[dict[str, Any]]:
         return json.loads(self.model_calls_json or "[]")
+
+
+@dataclass
+class ReviewWork:
+    id: str
+    job_id: str
+    state: str
+    prompt: str
+    model: str
+    timeout_seconds: int
+    created_at: float
+    deadline_at: float
+    text: str
+    actual_model: str
+    error_code: str
 
 
 class ReviewJobStore:
@@ -293,7 +335,9 @@ class ReviewJobStore:
                     worker,
                 ),
             )
-            return cur.rowcount == 1
+            finished = cur.rowcount == 1
+        self.expire_work(job_id)
+        return finished
 
     def interrupt_expired(self, now: float | None = None) -> int:
         """Mark running jobs whose lease lapsed as interrupted. Never re-queues."""
@@ -307,13 +351,103 @@ class ReviewJobStore:
                 "finished_at = ?, updated_at = ? WHERE state = 'running' AND lease_expires_at < ?",
                 (now, now, now),
             )
-            return cur.rowcount
+            interrupted = cur.rowcount
+        self.expire_work()
+        return interrupted
 
     def running_count(self) -> int:
         with self._cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM review_api_jobs WHERE state = 'running'")
             row = cur.fetchone()
         return int(row[0]) if row else 0
+
+    # ── requester work ────────────────────────────────────────────
+
+    def create_work(self, job_id: str, prompt: str, model: str, timeout_seconds: int) -> str:
+        work_id = "wrk_" + uuid.uuid4().hex
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                f"INSERT INTO review_api_work ({_WORK_COLUMNS}) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, '', '', '')",
+                (work_id, job_id, prompt, model, timeout_seconds, now, now + timeout_seconds),
+            )
+        return work_id
+
+    def get_work(self, work_id: str) -> ReviewWork | None:
+        with self._cursor() as cur:
+            cur.execute(f"SELECT {_WORK_COLUMNS} FROM review_api_work WHERE id = ?", (work_id,))
+            row = cur.fetchone()
+        return ReviewWork(*row) if row else None
+
+    def pending_work(self, job_id: str) -> list[ReviewWork]:
+        with self._cursor() as cur:
+            cur.execute(
+                f"SELECT {_WORK_COLUMNS} FROM review_api_work WHERE job_id = ? "
+                "AND state = 'pending' AND deadline_at >= ? ORDER BY created_at, id",
+                (job_id, time.time()),
+            )
+            rows = cur.fetchall()
+        return [ReviewWork(*r) for r in rows]
+
+    def answer_work(
+        self,
+        job_id: str,
+        work_id: str,
+        *,
+        text: str = "",
+        actual_model: str = "",
+        error_code: str = "",
+    ) -> bool:
+        """Record the requester's answer if the item is still pending and in time.
+
+        The job must still be running. Returns ``False`` otherwise.
+        """
+        assert not error_code or error_code in WORK_ERRORS
+        state = "failed" if error_code else "answered"
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE review_api_work SET state = ?, text = ?, actual_model = ?, "
+                "error_code = ? WHERE id = ? AND job_id = ? AND state = 'pending' "
+                "AND deadline_at >= ? AND EXISTS (SELECT 1 FROM review_api_jobs j "
+                "WHERE j.id = review_api_work.job_id AND j.state = 'running')",
+                (state, text, actual_model, error_code, work_id, job_id, time.time()),
+            )
+            return cur.rowcount == 1
+
+    def time_out_work(self, work_id: str) -> bool:
+        """Mark an unanswered item failed with ``timeout``. ``False`` if it already left pending."""
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE review_api_work SET state = 'failed', error_code = 'timeout' "
+                "WHERE id = ? AND state = 'pending'",
+                (work_id,),
+            )
+            return cur.rowcount == 1
+
+    def expire_work(self, job_id: str | None = None, work_id: str | None = None) -> int:
+        """Expire pending items: one item, one job's items, or every item whose
+        job is no longer running."""
+        with self._cursor() as cur:
+            if work_id is not None:
+                cur.execute(
+                    "UPDATE review_api_work SET state = 'expired' "
+                    "WHERE id = ? AND state = 'pending'",
+                    (work_id,),
+                )
+            elif job_id is not None:
+                cur.execute(
+                    "UPDATE review_api_work SET state = 'expired' "
+                    "WHERE job_id = ? AND state = 'pending'",
+                    (job_id,),
+                )
+            else:
+                cur.execute(
+                    "UPDATE review_api_work SET state = 'expired' WHERE state = 'pending' "
+                    "AND NOT EXISTS (SELECT 1 FROM review_api_jobs j "
+                    "WHERE j.id = review_api_work.job_id AND j.state = 'running')"
+                )
+            return cur.rowcount
 
 
 class _PgCursor:

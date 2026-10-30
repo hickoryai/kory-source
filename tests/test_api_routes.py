@@ -58,6 +58,7 @@ EXPECTED_ROUTES = {
     ("/api/reviews", "POST"),
     ("/api/reviews/{job_id}", "GET"),
     ("/api/reviews/{job_id}/report", "GET"),
+    ("/api/reviews/{job_id}/work/{work_id}", "POST"),
     ("/api/review-insights/summary", "GET"),
     ("/api/review-insights/open-prs", "GET"),
     ("/api/review-insights/reviewers", "GET"),

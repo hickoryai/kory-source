@@ -1,8 +1,9 @@
 """Review-without-post API routes (``/api/reviews``).
 
 Bearer-token callers (the goose CLI, the Kory Code relay) submit and poll
-their own jobs. Logged-in dashboard users can read any job and open its
-report. Nothing here writes to GitHub. Contract: ``docs/review-api.md``.
+their own jobs, and answer the job's ``pending_work`` on their own seats.
+Logged-in dashboard users can read any job and open its report. Nothing here
+writes to GitHub. Contract: ``docs/review-api.md``.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import html
 import json
 import logging
 import re
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, Validat
 from mira.dashboard.api import router
 from mira.review_api import service
 from mira.review_api.snapshot import SnapshotError
-from mira.review_api.store import ReviewJob
+from mira.review_api.store import ReviewJob, ReviewJobStore
 from mira.review_api.tokens import ReviewPrincipal
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,20 @@ class SubmitReview(BaseModel):
     repo: Annotated[StrictStr, Field(pattern=_REPO.pattern)]
     pr_number: Annotated[StrictInt, Field(gt=0)]
     head_sha: Annotated[StrictStr, Field(pattern=_SHA.pattern)]
+
+
+class WorkAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: Annotated[StrictStr, Field(min_length=1, pattern=r"\S")]
+    actual_model: Annotated[StrictStr, Field(min_length=1, max_length=200, pattern=r"\S")]
+
+
+class WorkFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    error: Literal["seat_exhausted", "workstation_outage", "model_mismatch", "timeout"]
+    actual_model: Annotated[StrictStr, Field(min_length=1, max_length=200)] = "unknown"
 
 
 def _error(status: int, code: str, message: str, **extra: Any) -> JSONResponse:
@@ -57,7 +72,21 @@ def _models(calls: list[dict[str, Any]]) -> dict[str, list[str]]:
     return {"requested": requested, "actual": actual}
 
 
-def _job_view(job: ReviewJob, base: str) -> dict[str, Any]:
+def _pending_work(job: ReviewJob, store: ReviewJobStore | None) -> list[dict[str, Any]]:
+    if store is None or job.state != "running":
+        return []
+    return [
+        {
+            "work_id": w.id,
+            "prompt": w.prompt,
+            "model": w.model,
+            "timeout_seconds": w.timeout_seconds,
+        }
+        for w in store.pending_work(job.id)
+    ]
+
+
+def _job_view(job: ReviewJob, base: str, store: ReviewJobStore | None = None) -> dict[str, Any]:
     result = job.result if job.state == "succeeded" else None
     calls = job.model_calls
     return {
@@ -85,6 +114,8 @@ def _job_view(job: ReviewJob, base: str) -> dict[str, Any]:
         "models": _models(calls),
         "model_calls": calls,
         "error": {"code": job.error_code, "message": job.error_message} if job.error_code else None,
+        # Model calls waiting for the submitting client to run them.
+        "pending_work": _pending_work(job, store),
         "status_url": f"{base}/api/reviews/{job.id}",
         "report_url": f"{base}/api/reviews/{job.id}/report",
     }
@@ -131,7 +162,7 @@ async def submit_review(request: Request) -> JSONResponse:
 
     existing = svc.store.find_active(principal.name, owner, repo, body.pr_number, body.head_sha)
     if existing is not None:
-        view = _job_view(existing, _base_url(request, svc))
+        view = _job_view(existing, _base_url(request, svc), svc.store)
         return JSONResponse(status_code=202, content={**view, "deduplicated": True})
 
     try:
@@ -174,7 +205,7 @@ async def submit_review(request: Request) -> JSONResponse:
         body.head_sha[:12],
         job.id,
     )
-    return JSONResponse(status_code=202, content=_job_view(job, _base_url(request, svc)))
+    return JSONResponse(status_code=202, content=_job_view(job, _base_url(request, svc), svc.store))
 
 
 def _load(request: Request, job_id: str) -> tuple[service.ReviewService, ReviewJob] | JSONResponse:
@@ -194,7 +225,53 @@ def get_review(job_id: str, request: Request) -> JSONResponse:
     if isinstance(loaded, JSONResponse):
         return loaded
     svc, job = loaded
-    return JSONResponse(content=_job_view(job, _base_url(request, svc)))
+    return JSONResponse(content=_job_view(job, _base_url(request, svc), svc.store))
+
+
+@router.post("/api/reviews/{job_id}/work/{work_id}")
+async def answer_work(job_id: str, work_id: str, request: Request) -> JSONResponse:
+    """The submitting client posts one model completion, or why it has none."""
+    loaded = _load(request, job_id)
+    if isinstance(loaded, JSONResponse):
+        return loaded
+    svc, job = loaded
+    if _principal(request) is None:
+        return _error(403, "token_required", "Answer work with the submitting review token.")
+    work = svc.store.get_work(work_id)
+    if work is None or work.job_id != job.id:
+        return _error(404, "work_not_found", "This review has no such work item.")
+    try:
+        raw = await request.json()
+        answer: WorkAnswer | WorkFailure = (
+            WorkFailure.model_validate(raw)
+            if isinstance(raw, dict) and "error" in raw
+            else WorkAnswer.model_validate(raw)
+        )
+    except (ValidationError, ValueError) as exc:
+        detail = (
+            [{"field": ".".join(map(str, e["loc"])), "problem": e["msg"]} for e in exc.errors()]
+            if isinstance(exc, ValidationError)
+            else []
+        )
+        return _error(
+            422,
+            "invalid_request",
+            "Body must be exactly {text, actual_model} or {error, actual_model?}.",
+            fields=detail,
+        )
+    if isinstance(answer, WorkFailure):
+        accepted = svc.store.answer_work(
+            job.id, work_id, actual_model=answer.actual_model, error_code=answer.error
+        )
+        content: dict[str, Any] = {"work_id": work_id, "state": "failed", "error": answer.error}
+    else:
+        accepted = svc.store.answer_work(
+            job.id, work_id, text=answer.text, actual_model=answer.actual_model
+        )
+        content = {"work_id": work_id, "state": "answered"}
+    if not accepted:
+        return _error(409, "work_not_pending", "This work item is no longer waiting for an answer.")
+    return JSONResponse(content=content)
 
 
 _SEVERITY_ORDER = {"blocker": 0, "warning": 1, "suggestion": 2, "nitpick": 3}

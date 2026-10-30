@@ -1,7 +1,7 @@
 """Contradiction judge: does a new claim narrow, widen, or reverse an approved one?
 
-The judge is one seat call per candidate through the configured review model
-(the router-acp seat provider in Kory Source). It returns the quoted clause on
+The judge is one seat call per candidate through the configured review model.
+In Kory Source that is the running review job's requester seat. It returns the quoted clause on
 each side so a human can answer keep, supersede, or defer without re-reading both.
 """
 
@@ -83,6 +83,26 @@ def seat_judge(llm: Any) -> Judge:
     return _judge
 
 
+def requester_judge() -> Judge:
+    """Judge on the running review job's requester seats (HAI-12330).
+
+    Router-acp calls have no stored relay, so outside a review-API job there
+    is no seat and the judge raises ``seat_provider_unconfigured``. The
+    registry already records that as ``conflict_check = failed``.
+    """
+
+    async def _judge(new: dict, existing: dict) -> dict:
+        from mira.exceptions import LLMError
+        from mira.llm.router_acp import job_llm
+
+        llm = job_llm.get()
+        if llm is None:
+            raise LLMError("seat_provider_unconfigured", detail="judge ran outside a review job")
+        return await seat_judge(llm)(new, existing)
+
+    return _judge
+
+
 def default_judge() -> Judge | None:
     """The review-tier provider from Mira's config, or None if none is configured."""
     try:
@@ -90,7 +110,10 @@ def default_judge() -> Judge | None:
         from mira.dashboard.models_config import llm_config_for
         from mira.llm import create_llm
 
-        return seat_judge(create_llm(llm_config_for("review", load_config().llm)))
+        llm_config = llm_config_for("review", load_config().llm)
+        if llm_config.provider in {"router-acp", "router_acp"}:
+            return requester_judge()
+        return seat_judge(create_llm(llm_config))
     except Exception as exc:
         logger.warning("Registry conflict judge unavailable: %s", exc)
         return None

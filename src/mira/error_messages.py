@@ -155,6 +155,10 @@ LLM_ERROR_MESSAGES: dict[str, ErrorMessage] = {
         full="Router completion response was not usable: {detail}",
         safe="Router completion response was not usable",
     ),
+    "seat_provider_unconfigured": ErrorMessage(
+        full="No requester seat for this call: {detail}",
+        safe="No requester seat is attached to this call",
+    ),
 }
 
 
