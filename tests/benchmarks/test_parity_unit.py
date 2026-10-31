@@ -21,6 +21,7 @@ from .parity_judge import (
     GREPTILE,
     KORY,
     PRIOR,
+    SUBMIT_ISSUES_TOOL,
     build_pool,
     build_prompt,
     judge_unit,
@@ -663,6 +664,27 @@ def test_router_acp_llm_is_built_directly():
 
     llm = parity_runner.make_llm(LLMConfig(provider="router-acp", model="grok-4"))
     assert type(llm) is RouterAcpProvider and not isinstance(llm, UnconfiguredSeatProvider)
+
+
+async def test_judge_llm_has_no_reviewer_framing(monkeypatch):
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    sent: list[dict] = []
+
+    async def transport(request):
+        sent.append(request)
+        return {"text": '{"issues": []}', "actual_model": "grok@x/grok-4.7"}
+
+    llm = parity_runner.make_judge_llm(
+        LLMConfig(provider="router-acp", model="grok@x/grok-4.7", router_acp_url="http://x")
+    )
+    llm._transport = transport
+    out = await llm.complete_with_tools(
+        [{"role": "user", "content": "JUDGE BODY"}], tools=[SUBMIT_ISSUES_TOOL]
+    )
+    assert out == '{"issues": []}'
+    prompt = json.dumps(sent[0])
+    assert "JUDGE BODY" in prompt and "submit_issues" in prompt
+    assert "Mira" not in prompt
 
 
 async def test_kory_crash_counts_as_misses(monkeypatch):

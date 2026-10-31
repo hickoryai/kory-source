@@ -77,6 +77,11 @@ assigns a severity (critical 4, major 2, minor 1, nit 0) and rates the
 evidence in each comment from 0 to 3. Python maps each comment back to its
 reviewer and does all of the counting.
 
+The judge's router-acp provider drops the reviewer framing that
+`RouterAcpProvider` puts on every prompt ("Follow the Mira review
+instructions"). The judge prompt has no such instructions. In the first live
+run, Grok went looking for them and answered in prose on 30% of units.
+
 `run` refuses an unpinned judge model. It also refuses a judge from the same
 model family as a pinned reviewer, unless `--allow-same-family-judge` is
 passed. After the run, the report compares the judge's actual model family

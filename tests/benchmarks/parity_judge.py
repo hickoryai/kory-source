@@ -29,7 +29,7 @@ SEVERITY_WEIGHT = {"critical": 4, "major": 2, "minor": 1, "nit": 0}
 VERDICTS = ("real", "not_real", "uncertain")
 _MAX_DIFF_CHARS = 40_000
 
-JUDGE_PROMPT_VERSION = "hai-11607-v1"
+JUDGE_PROMPT_VERSION = "hai-11607-v2"
 
 SUBMIT_ISSUES_TOOL = {
     "type": "function",

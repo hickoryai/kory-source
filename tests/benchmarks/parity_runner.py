@@ -217,6 +217,33 @@ def make_llm(config: LLMConfig) -> Any:
     return create_llm(config)
 
 
+_JUDGE_FRAME = (
+    "You are a model backend running through a router-acp seat.",
+    "The request below is self-contained. Answer it from its own text; do not look for "
+    "other instructions, files, or tools.",
+    "Return only the requested final answer.",
+    "",
+)
+
+
+def make_judge_llm(config: LLMConfig) -> Any:
+    """The judge's relay provider, without the reviewer framing.
+
+    ``RouterAcpProvider`` tells every seat to follow "the Mira review instructions". The
+    judge prompt has none, and in the first live run Grok went looking for them and
+    answered in prose instead of JSON on 30% of units.
+    """
+    if config.provider not in {"router-acp", "router_acp"}:
+        return make_llm(config)
+    from mira.llm.router_acp import RouterAcpProvider
+
+    class JudgeRouterProvider(RouterAcpProvider):
+        def _messages_prompt(self, messages: list[dict]) -> str:
+            return "\n".join([*_JUDGE_FRAME, *(str(m.get("content", "")) for m in messages)])
+
+    return JudgeRouterProvider(config)
+
+
 async def review_unit(
     unit: Unit,
     arm: str,
@@ -301,6 +328,7 @@ async def run_parity(
     *,
     provider_factory: Any = PinnedGitHubProvider,
     llm_factory: Any = make_llm,
+    judge_llm_factory: Any = None,
     revert_finder: Any = find_reverts,
     inputs: dict | None = None,
 ) -> dict:
@@ -341,7 +369,9 @@ async def run_parity(
     def metered_factory(config: LLMConfig) -> Any:
         return meter.guard(llm_factory(config))
 
-    judge_llm = metered_factory(cfg.judge_llm)
+    if judge_llm_factory is None:
+        judge_llm_factory = make_judge_llm if llm_factory is make_llm else llm_factory
+    judge_llm = meter.guard(judge_llm_factory(cfg.judge_llm))
     records: list[dict] = []
 
     async def _one(u: Unit, arm: str, run: int) -> dict | None:
