@@ -6,15 +6,16 @@ Linear: the client refuses any GraphQL mutation. It has three parts:
 - ``LinearClient``: GraphQL over HTTP with ``LINEAR_SYNC_API_KEY``, which is the
   sync's own key, so its calls are never counted as agent Linear calls. It
   retries 429, 5xx, and transport errors.
-- ``inventory()``: counts what exists in Linear and names what the importer
-  will not carry yet.
+- ``inventory()``: counts what exists in Linear (teams, issues, comments, and
+  documents) and names what the importer will not carry yet.
 - ``LinearImporter``: resumable walks over issues and comments. Each page's
   cursor is saved after the page is imported, so a restart resumes where it
   stopped and a replayed page is a no-op. Issues still waiting on a link target
   are re-read at the end of each issue walk.
 
-Run with ``python -m mira.registry.linear inventory|import --team HAI``.
-``import`` is a dry run unless ``--apply`` is given.
+Run with ``python -m mira.registry.linear inventory|import``. It covers every team
+in the workspace and every state, archived and trashed included; ``--team KEY``
+narrows it to the named teams. ``import`` is a dry run unless ``--apply`` is given.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ STATE_DELIVERY = {
     "started": "active",
     "completed": "shipped",
     "canceled": "canceled",
+    "duplicate": "canceled",
 }
 RELATIONS_PAGE = 50  # the relations(first:) in ISSUES_QUERY
 PENDING_BATCH = 50  # ids per ``id: {in: [...]}`` re-read of pending issues
@@ -92,6 +94,32 @@ query RegistryComments($filter: CommentFilter!, $after: String, $first: Int!) {
   }
 }
 """
+
+TEAMS_QUERY = """
+query RegistryTeams($filter: TeamFilter!, $after: String, $first: Int!) {
+  teams(filter: $filter, after: $after, first: $first, includeArchived: true) {
+    pageInfo { hasNextPage endCursor }
+    nodes { id key name archivedAt }
+  }
+}
+"""
+
+DOCUMENTS_QUERY = """
+query RegistryDocuments($filter: DocumentFilter!, $after: String, $first: Int!) {
+  documents(filter: $filter, after: $after, first: $first, orderBy: updatedAt, includeArchived: true) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      id title url updatedAt archivedAt
+      issue { id identifier team { key } }
+      project { id }
+      initiative { id }
+    }
+  }
+}
+"""
+
+# Every GraphQL document this module sends; tests validate each against Linear's schema.
+QUERIES = (ISSUES_QUERY, COMMENTS_QUERY, TEAMS_QUERY, DOCUMENTS_QUERY)
 
 
 class LinearError(RuntimeError):
@@ -260,10 +288,25 @@ def comment_item(node: dict) -> dict:
     }
 
 
-def _team_filter(teams: list[str]) -> dict:
+def _team_filter(teams: list[str] | None) -> dict:
+    """An ``IssueFilter`` for ``teams``. ``None`` is every team: no filter."""
+    if not teams:
+        return {}
     if len(teams) == 1:
         return {"team": {"key": {"eq": teams[0]}}}
     return {"or": [{"team": {"key": {"eq": t}}} for t in teams]}
+
+
+def _and(*filters: dict) -> dict:
+    kept = [f for f in filters if f]
+    if len(kept) == 1:
+        return kept[0]
+    return {"and": kept} if kept else {}
+
+
+def _on_issue(teams: list[str] | None) -> dict:
+    """A comment or document filter: attached to an issue of ``teams``."""
+    return {"issue": _team_filter(teams)} if teams else {}
 
 
 def _comment_team(node: dict) -> str:
@@ -273,8 +316,14 @@ def _comment_team(node: dict) -> str:
 # ── inventory ───────────────────────────────────────────────────────────
 
 
-def inventory(client: LinearClient, teams: list[str]) -> dict:
-    """Count what Linear holds for ``teams`` and name what the importer skips."""
+def inventory(client: LinearClient, teams: list[str] | None = None) -> dict:
+    """Count what Linear holds for ``teams`` (``None``: all) and name what the importer skips."""
+    team_rows = [
+        n
+        for nodes, _ in client.pages(TEAMS_QUERY, "teams", {})
+        for n in nodes
+        if not teams or n.get("key") in teams
+    ]
     issues: Counter[str] = Counter()
     states: Counter[str] = Counter()
     relation_types: Counter[str] = Counter()
@@ -295,11 +344,24 @@ def inventory(client: LinearClient, teams: list[str]) -> dict:
             if (rels.get("pageInfo") or {}).get("hasNextPage"):
                 truncated.append(node.get("identifier") or node["id"])
     comments: Counter[str] = Counter()
-    for nodes, _ in client.pages(COMMENTS_QUERY, "comments", {"issue": _team_filter(teams)}):
+    for nodes, _ in client.pages(COMMENTS_QUERY, "comments", _on_issue(teams)):
         for node in nodes:
-            if _comment_team(node) in teams:
-                comments["on_team_issues"] += 1
+            if not node.get("issue"):
+                comments["not_on_issue"] += 1
+            elif not teams or _comment_team(node) in teams:
+                comments["on_issues"] += 1
                 comments["archived"] += bool(node.get("archivedAt"))
+    documents: Counter[str] = Counter()
+    linked: list[str] = []
+    for nodes, _ in client.pages(DOCUMENTS_QUERY, "documents", _on_issue(teams)):
+        for node in nodes:
+            documents["total"] += 1
+            documents["archived"] += bool(node.get("archivedAt"))
+            issue = node.get("issue") or {}
+            for parent in ("issue", "project", "initiative"):
+                documents[f"on_{parent}"] += bool(node.get(parent))
+            if issue:
+                linked.append(f"{issue.get('identifier') or issue.get('id')}: {node.get('title')}")
     unmapped = {t: n for t, n in relation_types.items() if t not in RELATION_LINKS}
     exceptions = []
     if projects:
@@ -314,16 +376,31 @@ def inventory(client: LinearClient, teams: list[str]) -> dict:
             f"relations: {len(truncated)} issues hold more than {RELATIONS_PAGE}; only the "
             f"first {RELATIONS_PAGE} import ({', '.join(truncated[:20])})"
         )
-    exceptions.append(
-        "documents and comments on documents or projects: not inventoried or imported "
-        "by this importer"
-    )
+    if documents["total"]:
+        exceptions.append(
+            f"documents: {documents['total']} ({documents['on_issue']} linked to an issue); "
+            "counted here, not imported yet"
+        )
+    if comments["not_on_issue"]:
+        exceptions.append(
+            f"comments: {comments['not_on_issue']} on documents, projects or updates; not imported"
+        )
+    if teams:
+        exceptions.append(
+            "team filter: documents and comments not attached to an issue of the named teams "
+            "are not counted; run without --team to count the whole workspace"
+        )
     return {
-        "teams": teams,
+        "teams": [
+            {"key": t.get("key"), "name": t.get("name"), "archived": bool(t.get("archivedAt"))}
+            for t in team_rows
+        ],
         "issues": dict(issues),
         "state_types": dict(states),
         "relation_types": dict(relation_types),
         "comments": dict(comments),
+        "documents": dict(documents),
+        "documents_linked_to_issues": linked,
         "projects_referenced": len(projects),
         "exceptions": exceptions,
     }
@@ -350,7 +427,7 @@ class LinearImporter:
         self,
         registry: Registry,
         client: LinearClient,
-        teams: list[str],
+        teams: list[str] | None = None,
         *,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -405,11 +482,9 @@ class LinearImporter:
         if not st["after_cursor"]:
             st["walk_since"] = max(st["watermark"] - WATERMARK_OVERLAP, 0.0)
             st["walk_started_at"] = self.clock()
-        filt: dict = {"updatedAt": {"gte": to_iso(st["walk_since"])}}
-        if stream == "issues":
-            filt = {"and": [_team_filter(self.teams), filt]}
-        else:
-            filt = {"and": [{"issue": _team_filter(self.teams)}, filt]}
+        since = {"updatedAt": {"gte": to_iso(st["walk_since"])}}
+        scope = _team_filter(self.teams) if stream == "issues" else _on_issue(self.teams)
+        filt = _and(scope, since)
         document = ISSUES_QUERY if stream == "issues" else COMMENTS_QUERY
         totals: Counter[str] = Counter()
         errors: list[dict] = []
@@ -438,7 +513,7 @@ class LinearImporter:
         pending = self.registry.pending_link_sources(SOURCE_SYSTEM)
         for start in range(0, len(pending), PENDING_BATCH):
             ids = pending[start : start + PENDING_BATCH]
-            filt = {"and": [_team_filter(self.teams), {"id": {"in": ids}}]}
+            filt = _and(_team_filter(self.teams), {"id": {"in": ids}})
             for nodes, _ in self.client.pages(ISSUES_QUERY, "issues", filt):
                 items = [issue_item(n) for n in nodes]
                 results = self.registry.import_items(SOURCE_SYSTEM, items, IMPORT_ACTOR)
@@ -469,7 +544,11 @@ class LinearImporter:
                     self.registry.import_items(SOURCE_SYSTEM, items, IMPORT_ACTOR) if apply else []
                 )
             else:
-                kept = [n for n in nodes if n.get("issue") and _comment_team(n) in self.teams]
+                kept = [
+                    n
+                    for n in nodes
+                    if n.get("issue") and (not self.teams or _comment_team(n) in self.teams)
+                ]
                 totals["read"] += len(kept)
                 totals["skipped_other_team_or_not_on_issue"] += len(nodes) - len(kept)
                 items = [comment_item(n) for n in kept]
@@ -488,7 +567,9 @@ class LinearImporter:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m mira.registry.linear")
     parser.add_argument("command", choices=("inventory", "import"))
-    parser.add_argument("--team", action="append", required=True, help="Linear team key")
+    parser.add_argument(
+        "--team", action="append", help="limit to this Linear team key (default: every team)"
+    )
     parser.add_argument("--apply", action="store_true", help="write to the registry")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)

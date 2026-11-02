@@ -6,6 +6,7 @@ filters on team and ``updatedAt``, and can fail requests on demand.
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import threading
@@ -38,11 +39,13 @@ class Clock:
 
 
 class FakeLinear:
-    """In-memory Linear: issues and comments, cursor paging, fault injection."""
+    """In-memory Linear: teams, issues, comments and documents, cursor paging, fault injection."""
 
     def __init__(self) -> None:
+        self.teams: dict[str, dict] = {}
         self.issues: dict[str, dict] = {}
         self.comments: dict[str, dict] = {}
+        self.documents: dict[str, dict] = {}
         self.requests: list[dict] = []
         self.fail_next: list[int] = []  # HTTP statuses to return before serving
         self.crash_after_pages: int | None = None
@@ -67,6 +70,11 @@ class FakeLinear:
         }
         node.update(fields)
         self.issues[node["id"]] = node
+        team = node["team"]["key"]
+        self.teams.setdefault(
+            team,
+            {"id": f"team-{team}", "key": team, "name": team, "archivedAt": None, "updatedAt": ""},
+        )
         return node
 
     def comment(self, cid: str, issue_key: str, body: str, *, t: float, **fields) -> dict:
@@ -83,6 +91,26 @@ class FakeLinear:
         }
         node.update(fields)
         self.comments[cid] = node
+        return node
+
+    def document(self, did: str, issue_key: str | None, *, t: float, **fields) -> dict:
+        issue = self.issues[f"uuid-{issue_key}"] if issue_key else None
+        node = {
+            "id": did,
+            "title": fields.pop("title", did),
+            "url": f"https://linear.app/hickoryai/document/{did}",
+            "updatedAt": iso(t),
+            "archivedAt": None,
+            "issue": (
+                {"id": issue["id"], "identifier": issue["identifier"], "team": issue["team"]}
+                if issue
+                else None
+            ),
+            "project": None,
+            "initiative": None,
+        }
+        node.update(fields)
+        self.documents[did] = node
         return node
 
     @staticmethod
@@ -112,8 +140,10 @@ class FakeLinear:
         if self.crash_after_pages is not None and self.pages_served >= self.crash_after_pages:
             raise httpx.ConnectError("linear went away")
         q, v = body["query"], body["variables"]
-        name = "issues" if "RegistryIssues" in q else "comments"
-        store = self.issues if name == "issues" else self.comments
+        name = next(
+            n for n in ("issues", "comments", "teams", "documents") if f"Registry{n.title()}" in q
+        )
+        store = getattr(self, name)
         nodes = sorted(
             (n for n in store.values() if self._match(n, v["filter"])),
             key=lambda n: (n["updatedAt"], n["id"]),
@@ -303,6 +333,23 @@ def test_issue_mapping(fake):
     assert (trashed["status"], trashed["status_reason"]) == ("retired", "source_deleted")
 
 
+@pytest.mark.parametrize(
+    ("state", "delivery"),
+    [
+        ("triage", "planned"),
+        ("backlog", "planned"),
+        ("unstarted", "planned"),
+        ("started", "active"),
+        ("completed", "shipped"),
+        ("canceled", "canceled"),
+        ("duplicate", "canceled"),
+    ],
+)
+def test_every_linear_state_type_maps(fake, state, delivery):
+    # The state types WorkflowState.type documents in Linear's schema.
+    assert lin.issue_item(fake.issue("HAI-8", t=T0, state=state))["delivery_state"] == delivery
+
+
 # ── import walks ────────────────────────────────────────────────────────
 
 
@@ -329,6 +376,28 @@ def test_walks_ask_linear_only_for_the_team(reg, client, fake, clock):
     assert out["comments"]["totals"]["skipped_other_team_or_not_on_issue"] == 0
     filters = [r["variables"]["filter"] for r in fake.requests if "RegistryComments" in r["query"]]
     assert filters and all(f["and"][0] == {"issue": lin._team_filter(["HAI"])} for f in filters)
+
+
+def test_default_scope_is_every_team(reg, client, fake, clock):
+    seed(fake)
+    fake.issue("HAI-6", t=T0 - 15, state="duplicate", archivedAt=iso(T0 - 15))
+    out = LinearImporter(reg, client, clock=clock).run(apply=True)
+    assert out["issues"]["totals"]["created"] == 6
+    assert out["comments"]["totals"]["created"] == 3
+    assert reg.work_by_ticket("OPS-1")["delivery_state"] == "planned"
+    assert reg.work_by_ticket("HAI-6")["delivery_state"] == "archived"
+    walks = [r for r in fake.requests if "RegistryIssues" in r["query"]]
+    assert walks and all("team" not in json.dumps(r["variables"]["filter"]) for r in walks)
+    assert all("includeArchived: true" in q for q in lin.QUERIES)
+
+
+def test_cli_defaults_to_every_team(monkeypatch):
+    seen: list = []
+    monkeypatch.setattr(lin.LinearClient, "from_env", classmethod(lambda cls: None))
+    monkeypatch.setattr(lin, "inventory", lambda client, teams: seen.append(teams) or {})
+    lin.main(["inventory"])
+    lin.main(["inventory", "--team", "HAI"])
+    assert seen == [None, ["HAI"]]
 
 
 def test_several_teams_filter_with_or(reg, client, fake, clock):
@@ -669,24 +738,119 @@ async def test_links_between_linear_tickets_are_refused(reg, client, fake, clock
 # ── inventory ───────────────────────────────────────────────────────────
 
 
-def test_inventory_counts_and_names_exceptions(client, fake):
+def seed_inventory(fake: FakeLinear) -> None:
     seed(fake)
     fake.issue("HAI-5", t=T0, project={"id": "proj-1"}, archivedAt=iso(T0), trashed=True)
-    fake.comments["cm-doc"] = {
-        **fake.comments["cm-1"],
-        "id": "cm-doc",
-        "issue": None,
-    }
-    out = lin.inventory(client, ["HAI"])
-    assert out["issues"]["total"] == 5
+    fake.comments["cm-doc"] = {**fake.comments["cm-1"], "id": "cm-doc", "issue": None}
+    fake.document("doc-1", "HAI-2", t=T0 - 30, title="HAI-2 design")
+    fake.document("doc-2", "OPS-1", t=T0 - 20, archivedAt=iso(T0 - 20))
+    fake.document("doc-3", None, t=T0 - 10, project={"id": "proj-1"})
+
+
+def test_inventory_counts_the_whole_workspace(client, fake):
+    seed_inventory(fake)
+    out = lin.inventory(client)
+    assert [t["key"] for t in out["teams"]] == ["HAI", "OPS"]
+    assert out["issues"]["total"] == 6
+    assert (out["issues"]["team:HAI"], out["issues"]["team:OPS"]) == (5, 1)
     assert (out["issues"]["archived"], out["issues"]["trashed"]) == (1, 1)
-    assert out["comments"] == {"on_team_issues": 2, "archived": 0}
+    assert out["comments"] == {"on_issues": 3, "archived": 0, "not_on_issue": 1}
+    assert out["documents"] == {
+        "total": 3,
+        "archived": 1,
+        "on_issue": 2,
+        "on_project": 1,
+        "on_initiative": 0,
+    }
+    assert out["documents_linked_to_issues"] == ["HAI-2: HAI-2 design", "OPS-1: doc-2"]
     assert out["projects_referenced"] == 1
     joined = "\n".join(out["exceptions"])
     assert "projects: 1 referenced" in joined
-    assert "comments on documents or projects" in joined
     assert "of type 'similar'" in joined
-    assert "documents and comments on documents or projects: not inventoried" in joined
+    assert "documents: 3 (2 linked to an issue)" in joined
+    assert "comments: 1 on documents, projects or updates" in joined
+    assert "team filter" not in joined
+
+
+def test_inventory_narrowed_to_a_team(client, fake):
+    seed_inventory(fake)
+    out = lin.inventory(client, ["HAI"])
+    assert [t["key"] for t in out["teams"]] == ["HAI"]
+    assert out["issues"]["total"] == 5
+    assert out["comments"] == {"on_issues": 2, "archived": 0}
+    assert out["documents"]["total"] == 1
+    assert out["documents_linked_to_issues"] == ["HAI-2: HAI-2 design"]
+    assert "team filter: documents and comments" in "\n".join(out["exceptions"])
+
+
+# ── schema ──────────────────────────────────────────────────────────────
+# tests/fixtures/linear_schema.graphql.gz is Linear's published SDL
+# (github.com/linear/linear packages/sdk/src/schema.graphql at 3ce13b6, fetched
+# 2026-11-02). It checks query shape and filter inputs offline; it is not a live run.
+
+
+@pytest.fixture(scope="module")
+def linear_schema():
+    graphql = pytest.importorskip("graphql")
+    path = os.path.join(os.path.dirname(__file__), "fixtures", "linear_schema.graphql.gz")
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        return graphql.build_schema(fh.read())
+
+
+def check_variables(schema, document: str, variables: dict) -> list[str]:
+    from graphql import parse
+    from graphql.execution.values import get_variable_values
+
+    op = parse(document).definitions[0]
+    coerced = get_variable_values(schema, op.variable_definitions, variables)
+    return [e.message for e in coerced] if isinstance(coerced, list) else []
+
+
+@pytest.mark.parametrize("document", lin.QUERIES)
+def test_queries_validate_against_linear_schema(linear_schema, document):
+    from graphql import parse, validate
+
+    assert [e.message for e in validate(linear_schema, parse(document))] == []
+
+
+def test_sent_filters_are_valid_linear_inputs(linear_schema, reg, client, fake, clock):
+    seed_inventory(fake)
+    reg.import_items(
+        "linear",
+        [
+            {
+                "source_id": "uuid-HAI-9",
+                "source_version": 1,
+                "kind": "work",
+                "title": "blocked by a ticket that never arrives",
+                "links": [{"type": "blocks", "target_source_id": "uuid-NOPE-1"}],
+            }
+        ],
+        HUMAN,
+    )
+    lin.inventory(client)
+    lin.inventory(client, ["HAI", "OPS"])
+    LinearImporter(reg, client, clock=clock).run(apply=True)
+    LinearImporter(reg, client, ["HAI"], clock=clock).run(apply=True)
+    clock.now += 3600
+    LinearImporter(reg, client, ["HAI"], clock=clock).run(apply=True)
+    sent = {json.dumps(r, sort_keys=True): r for r in fake.requests}.values()
+    assert {
+        next(n for n in ("Issues", "Comments", "Teams", "Documents") if n in r["query"])
+        for r in sent
+    } == {"Issues", "Comments", "Teams", "Documents"}
+    assert any('"in"' in json.dumps(r["variables"]) for r in sent)  # the pending re-read
+    for r in sent:
+        assert check_variables(linear_schema, r["query"], r["variables"]) == [], r["variables"]
+
+
+def test_schema_check_catches_a_bad_filter(linear_schema):
+    bad = {"filter": {"issue": {"team": {"key": "HAI"}}}, "after": None, "first": 2}
+    assert check_variables(linear_schema, lin.COMMENTS_QUERY, bad)
+    with pytest.raises(AssertionError):
+        test_queries_validate_against_linear_schema(
+            linear_schema, lin.COMMENTS_QUERY.replace("archivedAt", "archivedOn")
+        )
 
 
 # ── transactions ────────────────────────────────────────────────────────
