@@ -84,9 +84,13 @@ run, Grok went looking for them and answered in prose on 30% of units.
 
 `run` refuses an unpinned judge model. It also refuses a judge from the same
 model family as a pinned reviewer, unless `--allow-same-family-judge` is
-passed. After the run, the report compares the judge's actual model family
-with the families of every reviewer seat call. Any overlap makes the parity
-verdict `inconclusive`.
+passed. An unpinned reviewer (`auto`) can still be routed to the judge's
+family, so the harness checks every reviewer reply. A reply whose actual model
+is in the judge's family, or is `unknown`, is never scored: it is logged as a
+failed `excluded_family` seat call and re-requested, at most
+`router_acp_max_retries` times per call. After the run, the report compares
+the judge's actual model family with the families of every scored reviewer
+seat call. Any overlap makes the parity verdict `inconclusive`.
 
 ### Scores
 

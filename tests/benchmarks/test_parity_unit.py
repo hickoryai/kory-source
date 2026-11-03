@@ -696,6 +696,124 @@ async def test_kory_crash_counts_as_misses(monkeypatch):
     assert arm["greptile_totals"]["tp"] == 2
 
 
+def _scripted_reviewer(models: list[str], **cfg):
+    from mira.llm.router_acp import RouterAcpProvider
+
+    sent: list[dict] = []
+
+    async def transport(request):
+        sent.append(request)
+        return {"text": '{"comments": []}', "actual_model": models[len(sent) - 1]}
+
+    async def no_sleep(_):
+        return None
+
+    llm = RouterAcpProvider(
+        LLMConfig(provider="router-acp", model="auto", router_acp_url="http://x", **cfg),
+        transport=transport,
+        sleep=no_sleep,
+    )
+    return llm, sent
+
+
+@pytest.mark.parametrize("refused", ["grok@x/grok-4.7", "unknown", ""])
+async def test_excluded_reviewer_reply_is_a_failed_call_and_retried(monkeypatch, refused):
+    from mira.llm.router_acp import RouterAcpProvider, attribution_key
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    monkeypatch.setattr(RouterAcpProvider, "call_log", type(RouterAcpProvider.call_log)())
+    llm, sent = _scripted_reviewer([refused, "claude@x/opus"])
+    meter = parity_runner.SeatMeter(10)
+    llm = meter.guard(parity_runner.exclude_reviewer_families(llm, {"xai"}))
+    token = attribution_key.set("review|t")
+    try:
+        assert await llm.review([{"role": "user", "content": "diff"}]) == '{"comments": []}'
+    finally:
+        attribution_key.reset(token)
+    log = [(e["state"], e["actual_model"], e["attempts"]) for e in RouterAcpProvider.call_log]
+    assert log == [
+        (parity_runner.EXCLUDED_STATE, refused or "unknown", 1),
+        ("ok", "claude@x/opus", 1),
+    ]
+    assert len(sent) == 2 and meter.used == 2  # the refused reply still used a seat session
+
+
+async def test_excluded_reviewer_retries_stop_at_the_retry_budget(monkeypatch):
+    from mira.exceptions import NonRetriableLLMError
+    from mira.llm.router_acp import RouterAcpProvider
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    monkeypatch.setattr(RouterAcpProvider, "call_log", type(RouterAcpProvider.call_log)())
+    llm, sent = _scripted_reviewer(["grok@x/grok-4.7"] * 5, router_acp_max_retries=2)
+    llm = parity_runner.exclude_reviewer_families(llm, {"xai"})
+    with pytest.raises(NonRetriableLLMError):
+        await llm.review([{"role": "user", "content": "diff"}])
+    assert len(sent) == 3  # 1 call + router_acp_max_retries
+    assert [e["state"] for e in RouterAcpProvider.call_log] == [parity_runner.EXCLUDED_STATE] * 3
+
+
+async def test_run_parity_never_scores_a_judge_family_reviewer_reply(monkeypatch):
+    from mira.llm.router_acp import RouterAcpProvider
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    monkeypatch.setattr(RouterAcpProvider, "call_log", type(RouterAcpProvider.call_log)())
+
+    class CallingEngine(FakeEngine):
+        def __init__(self, config, llm, provider, dry_run):
+            super().__init__(config, llm, provider, dry_run)
+            self.llm = llm
+
+        async def review_pr(self, url):
+            await self.llm.review([{"role": "user", "content": "diff"}])
+            return await super().review_pr(url)
+
+    monkeypatch.setattr(parity_runner, "ReviewEngine", CallingEngine)
+    monkeypatch.setattr("mira.registry.get_registry", lambda create=True: FakeRegistry())
+    judge = FakeJudge()
+    # Every review's first reply comes from the judge's family, the retry from Claude.
+    replies = iter(["grok@x/grok-4.6", "claude@x/opus"] * 4)
+
+    def llm_factory(cfg):
+        if cfg.model == "grok/grok-4.6":
+            return judge
+
+        async def transport(request):
+            return {"text": '{"comments": []}', "actual_model": next(replies)}
+
+        return RouterAcpProvider(cfg, transport=transport)
+
+    async def no_reverts(*a):
+        return []
+
+    units = load_units(
+        [
+            _fixture(
+                1, [_inline(SHA_A, "a.py", 3, "2026-10-01T01:00:00Z")], [_finding(1, 1, "a.py", 3)]
+            )
+        ]
+    )
+    cfg = parity_runner.ParityConfig(
+        reviewer_llm=LLMConfig(provider="router-acp", model="auto", router_acp_url="http://x"),
+        judge_llm=LLMConfig(provider="router-acp", model="grok/grok-4.6"),
+        runs=2,
+        seat_budget=100,
+    )
+    art = await parity_runner.run_parity(
+        units,
+        cfg,
+        "tok",
+        provider_factory=FakeProvider,
+        llm_factory=llm_factory,
+        revert_finder=no_reverts,
+    )
+    assert all(not r["review"]["error"] for r in art["records"])
+    assert art["seat_meter"]["used"] == 8  # 4 reviews x (refused + retry)
+    summary = parity_runner.summarize(art)
+    assert summary["judge"]["family_overlap"] == []
+    review_usage = summary["seat_usage"]["review"]
+    assert review_usage["failed"] == 4 and review_usage["seat_sessions"] == 8
+
+
 async def test_same_family_judge_is_refused():
     cfg = parity_runner.ParityConfig(
         reviewer_llm=LLMConfig(provider="router-acp", model="claude@x/opus"),

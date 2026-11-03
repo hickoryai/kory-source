@@ -111,6 +111,53 @@ class SeatMeter:
         }
 
 
+EXCLUDED_STATE = "excluded_family"
+
+
+def exclude_reviewer_families(llm: Any, families: set[str]) -> Any:
+    """Never score a reviewer reply from an excluded family, or one with no known model.
+
+    The relay has no way to keep ``auto`` routing out of a family, so the harness
+    checks every reply. A reply whose actual model is in ``families`` or is
+    ``unknown`` is logged as a failed ``excluded_family`` call (its seat session
+    counts) and re-requested, at most ``router_acp_max_retries`` times per call.
+    After that the call fails like any other failed seat call.
+    """
+    inner = getattr(llm, "_transport", None)
+    complete_raw = getattr(llm, "_complete_raw", None)
+    if inner is None or complete_raw is None:
+        return llm
+    from mira.exceptions import NonRetriableLLMError
+    from mira.llm.router_acp import RouterTransportError
+
+    async def _checked(request: dict[str, Any]) -> dict[str, Any]:
+        payload = await inner(request)
+        actual = str(payload.get("actual_model") or "unknown")
+        if actual == "unknown" or model_family(actual) in families:
+            raise RouterTransportError(
+                f"reviewer reply from {actual} is excluded",
+                kind=EXCLUDED_STATE,
+                body={"actual_model": actual},
+            )
+        return payload
+
+    async def _complete(prompt: str, requested: str) -> dict[str, Any]:
+        retries = 0
+        while True:
+            try:
+                return await complete_raw(prompt, requested)
+            except NonRetriableLLMError as exc:
+                cause = exc.__cause__
+                excluded = isinstance(cause, RouterTransportError) and cause.kind == EXCLUDED_STATE
+                if not excluded or retries >= llm.config.router_acp_max_retries:
+                    raise
+                retries += 1
+
+    llm._transport = _checked
+    llm._complete_raw = _complete
+    return llm
+
+
 def _epoch(stamp: str) -> float | None:
     if not stamp:
         return None
@@ -365,9 +412,11 @@ async def run_parity(
             reverts[pr_url] = f"error: {str(exc)[:200]}"
 
     meter = SeatMeter(cfg.seat_budget)
+    # The judge never scores its own family: reviewer replies from it are refused.
+    excluded = set() if cfg.allow_same_family_judge else {judge_family}
 
     def metered_factory(config: LLMConfig) -> Any:
-        return meter.guard(llm_factory(config))
+        return meter.guard(exclude_reviewer_families(llm_factory(config), excluded))
 
     if judge_llm_factory is None:
         judge_llm_factory = make_judge_llm if llm_factory is make_llm else llm_factory
@@ -518,7 +567,13 @@ def summarize(artifact: dict) -> dict:
     meter = artifact.get("seat_meter") or {}
 
     judge_models = set(usage["judge"]["actual_models"]) or {cfg["judge_llm"]["model"]}
-    review_models = set(usage["review"]["actual_models"]) or {cfg["reviewer_llm"]["model"]}
+    # A reply refused as excluded_family was never scored, so it cannot overlap the judge.
+    review_models = {
+        str(c.get("actual_model") or "unknown")
+        for r in artifact["records"]
+        for c in r["review"]["seat_calls"]
+        if c.get("state") != EXCLUDED_STATE
+    } or {cfg["reviewer_llm"]["model"]}
     judge_families = {model_family(m) for m in judge_models} - {"unknown"}
     review_families = {model_family(m) for m in review_models} - {"unknown"}
     overlap = sorted(judge_families & review_families)
