@@ -772,6 +772,8 @@ class ReviewEngine:
 
             raise
 
+        if not result.reviewed_files:  # Kory Source: returned before the registry hook
+            await finish_registry(self, [])
         # The final walkthrough must land after the in-progress one, or it gets
         # overwritten on fast PRs and stays stuck on "in progress".
         notify_task = getattr(self, "_walkthrough_notify_task", None)

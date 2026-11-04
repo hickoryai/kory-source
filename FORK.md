@@ -314,9 +314,11 @@ Upstream files touched, and why:
   asserts its type). If that pass calls the tool, it gets an
   `unknown tool` reply. HAI-12775 turns the post-critique line into
   `finish_registry`, which prepends the blockers and posts the
-  uncited-decision comment; it replaces a fork line, so the total is
-  unchanged. The fork-delta cap is `engine.py` < 46 against `567ed7e`; the
-  measured total is 45.
+  uncited-decision comment; it replaces a fork line. A PR with no
+  reviewable file returns before that hook, and its description can still
+  state a decision, so `review_pr` adds 2 lines that call `finish_registry`
+  when `reviewed_files` is 0. The fork-delta cap is `engine.py` < 48 against
+  `567ed7e`; the measured total is 47.
 - `src/mira/platforms/server.py` (10 lines): `install_registry(app)`
   (mounts `/api/registry` and `/mcp`), `observe_github` on every GitHub
   webhook as a background task, and the hourly registry job in the
@@ -344,11 +346,13 @@ These files are new and fork-owned:
   push hook calls).
 - `tests/test_decision_registry.py`, `tests/test_contradiction_gate.py`, and
   `tests/test_uncited_decisions.py`.
-  The registry test asserts the `engine.py` (<46) and `server.py` (<25)
+  The registry test asserts the `engine.py` (<48) and `server.py` (<25)
   caps against the fork base. The engine cap moved from 40 to 47 when
   HAI-12286 added `review_snapshot` (28 lines) beside the registry block.
   HAI-12196 fits the contradiction check into that block; the measured
-  total is 45, so the cap is the next integer, 46.
+  total is 45, so the cap is the next integer, 46. HAI-12775 adds 2 lines
+  for PRs with no reviewable file (measured 47), and the cap moves by
+  exactly those 2, to 48.
 
 MCP is streamable HTTP at `POST /mcp` and returns JSON responses with no
 SSE. Bearer JWT claims are `kind` (human|agent), `sub`, `model` (required

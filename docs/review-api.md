@@ -282,8 +282,7 @@ advisory finding per such decision (HAI-12775):
 - A review that posts to GitHub (the webhook path) cannot post an inline
   comment with no diff line. It gets the same decisions as one general PR
   comment with a hidden marker, edited in place on the next review. That
-  path checks only PRs with at least one reviewable file, because the engine
-  returns before its registry hook otherwise.
+  includes PRs with no reviewable file.
 
 ### States and stages
 

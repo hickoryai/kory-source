@@ -405,3 +405,70 @@ async def test_comment_failure_does_not_fail_the_review(tmp_path, monkeypatch):
     result = await _review(_engine(provider), "We decided to cache.")
     assert provider.markers == [COMMENT_MARKER]
     assert result.reviewed_files == 1
+
+
+LOCK_ONLY = "diff --git a/poetry.lock b/poetry.lock\n--- a/poetry.lock\n+++ b/poetry.lock\n@@ -1,1 +1,2 @@\n line\n+new\n"
+
+
+def _pull_provider(body: str, diff: str, existing: int | None) -> AsyncMock:
+    provider = AsyncMock()
+    provider.get_pr_info.return_value = _pr(body=body)
+    provider.get_pr_diff.return_value = diff
+    provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
+
+    async def find(pr_info, marker):  # type: ignore[no-untyped-def]
+        return existing if marker == COMMENT_MARKER else None
+
+    provider.find_bot_comment = AsyncMock(side_effect=find)
+    return provider
+
+
+def _advisory_writes(provider: AsyncMock) -> tuple[list[str], list[tuple[int, str]]]:
+    posted = [
+        c.args[1] for c in provider.post_comment.call_args_list if COMMENT_MARKER in c.args[1]
+    ]
+    updated = [
+        (c.args[1], c.args[2])
+        for c in provider.update_comment.call_args_list
+        if COMMENT_MARKER in c.args[2]
+    ]
+    return posted, updated
+
+
+@pytest.mark.parametrize("diff", ["", LOCK_ONLY], ids=["empty-diff", "all-files-filtered"])
+async def test_webhook_review_with_no_reviewable_file_posts_the_advisory(
+    diff, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    set_registry(None)
+    provider = _pull_provider("We decided to cache tokens for ten minutes.", diff, None)
+    engine = _engine(provider)
+    result = await engine.review_pr("https://github.com/hickoryai/widget/pull/7")
+    assert result.reviewed_files == 0
+    posted, updated = _advisory_writes(provider)
+    assert updated == []
+    [comment] = posted
+    assert comment.startswith(COMMENT_MARKER)
+    assert '"We decided to cache tokens for ten minutes."' in comment
+    provider.post_review.assert_not_called()
+
+
+async def test_webhook_review_with_no_reviewable_file_updates_the_advisory(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    set_registry(None)
+    provider = _pull_provider("Decisions I made:\n- One worker per repo", LOCK_ONLY, 91)
+    await _engine(provider).review_pr("https://github.com/hickoryai/widget/pull/7")
+    posted, updated = _advisory_writes(provider)
+    assert posted == []
+    [(comment_id, body)] = updated
+    assert comment_id == 91 and '"One worker per repo"' in body
+
+
+async def test_reviewable_pr_posts_the_advisory_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    set_registry(None)
+    provider = _pull_provider("We decided to cache.", DIFF, None)
+    result = await _engine(provider).review_pr("https://github.com/hickoryai/widget/pull/7")
+    assert result.reviewed_files == 1
+    posted, updated = _advisory_writes(provider)
+    assert len(posted) == 1 and updated == []
