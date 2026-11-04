@@ -312,8 +312,11 @@ Upstream files touched, and why:
   engine prepends after critique so the noise filter cannot drop the
   blocker. The security pass keeps a plain executor (an upstream test
   asserts its type). If that pass calls the tool, it gets an
-  `unknown tool` reply. The fork-delta cap is `engine.py` < 46 against
-  `567ed7e`; the measured total is 45.
+  `unknown tool` reply. HAI-12775 turns the post-critique line into
+  `finish_registry`, which prepends the blockers and posts the
+  uncited-decision comment; it replaces a fork line, so the total is
+  unchanged. The fork-delta cap is `engine.py` < 46 against `567ed7e`; the
+  measured total is 45.
 - `src/mira/platforms/server.py` (10 lines): `install_registry(app)`
   (mounts `/api/registry` and `/mcp`), `observe_github` on every GitHub
   webhook as a background task, and the hourly registry job in the
@@ -332,8 +335,9 @@ These files are new and fork-owned:
   contradiction findings; they are comments only and do not write a
   registry object), `uncited.py` (HAI-12775: advisory findings for
   decisions in the PR body or a mirrored Linear ticket that cite no registry
-  ID; the review API runner appends them, so `engine.py` is unchanged and
-  webhook reviews, which need a path for every inline comment, skip them),
+  ID; the review API runner appends them as findings, and a review that
+  posts to GitHub gets them as one general PR comment, edited in place on
+  re-review, because an inline comment needs a diff line),
   `realization.py`, `auth.py` (registry JWT), `mcp.py`, and `api.py`.
 - `ui/mira/src/pages/registry.tsx` and `ui/mira/src/lib/api/registry.ts`.
 - `docs/registry-conflict-gate.md` (the client contract the hickory-ai

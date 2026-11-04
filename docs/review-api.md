@@ -264,7 +264,9 @@ advisory finding per such decision (HAI-12775):
 - A decision is an explicit commitment ("we decided", "we chose", "we
   opted", "the decision was to", a line starting `Decision:`) or an item
   under a "Decisions I made" heading or label. Questions, hypotheticals,
-  negations, empty or `None` sections, test and lint notes, fenced code,
+  negations, empty or `None` sections, explicit no-decision statements ("No
+  new product behavior is ratified here", "No product behavior changed"),
+  test and lint notes, fenced code,
   blockquotes, inline code, quoted text, and HTML comments do not count.
 - A citation is `reg_` plus 12 hex digits in the same item or sentence (or
   the sentence right after it), Markdown links included. `reg_...` is not a
@@ -277,6 +279,11 @@ advisory finding per such decision (HAI-12775):
   the job, are not model calls, and write nothing to the registry. They are
   added even when no file was reviewable. Contradiction blockers
   (`source_pass == "registry"`) are unchanged.
+- A review that posts to GitHub (the webhook path) cannot post an inline
+  comment with no diff line. It gets the same decisions as one general PR
+  comment with a hidden marker, edited in place on the next review. That
+  path checks only PRs with at least one reviewable file, because the engine
+  returns before its registry hook otherwise.
 
 ### States and stages
 

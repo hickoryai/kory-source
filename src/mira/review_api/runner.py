@@ -287,7 +287,8 @@ async def run_job(
             raise failure
         set_stage("persisting")
         # Advisory only, and appended here so a PR with no reviewable file
-        # still gets them. Webhook reviews skip it: an inline comment needs a path.
+        # still gets them. A GitHub-posting review gets them as one general PR
+        # comment instead (registry.review_gate.finish).
         result.comments.extend(advisory_findings(snapshot.pr_info()))
         findings = [_finding(i, c) for i, c in enumerate(result.comments)]
         return JobOutcome(

@@ -48,6 +48,14 @@ _BULLET = re.compile(r"^(?P<indent>\s*)(?:[-*+]|\d+[.)])\s+(?P<text>.*)$")
 _EMPTY = re.compile(
     r"^(?:none|n/?a|nothing(?:\s+notable)?|no(?:\s+new)?\s+decisions?(?:\s+made)?)?$", re.I
 )
+# "No new product behavior is ratified here", "No product behavior changed":
+# an explicit statement that there is no decision. "No retries on 4xx" is one.
+_NO_DECISION = re.compile(
+    r"^(?:no|none|nothing)\b.*\b(?:chang(?:e|es|ed)|ratif(?:y|ies|ied)|decided|decisions?|"
+    r"introduc(?:e|es|ed)|alter(?:s|ed)?|affect(?:s|ed)?)\b"
+    r"|\bno\s+(?:new\s+)?(?:product\s+)?(?:behaviou?r(?:al)?|decisions?)\b",
+    re.I,
+)
 _COMMIT = re.compile(
     r"\b(?:we|i)(?:\s+have|\s+had|'ve|'d)?\s+(?:decided|chose|chosen|opted|settled\s+on|agreed)\b"
     r"|\bthe\s+decision\s+(?:is|was)\s+to\b"
@@ -112,7 +120,7 @@ def _section_item(text: str) -> bool:
         return False
     masked = _mask(_clean(text)).strip()
     words = masked.rstrip(" .!;:-")
-    if _EMPTY.match(words) or _QUESTION.match(masked):
+    if _EMPTY.match(words) or _NO_DECISION.search(words) or _QUESTION.match(masked):
         return False
     first = words.split(" ", 1)[0]
     if _HYPOTHETICAL.fullmatch(first):
@@ -260,18 +268,17 @@ def finding(source: str, decision: Decision) -> ReviewComment:
     )
 
 
-def advisory_findings(pr_info: Any, registry: Any = None) -> list[ReviewComment]:
-    """Advisories for the PR body and each linked, mirrored Linear ticket.
+def uncited_decisions(pr_info: Any, registry: Any = None) -> list[tuple[str, Decision]]:
+    """``(source, decision)`` for the PR body and each linked, mirrored Linear ticket.
 
     The PR body is checked even when no registry is configured. Any failure
     returns what was found so far, so this check never fails a review.
     """
-    out: list[ReviewComment] = []
+    out: list[tuple[str, Decision]] = []
     try:
         title = getattr(pr_info, "title", "") or ""
         body = getattr(pr_info, "description", "") or ""
-        for decision in find_uncited(body):
-            out.append(finding("The pull request body", decision))
+        out.extend(("The pull request body", d) for d in find_uncited(body))
         if registry is None:
             from mira.registry import get_registry
 
@@ -283,8 +290,60 @@ def advisory_findings(pr_info: Any, registry: Any = None) -> list[ReviewComment]
                     continue
                 url = work.get("source_url") or ""
                 source = f"The Linear {ticket} description" + (f" ({url})" if url else "")
-                for decision in find_uncited(work.get("body") or ""):
-                    out.append(finding(source, decision))
+                out.extend((source, d) for d in find_uncited(work.get("body") or ""))
     except Exception as exc:
         logger.debug("Uncited-decision check stopped early: %s", exc)
     return out[:MAX_FINDINGS]
+
+
+def advisory_findings(pr_info: Any, registry: Any = None) -> list[ReviewComment]:
+    """One ``suggestion`` finding per uncited decision (the review API's shape)."""
+    return [finding(source, d) for source, d in uncited_decisions(pr_info, registry)]
+
+
+# A hidden marker so a re-review edits its own comment instead of adding one.
+COMMENT_MARKER = "<!-- kory-source:registry-uncited-decisions -->"
+
+
+def _inert(text: str) -> str:
+    """Quoted PR text must not @-mention anyone or close the quote early."""
+    return text.replace("@", "@\u200b").replace("\n", " ")
+
+
+def general_comment(items: list[tuple[str, Decision]]) -> str:
+    """The advisories as one PR conversation comment, for reviews posted to GitHub.
+
+    An inline review comment needs a path and a diff line. These findings are
+    about the PR description or a ticket, so they go in a general comment.
+    """
+    lines = [COMMENT_MARKER, f"### {TITLE}", ""]
+    if not items:
+        lines.append("Every decision this pull request states now cites a registry ID.")
+        return "\n".join(lines) + "\n"
+    lines.append(
+        "These decisions have no registry ID next to them. If one is durable, record it "
+        "in the registry and cite its `reg_` ID. This is advisory: it does not block the "
+        "merge, and nothing was written to the registry."
+    )
+    lines.append("")
+    for source, d in items:
+        lines.append(f'- {source}, line {d.line}: "{_inert(d.quote)}"')
+    return "\n".join(lines) + "\n"
+
+
+async def post_general_comment(
+    provider: Any, pr_info: Any, items: list[tuple[str, Decision]]
+) -> None:
+    """Create, or edit in place, the advisory comment. Never raises.
+
+    With nothing to report and no earlier comment, this posts nothing. With an
+    earlier comment, it is edited to say the decisions are now cited.
+    """
+    try:
+        existing = await provider.find_bot_comment(pr_info, COMMENT_MARKER)
+        if existing is not None:
+            await provider.update_comment(pr_info, existing, general_comment(items))
+        elif items:
+            await provider.post_comment(pr_info, general_comment(items))
+    except Exception as exc:
+        logger.warning("Uncited-decision comment was not posted: %s", exc)

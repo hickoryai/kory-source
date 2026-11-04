@@ -6,8 +6,12 @@ the registry's Linear mirror only. Nothing here writes a registry object.
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 
+from mira.config import MiraConfig
+from mira.core.engine import ReviewEngine
 from mira.models import PRInfo, Severity
 from mira.registry import set_registry
 from mira.registry.db import RegistryDB
@@ -15,6 +19,7 @@ from mira.registry.linear import issue_item
 from mira.registry.model import Actor
 from mira.registry.service import Registry
 from mira.registry.uncited import (
+    COMMENT_MARKER,
     MAX_FINDINGS,
     SOURCE_PASS,
     TITLE,
@@ -125,10 +130,22 @@ def test_positive_forms(text, expected):
         "Decisions I made:\n- Added tests for the parser\n- Ran ruff and mypy",
         "Added a retry loop and tests. Fixed a typo.",
         "Decision: none",
+        # Explicit no-decision statements (the false-enforcement guard).
+        "## Decisions I made\nNo new product behavior is ratified here.",
+        "## Decisions I made\n- No product behavior changed",
+        "## Decisions I made\n- No product behavior changed.\n- No decisions were needed",
+        "Decisions I made: None — no product behavior changed.",
+        "## Decisions I made\nThis PR ratifies no new product behavior.",
+        "Decisions I made:\n- Nothing user-facing is affected",
     ],
 )
 def test_negative_controls(text):
     assert quotes(text) == []
+
+
+def test_a_no_decision_line_does_not_hide_a_real_one():
+    text = "## Decisions I made\n- No product behavior changed\n- No retries on 4xx"
+    assert quotes(text) == ["No retries on 4xx"]
 
 
 def test_one_citation_does_not_cover_another_decision():
@@ -268,3 +285,123 @@ def test_registry_outage_keeps_the_pr_body_findings():
 def test_findings_are_capped():
     body = "\n\n".join(f"We decided rule {i}." for i in range(MAX_FINDINGS + 5))
     assert len(advisory_findings(_pr(body=body), registry=None)) == MAX_FINDINGS
+
+
+# ── GitHub-posting reviews ──────────────────────────────────────────────
+
+DIFF = """diff --git a/app/handler.py b/app/handler.py
+index 1111111..2222222 100644
+--- a/app/handler.py
++++ b/app/handler.py
+@@ -1,2 +1,3 @@
+ def handle(x):
+-    return x
++    y = x + 1
++    return y
+"""
+
+
+class PostingProvider:
+    """Records every write the engine's registry hook makes to the PR."""
+
+    def __init__(self, existing: int | None = None, fail: bool = False) -> None:
+        self.existing = existing
+        self.fail = fail
+        self.posted: list[str] = []
+        self.updated: list[tuple[int, str]] = []
+        self.markers: list[str] = []
+
+    async def find_bot_comment(self, pr_info, marker):  # type: ignore[no-untyped-def]
+        self.markers.append(marker)
+        if self.fail:
+            raise RuntimeError("GitHub is down")
+        return self.existing
+
+    async def post_comment(self, pr_info, body):  # type: ignore[no-untyped-def]
+        self.posted.append(body)
+
+    async def update_comment(self, pr_info, comment_id, body):  # type: ignore[no-untyped-def]
+        self.updated.append((comment_id, body))
+
+
+def _engine(provider: object | None, *, dry_run: bool = False) -> ReviewEngine:
+    config = MiraConfig()
+    for flag in (
+        "walkthrough",
+        "self_critique",
+        "security_pass",
+        "osv_scan",
+        "secrets_scan",
+        "agentic_tools",
+        "code_context",
+        "dependency_overlap",
+        "include_summary",
+        "blast_radius",
+    ):
+        setattr(config.review, flag, False)
+    llm = MagicMock()
+    llm.review = AsyncMock(return_value='{"comments":[],"key_issues":[],"summary":""}')
+    llm.count_tokens = MagicMock(return_value=10)
+    llm.usage = {}
+    return ReviewEngine(config=config, llm=llm, provider=provider, dry_run=dry_run)  # type: ignore[arg-type]
+
+
+async def _review(engine: ReviewEngine, body: str):  # type: ignore[no-untyped-def]
+    pr = _pr(body=body)
+    engine._pr_info = pr
+    return await engine._review_diff_internal(DIFF, pr_title=pr.title, pr_description=body)
+
+
+async def test_posting_review_puts_advisories_in_one_general_comment(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    set_registry(None)
+    provider = PostingProvider()
+    body = PR_BODY + "\nDecisions I made: ping @octocat about the TTL\n"
+    result = await _review(_engine(provider), body)
+    # Nothing with an empty path reaches the inline review.
+    assert all(c.path for c in result.comments)
+    assert all(c.source_pass != SOURCE_PASS for c in result.comments)
+    [comment] = provider.posted
+    assert provider.updated == []
+    assert comment.startswith(COMMENT_MARKER)
+    assert TITLE in comment and "does not block the merge" in comment
+    assert (
+        '- The pull request body, line 4: "We decided to cache tokens for ten minutes."' in comment
+    )
+    assert '"Retry upstream calls three times before failing"' in comment
+    assert "Keep the queue in SQLite" not in comment
+    assert "@octocat" not in comment and "@\u200boctocat" in comment
+
+
+async def test_re_review_edits_the_comment_and_clears_it_when_cited(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    set_registry(None)
+    provider = PostingProvider(existing=55)
+    await _review(_engine(provider), "We decided to cache.")
+    assert provider.posted == []
+    assert provider.updated[0][0] == 55 and '"We decided to cache."' in provider.updated[0][1]
+    await _review(_engine(provider), f"We decided to cache ({CITED}).")
+    assert provider.posted == []
+    assert "now cites a registry ID" in provider.updated[1][1]
+
+
+async def test_nothing_is_posted_without_decisions_dry_run_or_a_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    set_registry(None)
+    quiet = PostingProvider()
+    await _review(_engine(quiet), "## Decisions I made\nNo new product behavior is ratified here.")
+    assert (quiet.posted, quiet.updated) == ([], [])
+    dry = PostingProvider()
+    await _review(_engine(dry, dry_run=True), "We decided to cache.")
+    assert (dry.posted, dry.updated, dry.markers) == ([], [], [])
+    result = await _review(_engine(None), "We decided to cache.")
+    assert all(c.source_pass != SOURCE_PASS for c in result.comments)
+
+
+async def test_comment_failure_does_not_fail_the_review(tmp_path, monkeypatch):
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+    set_registry(None)
+    provider = PostingProvider(fail=True)
+    result = await _review(_engine(provider), "We decided to cache.")
+    assert provider.markers == [COMMENT_MARKER]
+    assert result.reviewed_files == 1
