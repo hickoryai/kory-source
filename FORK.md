@@ -330,12 +330,16 @@ These files are new and fork-owned:
   evidence, import), `conflicts.py` (seat judge), `learned.py` (read-only
   learned-rule mirror), `prompt.py`, `review_gate.py` (review-time
   contradiction findings; they are comments only and do not write a
-  registry object), `realization.py`, `auth.py` (registry JWT), `mcp.py`,
-  and `api.py`.
+  registry object), `uncited.py` (HAI-12775: advisory findings for
+  decisions in the PR body or a mirrored Linear ticket that cite no registry
+  ID; the review API runner appends them, so `engine.py` is unchanged and
+  webhook reviews, which need a path for every inline comment, skip them),
+  `realization.py`, `auth.py` (registry JWT), `mcp.py`, and `api.py`.
 - `ui/mira/src/pages/registry.tsx` and `ui/mira/src/lib/api/registry.ts`.
 - `docs/registry-conflict-gate.md` (the client contract the hickory-ai
   push hook calls).
-- `tests/test_decision_registry.py` and `tests/test_contradiction_gate.py`.
+- `tests/test_decision_registry.py`, `tests/test_contradiction_gate.py`, and
+  `tests/test_uncited_decisions.py`.
   The registry test asserts the `engine.py` (<46) and `server.py` (<25)
   caps against the fork base. The engine cap moved from 40 to 47 when
   HAI-12286 added `review_snapshot` (28 lines) beside the registry block.
