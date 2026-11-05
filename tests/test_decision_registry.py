@@ -634,6 +634,8 @@ def test_mcp_tools_and_put_decision(mcp_client, reg):
         "put_work",
         "link_work",
         "put_evidence",
+        "ask_source_question",
+        "explain_pr_decisions",
     }
     res = rpc(
         mcp_client,
