@@ -14,7 +14,6 @@ from mira.config import LLMConfig
 from . import critique_replay as cr
 from . import parity_runner
 from . import study_capture as sc
-from .parity_judge import build_pool
 from .parity_snapshot import load_units
 from .test_parity_unit import (
     SHA_A,
@@ -106,17 +105,25 @@ def _ur(key: str, drafts: list[dict], stages: list[str]) -> sc.UnitRun:
 
 
 def _label(ur: sc.UnitRun, unit, links: dict[int, tuple[str, str | None]]) -> dict:
-    """A stored label result where draft i is grouped with golden g (or alone) under a verdict."""
-    pool, _ = build_pool(unit.unit_id, "t", sc.label_comments(ur), list(unit.golden), [], 1)
+    """A stored, structurally complete label over the frozen pool.
+
+    Draft i is grouped with golden g (or alone) under a verdict. Every other pool
+    comment gets its own issue, so each pool index appears exactly once.
+    """
+    pool = sc.expected_pool(ur.key, ur, unit)
     by_src = {p["source_id"]: p["index"] for p in pool}
     groups: dict[tuple, list[int]] = {}
     for i, (verdict, gid) in links.items():
         groups.setdefault((verdict, gid), []).append(by_src[f"draft:{i}"])
-    issues = []
+    issues, used = [], set()
     for (verdict, gid), members in groups.items():
         if gid:
             members = [*members, by_src[gid]]
+        used |= set(members)
         issues.append({"comment_indices": members, "verdict": verdict, "severity": "major"})
+    for p in pool:
+        if p["index"] not in used:
+            issues.append({"comment_indices": [p["index"]], "verdict": "real", "severity": "major"})
     return {
         "status": "ok",
         "judge": {"pool": pool, "parsed": {"issues": issues, "evidence": []}, "error": ""},
@@ -339,7 +346,7 @@ def test_load_capture_reports_every_planned_unit_run_with_missingness(tmp_path):
 def test_all_zero_drafts_support_low_coverage_and_leave_rates_not_evaluable():
     m = _manifest()
     captured = {k: _ur(k, [], []) for k in m["unit_runs"]}
-    rep = sc.analyze(m, captured, {})
+    rep = sc.analyze(m, captured, {}, units=_units())
     rd = rep["rules"]["R-draft"]
     assert rd["result"] == "low drafting coverage" and rd["d_plus"] == 0 and rd["denominator"] == 3
     assert rd["precondition"]["judge_error_rate"].startswith("N/A")
@@ -355,7 +362,9 @@ def test_required_but_missing_label_is_incomplete_not_the_zero_label_exception()
     k = f"{G1}|r1"
     captured = {key: _ur(key, [], []) for key in m["unit_runs"]}
     captured[k] = _ur(k, [_draft(3, "x")], ["critique_deleted"])
-    rep = sc.analyze(m, captured, {})  # no label stored for a unit-run that has drafts
+    rep = sc.analyze(
+        m, captured, {}, units=_units()
+    )  # no label stored for a unit-run that has drafts
     assert rep["missingness"][k] == {
         "complete": False,
         "label_required": True,
@@ -390,7 +399,7 @@ def test_mixed_copies_across_runs_follow_the_critique_eligible_definitions():
     labels[k] = _label(captured[k], units[G2], {0: ("real", "hickory-2-1")})
     for key in m["unit_runs"]:
         captured.setdefault(key, _ur(key, [], []))
-    rep = sc.analyze(m, captured, labels)
+    rep = sc.analyze(m, captured, labels, units=_units())
     rr = rep["rules"]["R-crit-recall"]
     assert rep["rules"]["R-draft"]["D_C"] == ["hickory-1-1", "hickory-1-2", "hickory-2-1"]
     assert rr["A"] == ["hickory-1-1", "hickory-1-2", "hickory-2-1"] and rr["e"] == 3
@@ -416,7 +425,7 @@ def test_uncertain_and_confirmed_copies_are_not_double_counted():
     labels[k] = _label(captured[k], units[G2], {0: ("uncertain", "hickory-2-1")})
     for key in m["unit_runs"]:
         captured.setdefault(key, _ur(key, [], []))
-    rd = sc.analyze(m, captured, labels)["rules"]["R-draft"]
+    rd = sc.analyze(m, captured, labels, units=_units())["rules"]["R-draft"]
     assert rd["D_C"] == ["hickory-1-1"] and rd["D_U"] == ["hickory-2-1"]  # 1-1 counted once, as C
     assert (rd["d"], rd["d_plus"]) == (1, 2)
 
@@ -424,7 +433,7 @@ def test_uncertain_and_confirmed_copies_are_not_double_counted():
 def test_partial_coverage_uses_the_frozen_planned_denominator():
     m = _manifest(runs=3)
     captured = {k: _ur(k, [], []) for k in m["unit_runs"][:7]}  # 7 of 9 planned unit-runs
-    rep = sc.analyze(m, _all_planned(m, captured), {})
+    rep = sc.analyze(m, _all_planned(m, captured), {}, units=_units())
     pre = rep["rules"]["R-crit-recall"]["precondition"]
     assert (pre["planned"], pre["complete"]) == (9, 7) and pre["coverage"] < 0.9 and not pre["met"]
     assert rep["rules"]["R-intermittent"]["all_complete"] is False
@@ -436,8 +445,9 @@ def test_partial_coverage_uses_the_frozen_planned_denominator():
 
 
 class Judge:
-    def __init__(self, fail_times=0, model=sc.JUDGE_MODEL, reply=None):
+    def __init__(self, fail_times=0, model=sc.JUDGE_MODEL, reply=None, omit=None):
         self.reply = reply
+        self.omit = omit  # callable(prompt) -> pool indices to leave out of the reply
         self.sent: list[dict] = []
         self.fail_times = fail_times
         self.model = model
@@ -451,6 +461,9 @@ class Judge:
         if self.reply is not None:
             return {"text": self.reply, "actual_model": self.model}
         idx = [int(i) for i in re.findall(r"^\[(\d+)\] ", request["body"]["prompt"], re.M)]
+        if self.omit is not None:
+            drop = set(self.omit(request["body"]["prompt"]))
+            idx = [i for i in idx if i not in drop]
         issues = [{"comment_indices": [i], "verdict": "real", "severity": "major"} for i in idx]
         return {"text": json.dumps({"issues": issues, "evidence": []}), "actual_model": self.model}
 
@@ -495,7 +508,7 @@ async def test_terminal_label_failure_is_counted_once_regardless_of_retries(tmp_
     assert len(judge.sent) == 3 and ledger.label_used == {
         key: 3
     }  # 1 call + 2 retries, own reservation
-    rep = sc.analyze(m, captured, sc.load_labels(m, out))
+    rep = sc.analyze(m, captured, sc.load_labels(m, out), units=_units())
     assert rep["missingness"][key]["status"] == "label_error"
     pre = rep["rules"]["R-draft"]["precondition"]
     assert (pre["label_required"], pre["label_failed"], pre["judge_error_rate"]) == (1, 1, 1.0)
@@ -506,7 +519,7 @@ async def test_a_label_that_succeeds_after_retries_is_complete(tmp_path):
     res, ledger, out, captured, m = await _label_phase(tmp_path, judge)
     key = f"{G1}|r1"
     assert len(judge.sent) == 3 and res[key]["status"] == "ok"
-    rep = sc.analyze(m, captured, sc.load_labels(m, out))
+    rep = sc.analyze(m, captured, sc.load_labels(m, out), units=_units())
     assert rep["missingness"][key]["status"] == "complete_labeled"
     assert rep["rules"]["R-draft"]["precondition"]["judge_error_rate"] == 0.0
 
@@ -521,7 +534,7 @@ async def test_durable_stop_and_budget_survive_restart_with_zero_new_requests(tm
     assert ledger2.label_used == ledger.label_used  # restored from the journal
     await _label_phase(tmp_path, fresh, manifest=m, captured=captured, ledger=ledger2)
     assert fresh.sent == []  # restart sends nothing
-    rep = sc.analyze(m, captured, sc.load_labels(m, out))
+    rep = sc.analyze(m, captured, sc.load_labels(m, out), units=_units())
     assert rep["missingness"][f"{G1}|r1"]["complete"] is False
 
 
@@ -690,7 +703,7 @@ async def test_malformed_labels_are_terminal_errors_never_negative_evidence(tmp_
     res, ledger, out, captured, m = await _label_phase(tmp_path, judge)
     key = f"{G1}|r1"
     assert res[key]["status"] == "error" and len(judge.sent) == 1
-    rep = sc.analyze(m, captured, sc.load_labels(m, out))
+    rep = sc.analyze(m, captured, sc.load_labels(m, out), units=_units())
     assert (
         rep["missingness"][key]["complete"] is False and rep["missingness"][key]["label_required"]
     )
@@ -705,16 +718,20 @@ def test_partial_and_duplicate_label_coverage_is_invalid():
     units = _units()
     k = f"{G1}|r1"
     ur = _ur(k, [_draft(3, "a"), _draft(4, "b")], ["critique_deleted", "critique_kept"])
-    rec = _label(ur, units[G1], {0: ("real", "hickory-1-1")})["judge"]  # draft 1 never labeled
+    rec = _label(ur, units[G1], {0: ("real", "hickory-1-1")})["judge"]
+    draft1 = next(p["index"] for p in rec["pool"] if p["source_id"] == "draft:1")
+    rec["parsed"]["issues"] = [
+        i for i in rec["parsed"]["issues"] if i["comment_indices"] != [draft1]
+    ]
     with pytest.raises(sc.LabelError, match="not labeled"):
-        sc.check_label_record(rec, 2)
+        sc.check_label_record(rec, sc.expected_pool(k, ur, units[G1]))
     dup = _label(ur, units[G1], {0: ("real", None), 1: ("real", None)})["judge"]
     dup["parsed"]["issues"].append(dict(dup["parsed"]["issues"][0]))
     with pytest.raises(sc.LabelError, match="more than one issue"):
-        sc.check_label_record(dup, 2)
+        sc.check_label_record(dup, sc.expected_pool(k, ur, units[G1]))
     m = _manifest()
     captured = {key: _ur(key, [], []) for key in m["unit_runs"]} | {k: ur}
-    rep = sc.analyze(m, captured, {k: {"status": "ok", "judge": rec}})
+    rep = sc.analyze(m, captured, {k: {"status": "ok", "judge": rec}}, units=_units())
     assert rep["missingness"][k]["status"] == "label_invalid"
 
 
@@ -731,14 +748,14 @@ async def test_label_phase_to_report_with_saved_diffs_and_sensitivities(tmp_path
         (ddir / f"{uid}.diff").write_text(diff)
         snaps[uid] = {"diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}
     diffs = sc.saved_diffs(out, {"snapshots": snaps}, set(snaps))
-    rep = sc.analyze(m, captured, sc.load_labels(m, out), diffs)
+    rep = sc.analyze(m, captured, sc.load_labels(m, out), diffs, units=_units())
     assert rep["missingness"][key]["status"] == "complete_labeled" and rep["pending"] == []
     assert isinstance(rep["rules"]["R-crit-recall"]["downstream_anchorable_deleted"], int)
     assert "sensitivity_uncertain_as_not_real" in rep["rules"]["R-crit-precision"]
     assert "sensitivity_uncertain_as_not_real" in rep["rules"]["R-fp"]["non_golden"]
     full = rep["rules"]["sensitivity_full_golden"]
     assert full["denominator"] == len(m["sensitivity_golden"])
-    no_diffs = sc.analyze(m, captured, sc.load_labels(m, out))
+    no_diffs = sc.analyze(m, captured, sc.load_labels(m, out), units=_units())
     assert (
         no_diffs["pending"]
         and no_diffs["rules"]["R-crit-recall"]["downstream_anchorable_deleted"] == "pending"
@@ -755,6 +772,105 @@ def test_full_golden_sensitivity_includes_the_excluded_anchor():
     k = f"{G1}|r1"
     ur = _ur(k, [_draft(4, "b")], ["critique_deleted"])
     captured = {key: _ur(key, [], []) for key in m["unit_runs"]} | {k: ur}
-    rep = sc.analyze(m, captured, {k: _label(ur, units[G1], {0: ("real", "hickory-1-2")})})
+    rep = sc.analyze(
+        m, captured, {k: _label(ur, units[G1], {0: ("real", "hickory-1-2")})}, units=units
+    )
     assert rep["rules"]["R-draft"]["d"] == 0  # primary set excludes it
     assert rep["rules"]["sensitivity_full_golden"]["d"] == 1  # sensitivity line includes it
+
+
+# ------------------------------------------------------------------ review fixes (2a95a4a)
+
+
+def _pool_index(m, captured, owner):
+    """Pool indices of one owner in the frozen pool of G1|r1."""
+    k = f"{G1}|r1"
+    pool = sc.expected_pool(k, captured[k], _units()[G1])
+    return [p["index"] for p in pool if p["owner"] == owner]
+
+
+async def test_a_label_omitting_a_golden_reference_is_a_terminal_error(tmp_path):
+    from .parity_judge import GREPTILE
+
+    m = _manifest()
+    captured = {k: _ur(k, [], []) for k in m["unit_runs"]} | {
+        f"{G1}|r1": _ur(f"{G1}|r1", [_draft(3, "x")], ["critique_deleted"])
+    }
+    golden_idx = _pool_index(m, captured, GREPTILE)
+    assert golden_idx  # G1 has golden references in its pool
+    judge = Judge(omit=lambda prompt: golden_idx[:1])  # every draft labeled, one golden omitted
+    res, ledger, out, captured, m = await _label_phase(
+        tmp_path, judge, manifest=m, captured=captured
+    )
+    key = f"{G1}|r1"
+    assert res[key]["status"] == "error" and "not labeled (greptile)" in res[key]["error"]
+    rep = sc.analyze(m, captured, sc.load_labels(m, out), units=_units())
+    assert rep["missingness"][key]["complete"] is False
+    assert rep["rules"]["R-draft"]["precondition"]["label_failed"] == 1
+    assert rep["rules"]["R-draft"]["D_C"] == [] and rep["rules"]["R-draft"]["D_U"] == []
+
+
+async def test_duplicate_pool_coverage_from_the_judge_is_a_terminal_error(tmp_path):
+    reply = None
+
+    class DupJudge(Judge):
+        async def __call__(self, request):
+            payload = await super().__call__(request)
+            body = json.loads(payload["text"])
+            body["issues"].append(dict(body["issues"][0]))
+            return {**payload, "text": json.dumps(body)}
+
+    judge = DupJudge(reply=reply)
+    res, ledger, out, captured, m = await _label_phase(tmp_path, judge)
+    assert (
+        res[f"{G1}|r1"]["status"] == "error" and "more than one issue" in res[f"{G1}|r1"]["error"]
+    )
+
+
+def test_an_omitted_prior_comment_invalidates_the_label():
+    unit = SimpleNamespace(
+        unit_id=G1,
+        golden=list(_units()[G1].golden),
+        prior=[
+            {
+                "id": "hickory-1-0",
+                "path": "a.py",
+                "line": 9,
+                "title": "Earlier",
+                "body": "prior finding",
+            }
+        ],
+    )
+    k = f"{G1}|r1"
+    ur = _ur(k, [_draft(3, "x")], ["critique_deleted"])
+    rec = _label(ur, unit, {0: ("real", None)})["judge"]
+    sc.check_label_record(rec, sc.expected_pool(k, ur, unit))  # complete: passes
+    prior_idx = next(p["index"] for p in rec["pool"] if p["source_id"] == "hickory-1-0")
+    rec["parsed"]["issues"] = [
+        i for i in rec["parsed"]["issues"] if prior_idx not in i["comment_indices"]
+    ]
+    with pytest.raises(sc.LabelError, match=r"not labeled \(prior\)"):
+        sc.check_label_record(rec, sc.expected_pool(k, ur, unit))
+
+
+def test_a_stored_label_over_a_different_pool_is_invalid_even_with_equal_counts():
+    m = _manifest()
+    units = _units()
+    k = f"{G1}|r1"
+    real = _ur(k, [_draft(3, "the captured draft")], ["critique_deleted"])
+    other = _ur(k, [_draft(3, "a substituted draft")], ["critique_deleted"])
+    forged = _label(other, units[G1], {0: ("real", "hickory-1-1")})  # same size pool, other draft
+    with pytest.raises(sc.LabelError, match="differs from the frozen"):
+        sc.check_label_record(forged["judge"], sc.expected_pool(k, real, units[G1]))
+    captured = {key: _ur(key, [], []) for key in m["unit_runs"]} | {k: real}
+    rep = sc.analyze(m, captured, {k: forged}, units=units)
+    assert rep["missingness"][k]["status"] == "label_invalid"
+    assert rep["rules"]["R-draft"]["D_C"] == []
+
+
+def test_zero_draft_special_case_is_unchanged():
+    m = _manifest()
+    captured = {k: _ur(k, [], []) for k in m["unit_runs"]}
+    rep = sc.analyze(m, captured, {}, units=_units())
+    assert all(v["status"] == "complete_zero_drafts" for v in rep["missingness"].values())
+    assert rep["rules"]["R-draft"]["precondition"]["judge_error_rate"].startswith("N/A")

@@ -577,16 +577,36 @@ class LabelError(ValueError):
     """A judge reply that does not label every draft of the frozen blind pool exactly once."""
 
 
-def check_label_record(record: dict, n_drafts: int) -> None:
-    """Structural validity of one blind label. Anything else is a terminal label error."""
-    from .parity_judge import KORY, VERDICTS
+def expected_pool(key: str, ur: UnitRun, unit: Any) -> list[dict]:
+    """The frozen blind pool for one unit-run: its captured drafts plus the unit's references."""
+    from .parity_judge import build_pool
+
+    pool, _ = build_pool(
+        unit.unit_id,
+        f"study-label|{key}",
+        label_comments(ur),
+        list(unit.golden),
+        list(unit.prior),
+        SEED,
+    )
+    return pool
+
+
+def check_label_record(record: dict, expected: list[dict]) -> None:
+    """Structural validity of one blind label against its frozen pool.
+
+    The stored pool must equal the expected pool: same drafts, Greptile and prior
+    comments, same order and source ids. Every pool index must appear in exactly one
+    issue with a valid verdict. Anything else is a terminal label error. An omitted
+    reference must never be filled in later as an "uncertain" issue.
+    """
+    from .parity_judge import VERDICTS
 
     if record.get("error"):
         raise LabelError(f"judge error: {str(record['error'])[:120]}")
-    pool = record.get("pool") or []
-    draft_idx = {p["index"] for p in pool if p.get("owner") == KORY}
-    if len(draft_idx) != n_drafts:
-        raise LabelError(f"pool holds {len(draft_idx)} drafts, capture has {n_drafts}")
+    pool = record.get("pool")
+    if pool != expected:
+        raise LabelError("stored pool differs from the frozen capture + reference pool")
     parsed = record.get("parsed")
     issues = parsed.get("issues") if isinstance(parsed, dict) else None
     if not isinstance(issues, list) or not issues:
@@ -605,9 +625,10 @@ def check_label_record(record: dict, n_drafts: int) -> None:
         seen += idx
     if len(seen) != len(set(seen)):
         raise LabelError("a comment appears in more than one issue")
-    missing = draft_idx - set(seen)
+    missing = set(range(len(pool))) - set(seen)
     if missing:
-        raise LabelError(f"{len(missing)} draft(s) not labeled")
+        owners = sorted({pool[i]["owner"] for i in missing})
+        raise LabelError(f"{len(missing)} pool comment(s) not labeled ({', '.join(owners)})")
 
 
 async def label_phase(
@@ -621,7 +642,7 @@ async def label_phase(
 ) -> dict[str, dict]:
     """One blind label call per captured unit-run with drafts, each inside its own reservation."""
     from .critique_replay import ReplayStop, _expect, _once
-    from .parity_judge import build_pool, build_prompt, judge_unit
+    from .parity_judge import build_prompt, judge_unit
 
     state.restore(out)
     results: dict[str, dict] = {}
@@ -632,13 +653,11 @@ async def label_phase(
         unit = units[ur.unit_id]
         comments = label_comments(ur)
         run_label = f"study-label|{key}"
-        pool, _ = build_pool(
-            unit.unit_id, run_label, comments, list(unit.golden), list(unit.prior), SEED
-        )
+        pool = expected_pool(key, ur, unit)
         prompt = build_prompt(unit.pr_title, diffs[ur.unit_id], pool)
 
         async def _label(
-            key=key, unit=unit, comments=comments, prompt=prompt, run_label=run_label
+            key=key, unit=unit, comments=comments, prompt=prompt, run_label=run_label, pool=pool
         ) -> dict:
             token = _expect.set(
                 (
@@ -662,7 +681,7 @@ async def label_phase(
                 _expect.reset(token)
             if state.stop:
                 raise ReplayStop(state.stop, state.detail)
-            check_label_record(record, len(comments))  # raises -> terminal label error
+            check_label_record(record, pool)  # raises -> terminal label error
             return {"judge": record}
 
         results[key] = await _once(out, f"label__{key.replace('|', '__')}", state, _label)
@@ -699,7 +718,7 @@ def wilson(k: int, n: int, z: float = 1.96) -> list[float] | None:
 
 
 def unit_run_outcomes(
-    manifest: dict, unit_runs: dict[str, UnitRun], labels: dict[str, dict]
+    manifest: dict, unit_runs: dict[str, UnitRun], labels: dict[str, dict], units: dict[str, Any]
 ) -> dict:
     """Terminal outcome per planned unit-run. A required-but-missing label is never complete."""
     out = {}
@@ -735,7 +754,7 @@ def unit_run_outcomes(
             }
         else:
             try:
-                check_label_record(res["judge"], len(ur.drafts))
+                check_label_record(res["judge"], expected_pool(key, ur, units[ur.unit_id]))
             except LabelError as exc:
                 out[key] = {
                     "complete": False,
@@ -753,10 +772,16 @@ def analyze(
     unit_runs: dict[str, UnitRun],
     labels: dict[str, dict],
     diffs: dict | None = None,
+    *,
+    units: dict[str, Any],
 ) -> dict:
-    """Metrics, rule outcomes and missingness, exactly as NEXT_EXPERIMENT_PLAN_v3 §6 defines them."""
+    """Metrics, rule outcomes and missingness, exactly as NEXT_EXPERIMENT_PLAN_v3 §6 defines them.
+
+    ``units`` (the development ``Unit`` objects) rebuild each frozen blind pool, so a
+    stored label is only accepted against the exact pool it should have judged.
+    """
     E = set(manifest["eligible_golden"])
-    outcomes = unit_run_outcomes(manifest, unit_runs, labels)
+    outcomes = unit_run_outcomes(manifest, unit_runs, labels, units)
     complete = {k for k, v in outcomes.items() if v["complete"]}
 
     # Per-draft rows for complete unit-runs.
@@ -1261,7 +1286,12 @@ def cmd_report(args: argparse.Namespace) -> int:
     run_artifact = json.loads((out / "capture-run.json").read_text())
     unit_runs = load_capture(manifest, out / "private" / "capture.jsonl", run_artifact)
     diffs = saved_diffs(out, run_artifact, {k.split("|")[0] for k in manifest["unit_runs"]})
-    report = analyze(manifest, unit_runs, load_labels(manifest, out), diffs)
+    from .parity_snapshot import load_units
+
+    dev = {
+        u.unit_id: u for u in load_units(json.loads(Path(args.manifest).read_text()), "development")
+    }
+    report = analyze(manifest, unit_runs, load_labels(manifest, out), diffs, units=dev)
     print(json.dumps(report, indent=1, default=str))
     return 0
 
