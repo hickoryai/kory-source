@@ -595,7 +595,9 @@ async def test_run_parity_end_to_end(monkeypatch):
     # Reproducible: a JSON round trip of the artifact rescored gives the same summary.
     again = parity_runner.summarize(json.loads(json.dumps(art)))
     assert json.loads(json.dumps(again)) == summary
-    assert "Registry A/B" in parity_runner.render_markdown(summary)
+    md = parity_runner.render_markdown(summary)
+    for section in ("Registry A/B", "## Attribution", "## Uncertainty", "## Seat usage"):
+        assert section in md
 
 
 async def test_registry_as_of_drops_later_approvals(monkeypatch):

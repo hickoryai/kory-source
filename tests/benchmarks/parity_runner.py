@@ -731,11 +731,55 @@ def render_markdown(summary: dict) -> str:
     ]
     if p.get("inconclusive_reasons"):
         lines.append(f"- Inconclusive because: {'; '.join(p['inconclusive_reasons'])}.")
+    inputs = summary.get("inputs") or {}
+    if inputs:
+        lines += [
+            "",
+            "## Inputs",
+            "",
+            f"- Manifest: `{inputs.get('manifest')}` (sha256 `{inputs.get('manifest_sha256')}`), split `{inputs.get('split')}`: "
+            f"{inputs.get('prs')} PRs, {inputs.get('units')} units, {inputs.get('golden_findings')} golden findings.",
+            f"- Arms {inputs.get('arms')} × {inputs.get('runs')} runs: {inputs.get('reviews')} reviews, {inputs.get('judge_calls')} judge calls. "
+            f"Estimated seat sessions: {inputs.get('estimated_seat_sessions')} ({inputs.get('estimate_basis')}).",
+            f"- Git: `{inputs.get('git_sha')}`. Shuffle seed: {summary['judge'].get('seed')}.",
+            f"- Command: `{inputs.get('rerun_command')}`",
+        ]
+    judge = summary["judge"]
+    lines += [
+        "",
+        "## Attribution",
+        "",
+        f"- Reviewer: actual models {summary['seat_usage']['review']['actual_models']}; families {judge['reviewer_families']}.",
+        f"- Judge: requested `{(judge.get('config') or {}).get('model')}`; actual models {summary['seat_usage']['judge']['actual_models']}; families {judge['families']}.",
+        f"- Reviewer/judge family overlap: {judge.get('family_overlap') or 'none'}. Judge is blind: {judge.get('blind')}.",
+        "- `unknown` is an unusable reply (no model reported); it is never scored.",
+        "",
+        "## Uncertainty",
+        "",
+        "| arm | verdict | Δ weighted TP/unit mean | 95% CI | non-inferiority margin | Greptile weighted TP/unit | precision ok | judge error rate |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for name, a in summary["arms"].items():
+        ap = a.get("parity", {})
+        d = ap.get("delta_weighted_tp_per_unit", {})
+        lines.append(
+            f"| {name} | {ap.get('verdict')} | {d.get('mean')} | [{d.get('lo')}, {d.get('hi')}] "
+            f"| −{ap.get('non_inferiority_margin_abs')} | {ap.get('greptile_weighted_tp_per_unit')} "
+            f"| {ap.get('precision_ok')} | {ap.get('judge_error_rate')} |"
+        )
+    rule = p.get("rule") or {}
+    if rule:
+        lines.append(
+            f"\nCluster bootstrap by PR, {rule.get('bootstrap_resamples')} resamples, seed {rule.get('bootstrap_seed')}, "
+            f"confidence {rule.get('confidence')}; margin {rule.get('non_inferiority_margin')} × Greptile's mean; "
+            f"precision margin {rule.get('precision_margin')}; at least {rule.get('min_scored_units')} units, "
+            f"{rule.get('min_coverage')} coverage, judge errors ≤ {rule.get('max_judge_error_rate')}."
+        )
     lines += [
         "",
         "## Per arm",
         "",
-        "| arm | Kory defect F1 | Greptile defect F1 | golden F1 | golden recall | Kory P | Greptile P | Kory evidence | coverage | latency mean s | verdict |",
+        "| arm | Kory defect F1 | Greptile defect F1 | golden F1 | golden recall | Kory P | Greptile P | Kory evidence | coverage | latency s (mean ± σ / median / p90) | verdict |",
         "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, a in summary["arms"].items():
@@ -745,7 +789,8 @@ def render_markdown(summary: dict) -> str:
             f"| {a['golden_f1']['mean']} ± {a['golden_f1']['sigma']} | {a['golden_recall']['mean']} "
             f"| {a['kory_totals']['precision']} | {a['greptile_totals']['precision']} "
             f"| {a['kory_totals']['evidence_mean']} | {a['coverage']['kory_rate']} "
-            f"| {a['latency_seconds']['mean']} | {a['parity']['verdict']} |"
+            f"| {a['latency_seconds']['mean']} ± {a['latency_seconds'].get('sigma')} / {a['latency_seconds'].get('median')} / {a['latency_seconds'].get('p90')} "
+            f"| {a['parity']['verdict']} |"
         )
     ab = summary.get("registry_ab")
     if ab:
