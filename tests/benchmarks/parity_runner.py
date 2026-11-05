@@ -14,12 +14,17 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import dataclasses
+import enum
 import hashlib
+import json
+import os
 import statistics
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from mira.config import FilterConfig, LLMConfig, MiraConfig, ReviewConfig
@@ -69,6 +74,8 @@ class ParityConfig:
     allow_same_family_judge: bool = False
     rule: dict = field(default_factory=lambda: dict(DEFAULT_RULE))
     seat_budget: int = 0
+    # Opt-in raw capture (HAI-12817). Empty = off, and the artifact is unchanged.
+    capture_path: str = field(default_factory=lambda: os.environ.get(CAPTURE_ENV, ""))
 
 
 class SeatBudgetExhausted(RuntimeError):
@@ -113,6 +120,230 @@ class SeatMeter:
             "refused": self.refused,
             "exhausted": self.exhausted or self.refused > 0,
         }
+
+
+CAPTURE_SCHEMA = "hai-12817-capture-v1"
+CAPTURE_ENV = "KORY_PARITY_CAPTURE_PATH"
+# Engine stages whose model calls the capture labels. Each wrapper only sets
+# the label and delegates; arguments, return values and call order are untouched.
+_CAPTURE_STAGES = {
+    "agentic_review_loop": "agentic_review",
+    "security_review_pass": "security",
+    "dependency_review_pass": "dependency",
+    "generate_pr_summary": "pr_summary",
+    "regenerate_summary": "summary",
+}
+_capture_stage: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "parity_capture_stage", default="review"
+)
+_capture_sink: contextvars.ContextVar[CaptureSink | None] = contextvars.ContextVar(
+    "parity_capture_sink", default=None
+)
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, enum.Enum):
+        return value.name
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.asdict(value)
+    return repr(value)
+
+
+def _named(value: Any) -> Any:
+    # IntEnum (Severity) would otherwise serialize as a bare number.
+    if isinstance(value, enum.Enum):
+        return value.name
+    if isinstance(value, dict):
+        return {k: _named(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_named(v) for v in value]
+    return value
+
+
+def _comment_record(comment: Any) -> dict:
+    if dataclasses.is_dataclass(comment) and not isinstance(comment, type):
+        fields = {f.name: getattr(comment, f.name) for f in dataclasses.fields(comment)}
+        return json.loads(json.dumps(_named(fields), default=_jsonable))
+    return {"repr": repr(comment)}
+
+
+def _current_attribution() -> str:
+    try:
+        from mira.llm.router_acp import attribution_key
+    except Exception:
+        return ""
+    return attribution_key.get()
+
+
+class CaptureSink:
+    """Append-only JSONL of everything the reviewer saw and said (HAI-12817).
+
+    Holds private source code, so the file is created owner-only (0600) in an
+    owner-only directory and never overwrites an existing file. Records carry
+    request bodies only: transport headers (the relay bearer token) are never
+    written. Scoring never reads this file.
+    """
+
+    def __init__(self, path: str) -> None:
+        target = Path(path)
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self._fh = os.fdopen(fd, "w", encoding="utf-8")
+        self.path = str(target)
+        self.records = 0
+        self._digest = hashlib.sha256()
+
+    def write(self, kind: str, **fields: Any) -> None:
+        if self._fh.closed:
+            return
+        self.records += 1
+        record = {
+            "seq": self.records,
+            "kind": kind,
+            "attribution": _current_attribution(),
+            "stage": _capture_stage.get(),
+            **fields,
+        }
+        line = json.dumps(record, default=_jsonable, ensure_ascii=False) + "\n"
+        self._fh.write(line)
+        self._fh.flush()
+        self._digest.update(line.encode("utf-8"))
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.close()
+
+    def as_dict(self) -> dict:
+        return {
+            "schema": CAPTURE_SCHEMA,
+            "path": self.path,
+            "records": self.records,
+            "sha256": self._digest.hexdigest(),
+        }
+
+
+def capture_transport(llm: Any, sink: CaptureSink | None) -> Any:
+    """Record each seat request body and its reply or error, then pass it through."""
+    inner = getattr(llm, "_transport", None)
+    if sink is None or inner is None:
+        return llm
+
+    async def _captured(request: dict[str, Any]) -> dict[str, Any]:
+        body = dict(request.get("body") or {})
+        start = time.monotonic()
+        try:
+            payload = await inner(request)
+        except BaseException as exc:
+            sink.write(
+                "seat_call",
+                request=body,
+                error={
+                    "type": type(exc).__name__,
+                    "kind": str(getattr(exc, "kind", "") or ""),
+                    "detail": str(exc)[:2000],
+                    "body": getattr(exc, "body", None),
+                },
+                duration_s=round(time.monotonic() - start, 3),
+            )
+            raise
+        sink.write(
+            "seat_call",
+            request=body,
+            response=payload,
+            duration_s=round(time.monotonic() - start, 3),
+        )
+        return payload
+
+    llm._transport = _captured
+    return llm
+
+
+def _staged(stage: str, fn: Any) -> Any:
+    async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+        token = _capture_stage.set(stage)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _capture_stage.reset(token)
+
+    _wrapper.__wrapped__ = fn  # type: ignore[attr-defined]
+    return _wrapper
+
+
+def install_capture(sink: CaptureSink) -> Any:
+    """Patch harness-visible engine hooks to record drafts, critique and tools.
+
+    Returns a function that restores every patched attribute.
+    """
+    import mira.core.engine as engine_module
+    from mira.llm.agentic_tools import AgenticToolExecutor
+
+    saved: list[tuple[Any, str, Any]] = []
+
+    def _patch(owner: Any, name: str, value: Any) -> None:
+        saved.append((owner, name, getattr(owner, name)))
+        setattr(owner, name, value)
+
+    for name, stage in _CAPTURE_STAGES.items():
+        _patch(engine_module, name, _staged(stage, getattr(engine_module, name)))
+
+    original_filter = engine_module.filter_noise
+
+    def _filter_noise(comments: list, *args: Any, **kwargs: Any) -> list:
+        kept = original_filter(comments, *args, **kwargs)
+        sink.write(
+            "noise_filter",
+            drafts=[_comment_record(c) for c in comments],
+            kept=[_comment_record(c) for c in kept],
+        )
+        return kept
+
+    _patch(engine_module, "filter_noise", _filter_noise)
+
+    original_critique = engine_module.self_critique
+
+    async def _self_critique(llm: Any, comments: list, *args: Any, **kwargs: Any) -> list:
+        token = _capture_stage.set("self_critique")
+        try:
+            sink.write(
+                "critique_input",
+                drafts=[_comment_record(c) for c in comments],
+                diff_paths=[getattr(f, "path", "") for f in kwargs.get("diff_files") or []],
+                learned_rules=list(kwargs.get("learned_rules") or []),
+                custom_rules=list(kwargs.get("custom_rules") or []),
+            )
+            kept = await original_critique(llm, comments, *args, **kwargs)
+            sink.write(
+                "critique_output",
+                kept_indices=[i for i, c in enumerate(comments) if any(c is k for k in kept)],
+            )
+            return kept
+        finally:
+            _capture_stage.reset(token)
+
+    _patch(engine_module, "self_critique", _self_critique)
+
+    original_execute = AgenticToolExecutor.execute
+
+    async def _execute(self: Any, name: str, args: dict) -> str:
+        result = await original_execute(self, name, args)
+        sink.write(
+            "tool_call",
+            executor=id(self),
+            tool=name,
+            args=dict(args or {}),
+            result=result,
+            answered_by="executor",
+        )
+        return result
+
+    _patch(AgenticToolExecutor, "execute", _execute)
+
+    def _restore() -> None:
+        for owner, name, value in reversed(saved):
+            setattr(owner, name, value)
+
+    return _restore
 
 
 EXCLUDED_STATE = "excluded_family"
@@ -242,6 +473,16 @@ class _NoRegistrySearch:
         if name != SEARCH_DECISIONS_TOOL["function"]["name"]:
             return await self._inner.execute(name, args)
         self._inner.call_log.append({"tool": name, "arg": (args or {}).get("query") or ""})
+        sink = _capture_sink.get()
+        if sink is not None:
+            sink.write(
+                "tool_call",
+                executor=id(self._inner),
+                tool=name,
+                args=dict(args or {}),
+                result="[registry unavailable]",
+                answered_by="harness",
+            )
         return "[registry unavailable]"
 
     def __getattr__(self, name: str) -> Any:
@@ -440,6 +681,54 @@ async def run_parity(
             f"{judge_family}; pick another judge or pass --allow-same-family-judge"
         )
 
+    sink = CaptureSink(cfg.capture_path) if cfg.capture_path else None
+    restore = install_capture(sink) if sink is not None else None
+    sink_token = _capture_sink.set(sink)
+    try:
+        if sink is not None:
+            sink.write(
+                "header",
+                schema=CAPTURE_SCHEMA,
+                harness=HARNESS,
+                reviewer_model=cfg.reviewer_llm.model,
+                arms=list(cfg.arms),
+                runs=cfg.runs,
+                seed=cfg.seed,
+                units=[u.unit_id for u in units if u.greptile_reviewed],
+            )
+        artifact = await _run_arms(
+            units,
+            cfg,
+            github_token,
+            provider_factory=provider_factory,
+            llm_factory=llm_factory,
+            judge_llm_factory=judge_llm_factory,
+            revert_finder=revert_finder,
+            inputs=inputs,
+        )
+    finally:
+        _capture_sink.reset(sink_token)
+        if restore is not None:
+            restore()
+        if sink is not None:
+            sink.close()
+    if sink is not None:
+        artifact["capture"] = sink.as_dict()
+    return artifact
+
+
+async def _run_arms(
+    units: list[Unit],
+    cfg: ParityConfig,
+    github_token: str,
+    *,
+    provider_factory: Any,
+    llm_factory: Any,
+    judge_llm_factory: Any,
+    revert_finder: Any,
+    inputs: dict | None,
+) -> dict:
+    judge_family = model_family(cfg.judge_llm.model)
     scored = [u for u in units if u.greptile_reviewed]
     semaphore = asyncio.Semaphore(cfg.concurrency)
 
@@ -464,7 +753,8 @@ async def run_parity(
     excluded = set() if cfg.allow_same_family_judge else {judge_family}
 
     def metered_factory(config: LLMConfig) -> Any:
-        return meter.guard(exclude_reviewer_families(llm_factory(config), excluded))
+        llm = capture_transport(llm_factory(config), _capture_sink.get())
+        return meter.guard(exclude_reviewer_families(llm, excluded))
 
     if judge_llm_factory is None:
         judge_llm_factory = make_judge_llm if llm_factory is make_llm else llm_factory

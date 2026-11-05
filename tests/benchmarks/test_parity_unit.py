@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -51,6 +52,12 @@ def _restore_registry_hooks(monkeypatch):
     monkeypatch.setattr(engine_module, "apply_registry", engine_module.apply_registry)
     monkeypatch.setattr(registry_prompt, "registry_rule", registry_prompt.registry_rule)
     monkeypatch.setattr(registry_prompt, "with_registry_tool", registry_prompt.with_registry_tool)
+    from mira.llm.agentic_tools import AgenticToolExecutor
+
+    for name in ("filter_noise", "self_critique", *parity_runner._CAPTURE_STAGES):
+        monkeypatch.setattr(engine_module, name, getattr(engine_module, name))
+    monkeypatch.setattr(AgenticToolExecutor, "execute", AgenticToolExecutor.execute)
+    monkeypatch.delenv(parity_runner.CAPTURE_ENV, raising=False)
 
 
 GREPTILE_BODY = (
@@ -1106,3 +1113,241 @@ async def test_cli_rescore_check(monkeypatch, tmp_path):
     art["records"][0]["judge"]["parsed"]["issues"][0]["verdict"] = "not_real"
     path.write_text(json.dumps(art))
     assert _cli("rescore", str(path), "--check").returncode == 1
+
+
+# --- HAI-12817 opt-in capture -------------------------------------------------
+
+
+def _capture_lines(path) -> list[dict]:
+    return [json.loads(line) for line in Path(path).read_text().splitlines()]
+
+
+def _engine_hooks() -> dict:
+    import mira.core.engine as engine_module
+    from mira.llm.agentic_tools import AgenticToolExecutor
+
+    names = ("filter_noise", "self_critique", *parity_runner._CAPTURE_STAGES)
+    hooks = {n: getattr(engine_module, n) for n in names}
+    hooks["execute"] = AgenticToolExecutor.execute
+    return hooks
+
+
+def _stable(art: dict) -> dict:
+    """The artifact minus wall-clock fields and the capture pointer."""
+    out = json.loads(json.dumps(art))
+    for key in ("started_at", "finished_at", "capture"):
+        out.pop(key, None)
+    for rec in out["records"]:
+        rec["review"].pop("duration_s")
+    return out
+
+
+async def test_capture_is_off_by_default(monkeypatch):
+    before = _engine_hooks()
+    art, _ = await _artifact(monkeypatch)
+    assert "capture" not in art
+    assert _engine_hooks() == before
+
+
+async def test_capture_keeps_the_artifact_and_scores(monkeypatch, tmp_path):
+    plain, _ = await _artifact(monkeypatch)
+    before = _engine_hooks()
+    path = tmp_path / "private" / "capture.jsonl"
+    monkeypatch.setenv(parity_runner.CAPTURE_ENV, str(path))
+    art, _ = await _artifact(monkeypatch)
+
+    assert _stable(art) == _stable(plain)
+    assert (
+        parity_runner.summarize(json.loads(json.dumps(art)))["arms"]
+        == (parity_runner.summarize(json.loads(json.dumps(plain)))["arms"])
+    )
+    assert _engine_hooks() == before  # every patched hook is restored
+
+    lines = _capture_lines(path)
+    assert lines[0]["kind"] == "header" and lines[0]["schema"] == parity_runner.CAPTURE_SCHEMA
+    assert lines[0]["units"] == [f"1@{SHA_A[:12]}"]
+    assert art["capture"]["records"] == len(lines)
+    assert art["capture"]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    assert oct(path.parent.stat().st_mode & 0o777) == "0o700"
+    with pytest.raises(FileExistsError):  # never overwrites an earlier capture
+        await _artifact(monkeypatch)
+
+
+async def test_capture_transport_records_bodies_not_headers(monkeypatch, tmp_path):
+    from mira.llm.router_acp import RouterAcpProvider, attribution_key
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    monkeypatch.setattr(RouterAcpProvider, "call_log", type(RouterAcpProvider.call_log)())
+
+    async def drive(sink):
+        llm, sent = _scripted_reviewer(
+            ["grok@x/grok-4.7", "claude@x/opus"], router_acp_token="relay-secret"
+        )
+        meter = parity_runner.SeatMeter(10)
+        llm = parity_runner.capture_transport(llm, sink)
+        llm = meter.guard(parity_runner.exclude_reviewer_families(llm, {"xai"}))
+        token = attribution_key.set("review|registry_off|r1|u1")
+        try:
+            reply = await llm.review([{"role": "user", "content": "diff"}])
+        finally:
+            attribution_key.reset(token)
+        return reply, sent, meter.used
+
+    plain = await drive(None)
+    sink = parity_runner.CaptureSink(str(tmp_path / "c.jsonl"))
+    captured = await drive(sink)
+    sink.close()
+
+    assert captured == plain  # same reply, same requests, same seat count
+    text = (tmp_path / "c.jsonl").read_text()
+    assert "relay-secret" not in text and "Authorization" not in text
+    calls = _capture_lines(tmp_path / "c.jsonl")
+    assert [c["kind"] for c in calls] == ["seat_call", "seat_call"]
+    assert [c["request"] for c in calls] == [r["body"] for r in plain[1]]
+    assert [c["response"]["actual_model"] for c in calls] == ["grok@x/grok-4.7", "claude@x/opus"]
+    assert {c["attribution"] for c in calls} == {"review|registry_off|r1|u1"}
+
+
+async def test_capture_records_full_drafts_critique_and_tools(monkeypatch, tmp_path):
+    import mira.core.engine as engine_module
+    from mira.core import passes
+    from mira.llm.agentic_tools import AgenticToolExecutor
+    from mira.llm.router_acp import RouterAcpProvider
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    verdicts = json.dumps(
+        {
+            "verdicts": [
+                {"index": 0, "evidence": "proven", "reason": "shown"},
+                {"index": 1, "evidence": "plausible", "reason": "not shown"},
+            ]
+        }
+    )
+    long_body = "x" * 900  # the critic only sees 500 chars; the capture keeps all
+
+    def drafts():
+        return [
+            ReviewComment(
+                path="a.py",
+                line=3,
+                end_line=None,
+                severity=Severity.WARNING,
+                category="bug",
+                title=f"t{i}",
+                body=long_body,
+                confidence=0.75,
+            )
+            for i in range(2)
+        ]
+
+    def critic():
+        sent: list[dict] = []
+
+        async def transport(request):
+            sent.append(request)
+            return {"text": verdicts, "actual_model": "claude@x/opus"}
+
+        llm = RouterAcpProvider(
+            LLMConfig(provider="router-acp", model="claude@x/opus", router_acp_url="http://x"),
+            transport=transport,
+        )
+        return llm, sent
+
+    plain_llm, plain_sent = critic()
+    plain_kept = await passes.self_critique(plain_llm, drafts(), indexing_llm=plain_llm)
+
+    sink = parity_runner.CaptureSink(str(tmp_path / "c.jsonl"))
+    restore = parity_runner.install_capture(sink)
+    token = parity_runner._capture_sink.set(sink)
+    try:
+        llm, sent = critic()
+        llm = parity_runner.capture_transport(llm, sink)
+        kept = await engine_module.self_critique(llm, drafts(), indexing_llm=llm)
+
+        async def fetch(path):
+            return "line1\nline2\n"
+
+        executor = AgenticToolExecutor(
+            source_fetcher=SimpleNamespace(fetch=fetch), repo_tree=["a.py"]
+        )
+        read = await executor.execute("read_file", {"path": "a.py"})
+        stub = parity_runner._NoRegistrySearch(executor)
+        await stub.execute("search_decisions", {"query": "nulls"})
+    finally:
+        parity_runner._capture_sink.reset(token)
+        restore()
+        sink.close()
+
+    assert [c.title for c in kept] == [c.title for c in plain_kept] == ["t0"]
+    assert [r["body"] for r in sent] == [r["body"] for r in plain_sent]  # identical prompt
+    assert engine_module.self_critique is passes.self_critique
+
+    by_kind: dict[str, list[dict]] = {}
+    for rec in _capture_lines(tmp_path / "c.jsonl"):
+        by_kind.setdefault(rec["kind"], []).append(rec)
+    (inp,) = by_kind["critique_input"]
+    assert [d["body"] for d in inp["drafts"]] == [long_body, long_body]
+    assert inp["drafts"][0]["severity"] == "WARNING" and inp["drafts"][0]["confidence"] == 0.75
+    (call,) = by_kind["seat_call"]
+    assert call["stage"] == "self_critique" and call["request"] == sent[0]["body"]
+    assert call["response"]["text"] == verdicts
+    assert by_kind["critique_output"][0]["kept_indices"] == [0]
+    tools = by_kind["tool_call"]
+    assert [(t["tool"], t["answered_by"]) for t in tools] == [
+        ("read_file", "executor"),
+        ("search_decisions", "harness"),
+    ]
+    assert tools[0]["result"] == read and tools[0]["args"] == {"path": "a.py"}
+
+
+async def test_capture_hooks_are_the_ones_the_real_engine_calls(
+    tmp_path, sample_diff_text, sample_llm_response_text
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from mira.config import MiraConfig
+    from mira.core.engine import ReviewEngine
+    from mira.llm.provider import LLMProvider
+
+    critique = json.dumps(
+        {"verdicts": [{"index": i, "evidence": "proven", "reason": "r"} for i in range(20)]}
+    )
+
+    def llm():
+        m = MagicMock(spec=LLMProvider)
+        m.review = AsyncMock(return_value=sample_llm_response_text)
+        m.complete = AsyncMock(return_value=sample_llm_response_text)
+        m.complete_with_tools = AsyncMock(return_value=critique)
+        m.count_tokens = MagicMock(return_value=100)
+        m.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return m
+
+    def shape(result, m):
+        comments = [(c.path, c.line, c.title, c.body, c.confidence) for c in result.comments]
+        calls = {
+            name: [c.args for c in getattr(m, name).call_args_list]
+            for name in ("review", "complete", "complete_with_tools")
+        }
+        return comments, calls
+
+    plain_llm = llm()
+    plain = shape(
+        await ReviewEngine(config=MiraConfig(), llm=plain_llm).review_diff(sample_diff_text),
+        plain_llm,
+    )
+
+    sink = parity_runner.CaptureSink(str(tmp_path / "c.jsonl"))
+    restore = parity_runner.install_capture(sink)
+    try:
+        cap_llm = llm()
+        result = await ReviewEngine(config=MiraConfig(), llm=cap_llm).review_diff(sample_diff_text)
+        captured = shape(result, cap_llm)
+    finally:
+        restore()
+        sink.close()
+
+    assert captured == plain  # same comments, same LLM calls with the same arguments
+    assert plain[0], "fixture should produce at least one comment"
+    kinds = [r["kind"] for r in _capture_lines(tmp_path / "c.jsonl")]
+    assert "noise_filter" in kinds and "critique_input" in kinds and "critique_output" in kinds

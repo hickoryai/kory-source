@@ -216,3 +216,46 @@ Both arms replace the engine's whole registry hook with the prompt block
 alone. The contradiction check (HAI-12196) does not run in either arm: it
 would judge decisions approved after Greptile's review, and its seat calls
 fall outside the A/B and the budget estimate.
+
+### Raw capture (opt-in, HAI-12817)
+
+The audit trail keeps titles and drop reasons only. To keep everything the reviewer
+saw and said, set `KORY_PARITY_CAPTURE_PATH` to a new file outside the repository
+before `run`:
+
+```bash
+KORY_PARITY_CAPTURE_PATH=/opt/dev/artifacts/<ticket>/private/capture.jsonl \
+  GITHUB_TOKEN="$(gh auth token)" uv run python tests/benchmarks/fixtures/hickory/run_parity.py run ...
+```
+
+Without the variable nothing is patched or written, and the artifact is the same
+as before. With it, the harness wraps only harness-owned hooks. Each wrapper
+records, then passes the same arguments through and returns the same value. So
+replies, call counts, call order, model pins and the seat meter do not change.
+The artifact gains one `capture` key (`schema`, `path`, `records`, `sha256` of
+the file). Scoring never reads the capture.
+
+The file is JSON Lines, schema `hai-12817-capture-v1`. Every record has `seq`,
+`kind`, `attribution` (`review|<arm>|r<run>|<unit>`) and `stage` (`review`,
+`agentic_review`, `security`, `dependency`, `self_critique`, `summary`,
+`pr_summary`).
+
+| kind | source hook | fields |
+|---|---|---|
+| `header` | `run_parity` | schema, harness, reviewer model, arms, runs, seed, unit ids |
+| `seat_call` | reviewer transport, inside the excluded-family check and the seat meter | `request` (the relay body: exact `prompt`, `model`, `priority`, `timeout_seconds`), then `response` (the relay payload: `text`, `actual_model`, …) or `error` (`type`, `kind`, `detail`, `body`), and `duration_s` |
+| `noise_filter` | `engine.filter_noise` | `drafts` (every comment in, all fields: body, `existing_code`, confidence, severity, `source_pass`) and `kept` |
+| `critique_input` | `engine.self_critique` | `drafts` (full comments, before the critic's 500/400/1200-character cuts), `diff_paths`, `learned_rules`, `custom_rules` |
+| `critique_output` | `engine.self_critique` | `kept_indices` into `drafts` |
+| `tool_call` | `AgenticToolExecutor.execute`, and the harness's own `search_decisions` answer | `executor`, `tool`, `args`, `result` (the exact string fed back to the model), `answered_by` |
+
+The critic's exact prompt and raw reply are the `seat_call` records with
+`stage == "self_critique"`. Judge calls are not captured: the artifact already
+holds their prompts and replies. Refused calls (past the seat cap) never reach
+the transport, so they are not captured either.
+
+The capture holds private source code and full model output, so the file is
+created `0600` in a `0700` directory. An existing file is never overwritten:
+`run` fails before any model call. Request headers, which carry the relay bearer
+token, are never written. Keep captures under `/opt/dev/artifacts`, never in the
+repository or a PR.
