@@ -358,3 +358,29 @@ def test_repository_outside_the_manifest_is_refused_before_reading(reg, checkout
         RepositoryHistoryImporter(
             reg, GitReader(checkout[0]), repo="hickoryai/private-other", access=rp.operator()
         ).run(apply=True)
+
+
+def test_a_new_head_with_the_same_body_adds_a_revision_but_no_duplicate_decision(reg, client):
+    import copy
+
+    original = copy.deepcopy(GH["pulls"])
+    imp = GitHubHistoryImporter(reg, client, access=rp.operator(), repos=[REPO])
+    imp.run(apply=True)
+    before = len(_decisions(reg))
+    try:
+        GH["pulls"][0]["head"] = {"sha": "head11-v2"}
+        # A finished run is not resumed: a later run sees the new head.
+        reg.db.execute("UPDATE registry_import_runs SET scope_sha256 = 'done'")
+        imp.run(apply=True)
+    finally:
+        GH["pulls"][:] = original
+    heads = reg.db.execute(
+        "SELECT head_sha FROM registry_source_revisions WHERE source_type = "
+        "'github_pr_description' AND source_id = ? ORDER BY observed_at",
+        (f"{REPO}#11",),
+    )
+    assert [h[0] for h in heads] == ["head11", "head11-v2"]
+    assert len(_decisions(reg)) == before
+    d = next(d for d in _decisions(reg) if d["body"] == "Keep Linear authoritative.")
+    quotes = ProvenanceStore(reg).evidence_for(d["id"], rp.reader())["quotes"]
+    assert {q["evidence_role"] for q in quotes} == {"statement", "support"}

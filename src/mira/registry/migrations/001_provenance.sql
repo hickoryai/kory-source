@@ -1,4 +1,5 @@
 -- HAI-12825: decision provenance. Additive only; never edit after release.
+-- (Amended once before any release, in review: revisions are keyed by observation.)
 -- Statements end with a semicolon at end of line. Portable SQLite/PostgreSQL.
 
 ALTER TABLE registry_objects ADD COLUMN corpus_id TEXT NOT NULL DEFAULT '';
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS registry_source_revisions (
     payload TEXT NOT NULL DEFAULT '',
     original_text TEXT NOT NULL DEFAULT '',
     content_sha256 TEXT NOT NULL,
+    observation_sha256 TEXT NOT NULL,
     source_version TEXT NOT NULL DEFAULT '',
     source_created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     source_updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
@@ -62,7 +64,7 @@ CREATE TABLE IF NOT EXISTS registry_source_revisions (
     corpus_id TEXT NOT NULL,
     policy_version TEXT NOT NULL,
     import_run_id TEXT NOT NULL DEFAULT '',
-    UNIQUE (source_system, source_type, source_id, content_sha256)
+    UNIQUE (source_system, source_type, source_id, observation_sha256)
 );
 CREATE INDEX IF NOT EXISTS registry_source_rev_source ON registry_source_revisions (source_system, source_type, source_id);
 

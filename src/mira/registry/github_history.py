@@ -418,6 +418,8 @@ class GitHubHistoryImporter:
                 counts=counts,
                 anchor=anchor,
                 occurred_at=rev.source_created_at,
+                # One decision per passage per source record, across heads and edits.
+                identity=f"{rev.source_type}:{rev.source_id}",
             )
 
 

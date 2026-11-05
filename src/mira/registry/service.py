@@ -1153,6 +1153,130 @@ class Registry:
         if not actor.is_human:
             raise Forbidden(f"only a person can {action}")
 
+    # ── durable lifecycle provenance (HAI-12825) ──────────────────────
+
+    _APPROVAL_EVENTS = ("approved", "approved_supersede")
+    _REALIZATION_EVENTS = ("realization",)
+
+    def _lifecycle(self, obj: dict, event: str, actor: Actor | None) -> str:
+        """Append an immutable record of a status or realization change.
+
+        Writes a ``registry_lifecycle_event`` source revision, a new
+        ``registry_decision_versions`` row citing it, and, for a person's
+        action, an ``approver`` or ``reviewer`` attribution. The mutable
+        ``registry_objects`` row stays the current projection. Returns the event
+        evidence id. Claims only; ``actor=None`` is the registry's own automation.
+        """
+        if obj["kind"] not in CLAIM_KINDS:
+            return ""
+        from mira.registry.attribution import Attribution
+        from mira.registry.provenance import ProvenanceStore, SourceRevision
+
+        store = ProvenanceStore(self)
+        now = self.clock()
+        who = f"{actor.kind}:{actor.sub}" if actor else "automation:registry"
+        labels = {
+            "event": event,
+            "object_id": obj["id"],
+            "actor": who,
+            "status": obj["status"],
+            "status_reason": obj["status_reason"],
+            "realization": obj["realization"],
+            "pr": obj["pr"],
+            "merge_commit": obj["merge_commit"],
+            "at": now,
+            "nonce": secrets.token_hex(4),
+        }
+        text = (
+            f"{event}: {obj['id']} by {who}; status={obj['status']}, "
+            f"realization={obj['realization']}"
+        )
+        corpus = (obj["corpus_id"], obj["policy_version"])
+        eid, _ = store.record_revision(
+            SourceRevision(
+                "registry",
+                "registry_lifecycle_event",
+                f"{obj['id']}:{event}",
+                text,
+                source_labels=labels,
+                source_created_at=now,
+                source_version=str(now),
+            ),
+            corpus=corpus,
+        )
+        rows = self.db.execute(
+            "SELECT COALESCE(MAX(revision), 0) FROM registry_decision_versions WHERE object_id = ?",
+            (obj["id"],),
+        )
+        revision = int(rows[0][0] or 0) + 1
+        approval = event in self._APPROVAL_EVENTS
+        store.add_decision_version(
+            obj["id"],
+            revision=revision,
+            claim_text=obj["body"] or obj["title"],
+            corpus_id=corpus[0],
+            authority_tier=obj["authority_tier"] or ("explicit_human" if approval else "legacy"),
+            authority_reasons=[f"lifecycle event {event} by {who}"],
+            approval_status=obj["status"],
+            approval_evidence=[eid] if approval else [],
+            realization=obj["realization"],
+            realization_evidence=[eid] if event.startswith("realization") else [],
+            scope=obj["scope"],
+            basis=obj["basis"],
+            effective_from=now,
+        )
+        if actor is not None and actor.is_human:
+            att = Attribution(
+                "approver" if approval else "reviewer",
+                eid,
+                obj["id"],
+                revision,
+                reason="authenticated registry caller (dashboard session or verified JWT)",
+            )
+            att.set("actor_kind", "human", "stated", pointer="/source_labels/actor")
+            att.set("original_identity", actor.sub, "stated", pointer="/source_labels/actor")
+            att.set(
+                "normalized_identity",
+                f"registry-actor:{actor.sub}",
+                "stated",
+                pointer="/source_labels/actor",
+            )
+            att.set("occurred_at", now, "stated", pointer="/source_labels/at")
+            store.record_attributions([att], corpus_id=corpus[0])
+        self.db.execute(
+            "UPDATE registry_objects SET decision_revision = ? WHERE id = ?", (revision, obj["id"])
+        )
+        obj["decision_revision"] = revision
+        return eid
+
+    def _rel_receipt(
+        self,
+        source_id: str,
+        target_id: str,
+        type: str,
+        actor: Actor,
+        stance: str,
+        approving_evidence_id: str = "",
+    ) -> None:
+        """One relationship-evidence record for a lifecycle change to an edge."""
+        from mira.registry.provenance import ProvenanceStore
+
+        rows = self.db.execute(
+            f"SELECT {', '.join(_REL_COLS)} FROM registry_relationships "
+            "WHERE source_id = ? AND target_id = ? AND type = ?",
+            (source_id, target_id, type),
+        )
+        if not rows:
+            return
+        rel = self._rel(rows[0])
+        ProvenanceStore(self).add_relationship_evidence(
+            rel,
+            corpus_id=rel["corpus_id"],
+            stance=stance,
+            approving_evidence_id=approving_evidence_id,
+            created_by=f"{actor.kind}:{actor.sub}",
+        )
+
     def approve(self, object_id: str, actor: Actor, access: AccessContext | None = None) -> dict:
         self._require_human(actor, "approve")
         obj = self.get_visible(object_id, access)
@@ -1165,7 +1289,8 @@ class Registry:
             status="approved", status_reason="", decided_by=actor.sub, decided_at=self.clock()
         )
         self._write(obj)
-        self._apply_supersedes(object_id, actor)
+        approval = self._lifecycle(obj, "approved", actor)
+        self._apply_supersedes(object_id, actor, approval)
         return self.get(object_id)
 
     def reject(
@@ -1185,7 +1310,9 @@ class Registry:
             decided_by=actor.sub,
             decided_at=self.clock(),
         )
-        return self._write(obj)
+        self._write(obj)
+        self._lifecycle(obj, "rejected", actor)
+        return self.get(object_id)
 
     def retire(self, object_id: str, actor: Actor, access: AccessContext | None = None) -> dict:
         self._require_human(actor, "retire")
@@ -1195,7 +1322,9 @@ class Registry:
         obj.update(
             status="retired", status_reason="retired", decided_by=actor.sub, decided_at=self.clock()
         )
-        return self._write(obj)
+        self._write(obj)
+        self._lifecycle(obj, "retired", actor)
+        return self.get(object_id)
 
     def restore(self, object_id: str, actor: Actor, access: AccessContext | None = None) -> dict:
         """Bring an expired proposal back. Its 14 days restart now."""
@@ -1204,7 +1333,9 @@ class Registry:
         if obj["status"] != "rejected" or obj["status_reason"] != "expired":
             raise RegistryError(f"{object_id} did not expire")
         obj.update(status="proposed", status_reason="", restored_at=self.clock())
-        return self._write(obj)
+        self._write(obj)
+        self._lifecycle(obj, "restored", actor)
+        return self.get(object_id)
 
     def supersede(
         self, new_id: str, old_id: str, actor: Actor, access: AccessContext | None = None
@@ -1238,6 +1369,16 @@ class Registry:
         applied = old["status"] == "proposed" or new["status"] == "approved"
         with self._ancestry_guard():
             self._add_rel(new_id, old_id, type, actor, status="active" if applied else "proposed")
+            # Approval of an applied edge is only ever the newer side's own approval.
+            approval = self._latest_approval(new_id) if applied else ""
+            self._rel_receipt(
+                new_id,
+                old_id,
+                type,
+                actor,
+                f"recorded {'active' if applied else 'proposed'}",
+                approval,
+            )
             if applied:
                 self._replace(old, actor)
         return {"new": self.get(new_id), "old": self.get(old_id), "applied": applied}
@@ -1248,8 +1389,25 @@ class Registry:
         else:
             old.update(status="superseded", status_reason="superseded")
         self._write(old)
+        self._lifecycle(old, old["status_reason"], actor)
 
-    def _apply_supersedes(self, new_id: str, actor: Actor) -> None:
+    def _latest_approval(self, object_id: str) -> str:
+        """The newest approval-event evidence id for an object, or ``''``."""
+        rows = self.db.execute(
+            "SELECT approval_evidence FROM registry_decision_versions WHERE object_id = ? "
+            "AND approval_evidence <> '' AND approval_evidence <> '[]' "
+            "ORDER BY revision DESC LIMIT 1",
+            (object_id,),
+        )
+        if not rows:
+            return ""
+        try:
+            ids = json.loads(rows[0][0])
+        except ValueError:
+            return ""
+        return ids[-1] if ids else ""
+
+    def _apply_supersedes(self, new_id: str, actor: Actor, approval: str = "") -> None:
         """A person approved ``new_id``: its proposed ancestry edges take effect."""
         self._require_human(actor, "apply a supersession")
         for type in ANCESTRY_TYPES:
@@ -1260,6 +1418,7 @@ class Registry:
                 if old["status"] in ("proposed", "approved"):
                     self._replace(old, actor)
                 self._set_rel_status(new_id, old["id"], type, "active", actor.sub)
+                self._rel_receipt(new_id, old["id"], type, actor, "activated by approval", approval)
 
     def resolve_conflict(
         self, object_id: str, choice: str, actor: Actor, access: AccessContext | None = None
@@ -1297,9 +1456,13 @@ class Registry:
                 decided_at=now,
             )
             self._write(obj)
+            self._lifecycle(obj, "rejected_keep_existing", actor)
             for r in conflicts:
                 self._set_rel_status(
                     object_id, r["target_id"], "conflicts_with", "kept_existing", actor.sub
+                )
+                self._rel_receipt(
+                    object_id, r["target_id"], "conflicts_with", actor, "kept existing"
                 )
             return self.get(object_id)
 
@@ -1309,16 +1472,22 @@ class Registry:
         if obj["conflict_check"] in _OPEN_CHECKS:
             obj["conflict_check"] = "done"
         self._write(obj)
+        approval = self._lifecycle(obj, "approved_supersede", actor)
         for r in conflicts:
             old = self.get(r["target_id"])
             self._set_rel_status(
                 object_id, old["id"], "conflicts_with", "superseded_existing", actor.sub
             )
+            self._rel_receipt(object_id, old["id"], "conflicts_with", actor, "superseded existing")
             self._add_rel(object_id, old["id"], "supersedes", actor)
+            self._rel_receipt(
+                object_id, old["id"], "supersedes", actor, "approved supersession", approval
+            )
             if old["status"] in ("approved", "proposed"):
                 old.update(status="superseded", status_reason="superseded")
                 self._write(old)
-        self._apply_supersedes(object_id, actor)
+                self._lifecycle(old, "superseded", actor)
+        self._apply_supersedes(object_id, actor, approval)
         return self.get(object_id)
 
     def expire(self) -> list[str]:
@@ -1334,6 +1503,7 @@ class Registry:
         for obj in stale:
             obj.update(status="rejected", status_reason="expired", decided_at=self.clock())
             self._write(obj)
+            self._lifecycle(obj, "expired", None)
         return [o["id"] for o in stale]
 
     def refresh_confidence(self) -> int:
@@ -1358,6 +1528,7 @@ class Registry:
             if obj["realization"] == "stated":
                 obj["realization"] = "in_progress"
                 self._write(obj)
+                self._lifecycle(obj, "realization_in_progress", None)
                 changed.append(obj["id"])
         return changed
 
@@ -1390,6 +1561,7 @@ class Registry:
             self._write(obj)
             if (obj["realization"], obj["status"]) != before:
                 changed.append(obj["id"])
+                self._lifecycle(obj, f"realization_{obj['realization']}", None)
         return changed
 
     def _merge(self, obj: dict) -> None:

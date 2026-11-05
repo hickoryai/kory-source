@@ -15,7 +15,7 @@ PostgreSQL advisory lock).
 
 | Table | Holds |
 |---|---|
-| `registry_source_revisions` | One immutable row per (source system, type, id, content SHA-256): original text, labels, payload, base/head/commit SHA, availability, corpus, import run. An edit adds a row. |
+| `registry_source_revisions` | One immutable row per (source system, type, id, observation SHA-256). The observation hash covers the text plus base/head/commit SHA, source version, labels (account) and availability, so a new PR head with an unchanged body is a new revision; an identical replay is not. `content_sha256` is the text hash quotes validate against. |
 | `registry_decision_evidence` | Exact quote and offsets into a revision, with role (statement, directive, approval, correction, realization, support) and stated/inferred. Quotes are validated against the stored text. |
 | `registry_attributions` | One row per role per evidence: original labels, normalized values, per-field state (`stated` / `inferred` / `unknown`) with evidence pointer. |
 | `registry_decision_versions` | Append-only claim versions: scope, basis, approval status and evidence, realization, authority tier and policy version. |
@@ -75,6 +75,13 @@ attributions.
   and the older decision and evidence stay visible.
 - Confidence is evidence certainty (high/medium/low/unknown with reasons),
   not authority, and does not decay with age.
+- Every lifecycle change to a claim (approve, reject, retire, restore, a
+  conflict answer, supersession, expiry, push/PR realization) appends a
+  `registry_lifecycle_event` source revision and a new decision version citing
+  it, plus an `approver` (approvals) or `reviewer` attribution for a person.
+  Activating a supersedes/corrects edge records relationship evidence whose
+  `approving_evidence_id` is that approval event. `registry_objects` stays the
+  mutable current projection.
 - Legacy rows keep their status; `evidence_for` returns a legacy projection
   that marks quote, invoker and approval evidence unknown.
 

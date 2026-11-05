@@ -3,10 +3,13 @@
 Flow (HAI-12825): source reads -> immutable revisions -> proposed claims,
 attributions and anchors -> human approval events -> cited read-only answers.
 
-- A source revision is keyed by source system, type, id, and content hash. A
-  re-read of the same text is a no-op; an edit is a new revision; nothing is
+- A source revision is keyed by source system, type, id, and an observation
+  hash: the text plus the revision context that can change without it (base,
+  head and commit SHA, source version, account labels). Replaying an identical
+  observation is a no-op; a new head or edit is a new revision; nothing is
   overwritten. ``evidence_id`` is derived from that key, so retries and
-  concurrent importers converge on one row.
+  concurrent importers converge on one row. ``content_sha256`` stays the text
+  hash quotes are validated against.
 - Every quote is validated against the stored original text at its offsets.
 - Every row carries ``corpus_id``. Reads take an ``AccessContext`` and return
   nothing for a corpus the caller may not read.
@@ -41,6 +44,7 @@ REVISION_COLS = (
     "payload",
     "original_text",
     "content_sha256",
+    "observation_sha256",
     "source_version",
     "source_created_at",
     "source_updated_at",
@@ -106,8 +110,8 @@ def sha256_text(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()
 
 
-def evidence_id_for(system: str, source_type: str, source_id: str, content_sha: str) -> str:
-    key = f"{system}\x1f{source_type}\x1f{source_id}\x1f{content_sha}"
+def evidence_id_for(system: str, source_type: str, source_id: str, observation_sha: str) -> str:
+    key = f"{system}\x1f{source_type}\x1f{source_id}\x1f{observation_sha}"
     return "ev_" + hashlib.sha256(key.encode()).hexdigest()[:24]
 
 
@@ -149,9 +153,24 @@ class SourceRevision:
         return sha256_text(self.original_text)
 
     @property
+    def observation_sha256(self) -> str:
+        """Text plus the context that can change without it. Excludes observed_at."""
+        key = {
+            "text": self.content_sha256,
+            "base_sha": self.base_sha,
+            "head_sha": self.head_sha,
+            "commit_sha": self.commit_sha,
+            "source_version": str(self.source_version),
+            "labels": self.source_labels,
+            "availability": self.availability,
+            "parent": self.parent_source_id,
+        }
+        return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()
+
+    @property
     def evidence_id(self) -> str:
         return evidence_id_for(
-            self.source_system, self.source_type, self.source_id, self.content_sha256
+            self.source_system, self.source_type, self.source_id, self.observation_sha256
         )
 
 
@@ -176,8 +195,13 @@ class ProvenanceStore:
     def record_revision(
         self, rev: SourceRevision, *, corpus: tuple[str, str], run_id: str = ""
     ) -> tuple[str, bool]:
-        """Store one immutable revision. Returns ``(evidence_id, created)``."""
-        if not corpus[0]:
+        """Store one immutable revision. Returns ``(evidence_id, created)``.
+
+        Imported sources need a corpus. Registry-native lifecycle events
+        (``source_system = 'registry'``) on a legacy object have none and keep
+        the legacy object's visibility.
+        """
+        if not corpus[0] and rev.source_system != "registry":
             raise RegistryError("a source revision needs a corpus")
         if rev.availability not in AVAILABILITY:
             raise RegistryError(f"availability must be one of {', '.join(AVAILABILITY)}")
@@ -192,6 +216,7 @@ class ProvenanceStore:
             "payload": _json(rev.payload),
             "original_text": rev.original_text,
             "content_sha256": rev.content_sha256,
+            "observation_sha256": rev.observation_sha256,
             "source_version": str(rev.source_version),
             "source_created_at": float(rev.source_created_at or 0),
             "source_updated_at": float(rev.source_updated_at or 0),
@@ -477,7 +502,8 @@ class ProvenanceStore:
     # ── reads ─────────────────────────────────────────────────────────
 
     def _readable(self, corpus_id: str, access: AccessContext | None) -> bool:
-        return (access or _access.DENIED).can_read(corpus_id)
+        # Corpus-less rows are registry-native records about legacy-visible objects.
+        return not corpus_id or (access or _access.DENIED).can_read(corpus_id)
 
     def evidence_for(self, object_id: str, access: AccessContext | None) -> dict:
         """Everything recorded about one decision, for a caller allowed to see it."""

@@ -399,6 +399,7 @@ class RepositoryHistoryImporter:
                 counts=counts,
                 anchor=anchor,
                 occurred_at=rev.source_created_at,
+                identity=f"{self.repo}:{path}:code",
             )
 
     def _log(self, run: dict, frozen: str, counts: Counter[str]) -> None:
@@ -465,7 +466,7 @@ class RepositoryHistoryImporter:
                 counts=counts,
                 anchor=anchor,
                 occurred_at=rev.source_created_at,
-                identity=identity,
+                identity=identity or f"{rev.source_type}:{rev.source_id}",
             )
 
 
