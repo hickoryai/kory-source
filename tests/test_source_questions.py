@@ -75,7 +75,7 @@ def snapshot(files=None, head="head7", calls=None):
     return snap
 
 
-def _decision(reg, store, source_id, text, *, path=None, parent=None):
+def _decision(reg, store, source_id, text, *, path=None, parent=None, head="head7"):
     """An imported decision with a validated quote (and optionally a historical anchor)."""
     rev = SourceRevision(
         "github",
@@ -85,6 +85,7 @@ def _decision(reg, store, source_id, text, *, path=None, parent=None):
         parent_source_id=parent or "",
         repository=REPO,
         source_url=f"https://github.com/{REPO}/pull/x",
+        head_sha=head if parent is None else "",
     )
     eid, _ = store.record_revision(rev, corpus=rp.CORPUS_TAG)
     store.record_attributions(
@@ -185,7 +186,7 @@ async def test_confirmed_supersession_needs_a_person_to_approve_the_newer_decisi
     out = await _explain(reg)
     assert out["verdict"] == "confirmed_supersession"
     f = _finding(out, world["D"])
-    assert any("approved by zane" in r for r in f["reasons"])
+    assert any("approval recorded for zane" in r for r in f["reasons"])
 
 
 async def test_conflict_is_reported_as_conflict_not_override(reg, world):
@@ -282,27 +283,56 @@ async def test_every_finding_cites_quote_source_and_attribution(reg, world):
     assert c["quotes"][0]["quote"] == "We decided sessions last seven days."
     assert c["quotes"][0]["evidence_id"] == world["D_ev"]
     assert c["revisions"][0]["source_url"].startswith("https://github.com/")
-    assert c["attribution"][0]["role"] == "source_account"
-    assert "original_model" in c["attribution"][0]["unknown_fields"]
+    account = next(a for a in c["attribution"] if a["role"] == "source_account")
+    assert "original_model" in account["unknown_fields"]
+    # D was approved through the registry: that approval is its own attribution.
+    assert any(
+        a["role"] == "approver" and a["original_identity"] == "zane" for a in c["attribution"]
+    )
     cited = [e for s in out["narrative"] for e in s["evidence"]]
     assert world["D_ev"] in cited
 
 
-def test_narrative_sentences_cite_only_evidence_in_the_answer():
+def test_narrative_sentences_must_cite_proof_for_what_they_assert():
     answer = {
         "kind": "pr_decisions",
         "pr": {"number": 1, "head_sha": "h"},
         "verdict": "conflict",
-        "findings": [{"decision": {"id": "reg_x", "title": "X"}, "verdict": "conflict"}],
+        "findings": [
+            {
+                "decision": {"id": "reg_x", "title": "X"},
+                "verdict": "conflict",
+                "receipts": ["rel_1"],
+            }
+        ],
         "citations": {"reg_x": {"quotes": [{"evidence_id": "ev_real"}]}},
+        "receipts": {"rel_1": {"kind": "relationship"}},
         "limits": ["coverage incomplete"],
     }
     out = render_narrative(answer)
-    assert out[1]["evidence"] == ["ev_real"]
-    assert out[-1] == {"text": "Limit: coverage incomplete.", "evidence": []}
-    validate_citations(out, answer["citations"])
+    assert out[1]["evidence"] == ["ev_real"] and out[1]["receipts"] == ["rel_1"]
+    assert out[-1] == {"text": "Limit: coverage incomplete.", "evidence": [], "receipts": []}
+    cites, rec = answer["citations"], answer["receipts"]
     with pytest.raises(CitationError, match="ev_ghost"):
-        validate_citations([{"text": "x", "evidence": ["ev_ghost"]}], answer["citations"])
+        validate_citations([{"text": "x", "evidence": ["ev_ghost"]}], cites, rec)
+    with pytest.raises(CitationError, match="rel_ghost"):
+        validate_citations([{"text": "x", "evidence": [], "receipts": ["rel_ghost"]}], cites, rec)
+    # An empty evidence list cannot carry a relationship claim.
+    with pytest.raises(CitationError, match="relationship"):
+        validate_citations([{"text": "x", "evidence": [], "verdict": "conflict"}], cites, rec)
+    with pytest.raises(CitationError, match="approval"):
+        validate_citations(
+            [
+                {
+                    "text": "x",
+                    "evidence": [],
+                    "receipts": ["rel_1"],
+                    "verdict": "confirmed_supersession",
+                }
+            ],
+            cites,
+            rec,
+        )
 
 
 # ── read-only and access ────────────────────────────────────────────────
@@ -462,3 +492,102 @@ async def test_mcp_tools_use_the_verified_token_sub(reg, world, monkeypatch):
         assert denied["isError"] is True
     ctx = call(rp.READER_SUB, "get_context", {"repo": REPO, "paths": ["src/app/auth.py"]})
     assert ctx["isError"] is False
+
+
+# ── review corrections (HAI-12825) ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        ("supersedes", "rejected"),
+        ("supersedes", "withdrawn"),
+        ("conflicts_with", "kept_existing"),
+        ("conflicts_with", "rejected"),
+        ("compatible_with", "withdrawn"),
+    ],
+)
+async def test_inactive_links_are_history_not_current_verdicts(reg, world, link):
+    type_, status = link
+    if type_ == "supersedes":
+        reg.supersede(world["N"], world["D"], HUMAN, rp.reader())
+        reg.approve(world["N"], HUMAN, rp.reader())
+    else:
+        reg.relate(world["N"], world["D"], type_, HUMAN, access=rp.reader())
+    reg._set_rel_status(world["N"], world["D"], type_, status, "zane")
+    out = await _explain(reg)
+    f = _finding(out, world["D"])
+    assert f["verdict"] == "no_supported_override_found"
+    assert out["verdict"] == "no_supported_override_found"
+    assert [(e["type"], e["status"]) for e in f["inactive_links"]] == [link]
+    assert any("inactive link" in r for r in f["reasons"])
+    # The audit edge is still in the graph.
+    assert any(e["type"] == type_ and e["status"] == status for e in out["graph"]["edges"])
+
+
+async def test_head_mismatch_never_yields_an_affirmative_verdict(reg, world):
+    reg.supersede(world["N"], world["D"], HUMAN, rp.reader())
+    reg.approve(world["N"], HUMAN, rp.reader())
+    assert (await _explain(reg))["verdict"] == "confirmed_supersession"
+    out = await _explain(reg, expected_head_sha="different-head")
+    assert out["verdict"] == "insufficient_evidence"
+    assert out["revision_bound"] is False
+    assert out["limits"][0].startswith("head moved")
+
+
+async def test_stale_import_is_insufficient_and_old_head_statements_do_not_count(reg, world):
+    reg.supersede(world["N"], world["D"], HUMAN, rp.reader())
+    reg.approve(world["N"], HUMAN, rp.reader())
+    out = await _explain(reg, snap=snapshot(head="head8"))  # PR moved on; import is at head7
+    assert out["verdict"] == "insufficient_evidence"
+    assert any(limit.startswith("stale import") for limit in out["limits"])
+    assert out["pr_decisions"] == [] and out["stale_pr_decisions"] == [world["N"]]
+
+
+async def test_unimported_pr_description_is_insufficient(reg, world):
+    reg.db.execute("DELETE FROM registry_source_revisions WHERE source_id = ?", (f"{REPO}#{PR}",))
+    out = await _explain(reg)
+    assert out["verdict"] == "insufficient_evidence"
+    assert any("has not been imported" in limit for limit in out["limits"])
+
+
+async def test_confirmed_supersession_cites_edge_and_approval_receipts(reg, world):
+    reg.supersede(world["N"], world["D"], HUMAN, rp.reader())
+    reg.approve(world["N"], HUMAN, rp.reader())
+    out = await _explain(reg)
+    f = _finding(out, world["D"])
+    kinds = {out["receipts"][r]["kind"]: out["receipts"][r] for r in f["receipts"]}
+    rel, approval = kinds["relationship"], kinds["approval"]
+    assert (rel["type"], rel["status"]) == ("supersedes", "active")
+    assert any(e["approving_evidence_id"] == approval["id"] for e in rel["evidence"])
+    assert approval["approvers"][0]["original_identity"] == "zane"
+    sentence = next(s for s in out["narrative"] if s.get("verdict") == "confirmed_supersession")
+    assert world["D_ev"] in sentence["evidence"] and world["N_ev"] in sentence["evidence"]
+    assert set(sentence["receipts"]) == {rel["id"], approval["id"]}
+
+
+async def test_legacy_decided_by_alone_is_not_approval_proof(reg, world):
+    reg.supersede(world["N"], world["D"], HUMAN, rp.reader())
+    # A pre-provenance approval: status and decided_by set, no lifecycle event.
+    reg.db.execute(
+        "UPDATE registry_objects SET status = 'approved', decided_by = 'someone' WHERE id = ?",
+        (world["N"],),
+    )
+    reg.db.execute(
+        "UPDATE registry_relationships SET status = 'active' WHERE source_id = ?", (world["N"],)
+    )
+    out = await _explain(reg)
+    f = _finding(out, world["D"])
+    assert f["verdict"] == "insufficient_evidence"
+    assert any("legacy decided_by is not proof" in r for r in f["reasons"])
+    assert out["verdict"] == "insufficient_evidence"
+
+
+async def test_as_of_commit_is_reported_unsupported_not_echoed_as_proof(reg, world):
+    svc = QuestionService(reg, snapshot=snapshot())
+    out = svc.decision_history(REPO, ["src/app/auth.py"], [], rp.reader(), as_of_commit="abc123")
+    assert out["verdict"] == "insufficient_evidence"
+    assert out["as_of_supported"] is False
+    assert "not supported" in out["limits"][0]
+    current = svc.decision_history(REPO, ["src/app/auth.py"], [], rp.reader())
+    assert current["verdict"] == "history"

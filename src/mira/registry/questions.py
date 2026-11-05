@@ -52,6 +52,14 @@ VERDICTS = (
 )
 _RANK = {v: i for i, v in enumerate(VERDICTS)}
 _UNCERTAIN_ANCHORS = ("pending", "ambiguous", "dangling", "unsupported")
+# Relationship states that are audit history only: never a current verdict.
+_INACTIVE_LINKS = ("rejected", "withdrawn", "kept_existing", "superseded_existing")
+_RELATIONSHIP_VERDICTS = (
+    "confirmed_supersession",
+    "proposed_supersession",
+    "conflict",
+    "compatible",
+)
 _PR_REF = re.compile(
     r"(?:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?\s*(?:#|pr\s*#?|pull\s*(?:request)?\s*#?)"
     r"\s*(?P<num>\d+)",
@@ -174,8 +182,11 @@ class QuestionService:
         except Exception as exc:  # reported, never guessed around
             return self._insufficient(repo, pr_number, f"PR snapshot unavailable: {exc}")
         limits: list[str] = []
+        # Revision limits mean the evidence is not about the frozen head; no
+        # affirmative verdict can stand on it.
+        revision_limits: list[str] = []
         if expected_head_sha and snap["head_sha"] != expected_head_sha:
-            limits.append(
+            revision_limits.append(
                 f"head moved: expected {expected_head_sha[:12]}, frozen {snap['head_sha'][:12]}"
             )
         if snap.get("unavailable_paths"):
@@ -186,11 +197,13 @@ class QuestionService:
             | {f["previous_filename"] for f in files if f.get("previous_filename")}
         )
         prior, anchored = self._anchored(repo, paths, access)
-        stated = self._stated_in_pr(repo, pr_number, snap, access)
+        stated, stale_stated, import_limit = self._stated_in_pr(repo, pr_number, snap, access)
+        if import_limit:
+            revision_limits.append(import_limit)
         tickets = self._ticket_decisions(f"{snap.get('title', '')}\n{snap.get('body', '')}", access)
         for oid in tickets:
             prior.setdefault(oid, {"why": "linked ticket (unanchored)", "anchors": []})
-        for oid in stated:
+        for oid in stated | stale_stated:
             prior.pop(oid, None)
         graph = walk(self.registry, sorted({*prior, *stated}), access)
         if graph["truncated"]:
@@ -200,11 +213,14 @@ class QuestionService:
         coverage = self._coverage(repo, access)
         if not coverage["github_complete"]:
             limits.append("GitHub history import for this repository is not complete")
+        receipts: dict[str, dict] = {}
         findings = [
-            self._judge(oid, info, stated, graph, anchored, access) for oid, info in prior.items()
+            self._judge(oid, info, stated, graph, anchored, access, receipts)
+            for oid, info in prior.items()
         ]
         findings.sort(key=lambda f: (_RANK[f["verdict"]], f["decision"]["id"]))
-        verdict = self._overall(findings, limits)
+        verdict = self._overall(findings, limits + revision_limits, bool(revision_limits))
+        limits = revision_limits + limits
         citations = self._citations(
             [f["decision"]["id"] for f in findings] + sorted(stated), access
         )
@@ -223,10 +239,13 @@ class QuestionService:
             "verdict": verdict,
             "findings": findings,
             "pr_decisions": sorted(stated),
+            "stale_pr_decisions": sorted(stale_stated),
             "graph": graph,
             "coverage": coverage,
             "limits": limits,
+            "revision_bound": not revision_limits,
             "citations": citations,
+            "receipts": receipts,
             "read_only": True,
         }
         answer["narrative"] = render_narrative(answer)
@@ -249,6 +268,16 @@ class QuestionService:
         if graph["hidden_links"]:
             limits.append("some related decisions are outside your readable corpus")
         ids = list(graph["history_order"])
+        verdict = "insufficient_evidence" if not ids else "history"
+        if as_of_commit:
+            # Not supported yet: the registry answers about its current state, so
+            # presenting that as the history at a past commit would be false proof.
+            verdict = "insufficient_evidence"
+            limits.insert(
+                0,
+                f"as_of_commit {as_of_commit[:12]} is not supported: these are current "
+                "registry records, not proof of what held at that commit",
+            )
         answer = {
             "kind": "decision_history",
             "question": question,
@@ -256,7 +285,8 @@ class QuestionService:
             "paths": paths,
             "symbols": symbols,
             "as_of_commit": as_of_commit or "",
-            "verdict": "insufficient_evidence" if not ids else "history",
+            "as_of_supported": False,
+            "verdict": verdict,
             "graph": graph,
             "limits": limits,
             "citations": self._citations(ids, access),
@@ -338,20 +368,57 @@ class QuestionService:
                 out[oid] = info
         return out, anchors
 
-    def _stated_in_pr(self, repo: str, number: int, snap: dict, access) -> set[str]:
-        """Decisions extracted from this PR's own description, comments and reviews."""
+    def _stated_in_pr(
+        self, repo: str, number: int, snap: dict, access
+    ) -> tuple[set[str], set[str], str]:
+        """Decisions this PR states at its frozen head: ``(current, stale, limit)``.
+
+        A description revision counts only when it was observed at the frozen
+        head. Conversation comments have no head and count. A review or inline
+        comment on another commit is stale. If the description was never
+        imported at this head, ``limit`` says so and no verdict may be
+        affirmative.
+        """
         prefix = f"{repo}#{number}"
+        head = snap.get("head_sha") or ""
         rows = self.registry.db.execute(
-            "SELECT DISTINCT e.object_id FROM registry_decision_evidence e JOIN "
-            "registry_source_revisions r ON r.evidence_id = e.evidence_id WHERE "
-            "r.source_system = 'github' AND (r.source_id = ? OR r.parent_source_id = ?)",
+            "SELECT e.object_id, r.source_type, r.head_sha, r.commit_sha FROM "
+            "registry_decision_evidence e JOIN registry_source_revisions r "
+            "ON r.evidence_id = e.evidence_id WHERE r.source_system = 'github' "
+            "AND (r.source_id = ? OR r.parent_source_id = ?)",
             (prefix, prefix),
         )
-        ids = {r[0] for r in rows}
+        current: set[str] = set()
+        stale: set[str] = set()
+        for oid, source_type, rev_head, commit in rows:
+            if source_type == "github_pr_description":
+                at_head = rev_head == head
+            elif source_type in ("github_review", "github_review_comment"):
+                at_head = not commit or commit == head
+            else:
+                at_head = True
+            (current if at_head else stale).add(oid)
+        stale -= current
+        heads = self.registry.db.execute(
+            "SELECT head_sha FROM registry_source_revisions WHERE source_system = 'github' "
+            "AND source_type = 'github_pr_description' AND source_id = ?",
+            (prefix,),
+        )
+        imported = {h[0] for h in heads}
+        limit = ""
+        if not imported:
+            limit = "this PR's description has not been imported; its own decisions are unknown"
+        elif head not in imported:
+            limit = (
+                f"stale import: this PR was imported at {sorted(imported)[-1][:12]}, "
+                f"not the frozen head {head[:12]}"
+            )
         url = snap.get("url") or ""
-        if url:
-            ids |= {o["id"] for o in self.registry._select_visible(access, "pr = ?", (url,))}
-        return {i for i in ids if self._visible(i, access)}
+        if url:  # registry decisions recorded on this PR's branch
+            current |= {o["id"] for o in self.registry._select_visible(access, "pr = ?", (url,))}
+        current = {i for i in current if self._visible(i, access)}
+        stale = {i for i in stale if self._visible(i, access)} - current
+        return current, stale, limit
 
     def _ticket_decisions(self, text: str, access) -> set[str]:
         ids: set[str] = set()
@@ -385,6 +452,64 @@ class QuestionService:
             ],
         }
 
+    def _relationship_receipt(self, edge: dict, access) -> dict:
+        """The stored relationship and every evidence record for it."""
+        rows = self.registry.db.execute(
+            "SELECT created_by, created_at, resolved_by, resolved_at, origin FROM "
+            "registry_relationships WHERE id = ?",
+            (edge["id"],),
+        )
+        created_by, created_at, resolved_by, resolved_at, origin = rows[0] if rows else ("",) * 5
+        return {
+            "kind": "relationship",
+            "id": edge["id"],
+            "type": edge["type"],
+            "status": edge["status"],
+            "source_id": edge["source_id"],
+            "target_id": edge["target_id"],
+            "relation": edge.get("relation") or "",
+            "created_by": created_by,
+            "created_at": created_at,
+            "resolved_by": resolved_by,
+            "resolved_at": resolved_at,
+            "origin": origin,
+            "evidence": self.store.relationship_evidence(edge["id"], access),
+        }
+
+    def _approval_receipt(self, object_id: str, edge_receipt: dict, access) -> dict | None:
+        """Proof a person approved ``object_id``, tied to the edge's activation.
+
+        Needs a recorded approval lifecycle event with a human approver
+        attribution, cited by a relationship-evidence record of this edge. A
+        legacy ``decided_by`` alone is not proof.
+        """
+        approval = self.registry._latest_approval(object_id)
+        if not approval:
+            return None
+        cited = any(r.get("approving_evidence_id") == approval for r in edge_receipt["evidence"])
+        if not cited:
+            return None
+        approvers = [
+            a
+            for a in self.store.attributions(object_id, [approval], access)
+            if a["role"] == "approver"
+            and a["evidence_id"] == approval
+            and a["actor_kind"] == "human"
+        ]
+        try:
+            event = self.store.source_revision(approval, access)
+        except NotFound:
+            return None
+        if not approvers:
+            return None
+        return {
+            "kind": "approval",
+            "id": approval,
+            "object_id": object_id,
+            "event": {k: event.get(k) for k in ("source_type", "source_labels", "observed_at")},
+            "approvers": [_attr_view(a) for a in approvers],
+        }
+
     def _judge(
         self,
         oid: str,
@@ -393,51 +518,74 @@ class QuestionService:
         graph: dict,
         anchored: dict[str, list[dict]],
         access,
+        receipts: dict[str, dict],
     ) -> dict:
         obj = self.registry.get(oid)
         verdict = "no_supported_override_found"
         via: list[dict] = []
+        inactive: list[dict] = []
         reasons: list[str] = []
+        cited: list[str] = []
+        unproven = False  # an edge exists but its proof does not
         for e in graph["edges"]:
             ends = {e["source_id"], e["target_id"]}
             if oid not in ends:
                 continue
-            other = (ends - {oid}) or {oid}
-            other_id = next(iter(other))
+            other_id = next(iter((ends - {oid}) or {oid}))
             if other_id not in stated:
                 continue
+            if e["type"] not in ("supersedes", "corrects", "conflicts_with", "compatible_with"):
+                continue
+            if e["status"] in _INACTIVE_LINKS:
+                # Audit history: shown, never a current verdict.
+                inactive.append(e)
+                continue
+            receipt = self._relationship_receipt(e, access)
             if e["type"] in ("supersedes", "corrects") and e["target_id"] == oid:
                 newer = self.registry.get(e["source_id"])
-                if (
-                    e["status"] == "active"
-                    and newer["status"] == "approved"
-                    and newer["decided_by"]
-                ):
+                approval = (
+                    self._approval_receipt(newer["id"], receipt, access)
+                    if e["status"] == "active" and newer["status"] == "approved"
+                    else None
+                )
+                if approval is not None:
                     v = "confirmed_supersession"
+                    who = ", ".join(a["original_identity"] or "?" for a in approval["approvers"])
+                    reasons.append(f"{newer['id']} {e['type']} it; approval recorded for {who}")
+                    receipts[approval["id"]] = approval
+                    cited.append(approval["id"])
+                elif e["status"] == "active" and newer["status"] == "approved":
+                    v = "insufficient_evidence"
+                    unproven = True
                     reasons.append(
-                        f"{newer['id']} {e['type']} it, approved by {newer['decided_by']}"
+                        f"{newer['id']} is marked approved but no recorded approval event backs "
+                        "this edge (a legacy decided_by is not proof)"
                     )
                 else:
                     v = "proposed_supersession"
                     reasons.append(f"{newer['id']} would {e['type'].rstrip('s')} it; not approved")
+            elif e["type"] in ("supersedes", "corrects"):
+                continue  # the PR's decision is the older side: not an override of this one
             elif e["type"] == "conflicts_with":
                 v = "conflict"
                 reasons.append(
                     f"{other_id} conflicts ({e['relation'] or 'unspecified'}); "
                     "a conflict is not an authorized override"
                 )
-            elif e["type"] == "compatible_with":
+            else:
                 v = "compatible"
                 reasons.append(f"{other_id} is recorded as compatible")
-            else:
-                continue
+            receipts[receipt["id"]] = receipt
+            cited.append(receipt["id"])
             via.append(e)
             if _RANK[v] < _RANK[verdict]:
                 verdict = v
         uncertain = [
             a for a in anchored.get(oid, []) if a["resolution_status"] in _UNCERTAIN_ANCHORS
         ]
-        if verdict == "no_supported_override_found":
+        if verdict == "no_supported_override_found" and unproven:
+            verdict = "insufficient_evidence"
+        elif verdict == "no_supported_override_found":
             if info["why"].startswith("linked ticket"):
                 verdict = "insufficient_evidence"
                 reasons.append("linked through a ticket, not anchored to the changed code")
@@ -450,9 +598,14 @@ class QuestionService:
                 )
             else:
                 reasons.append(
-                    "the PR touches its anchored code; no recorded supersession, "
-                    "correction, conflict or compatibility with this PR"
+                    "the PR touches its anchored code; no current supersession, "
+                    "correction, conflict or compatibility with this PR's decisions"
                 )
+        if inactive:
+            reasons.append(
+                f"{len(inactive)} inactive link(s) kept as history: "
+                + ", ".join(f"{e['type']} {e['status']}" for e in inactive)
+            )
         return {
             "decision": {
                 k: obj.get(k)
@@ -470,11 +623,16 @@ class QuestionService:
             "why_considered": info["why"],
             "anchors": info["anchors"],
             "via": via,
+            "inactive_links": inactive,
+            "receipts": cited,
             "reasons": reasons,
         }
 
     @staticmethod
-    def _overall(findings: list[dict], limits: list[str]) -> str:
+    def _overall(findings: list[dict], limits: list[str], revision_unbound: bool = False) -> str:
+        """Strongest finding, but never affirmative on evidence not bound to the head."""
+        if revision_unbound:
+            return "insufficient_evidence"
         if not findings:
             return "insufficient_evidence" if limits else "no_supported_override_found"
         best = min(findings, key=lambda f: _RANK[f["verdict"]])["verdict"]
@@ -566,7 +724,8 @@ def _attr_view(a: dict) -> dict:
 
 
 _SENTENCES = {
-    "confirmed_supersession": "{title} ({id}) was replaced with human approval.",
+    "confirmed_supersession": "{title} ({id}) was replaced; the edge and a person's recorded "
+    "approval are cited.",
     "proposed_supersession": "{title} ({id}) would be replaced, but no person has approved that.",
     "conflict": "This PR's recorded decisions conflict with {title} ({id}); a conflict is "
     "not an authorized override.",
@@ -577,9 +736,14 @@ _SENTENCES = {
 }
 
 
+def _quote_ids(cited: dict, oid: str) -> list[str]:
+    return [q["evidence_id"] for q in (cited.get(oid) or {}).get("quotes", [])]
+
+
 def render_narrative(answer: dict) -> list[dict]:
-    """Deterministic sentences, each with the evidence ids it rests on. Validated."""
+    """Deterministic sentences with the quotes and receipts they rest on. Validated."""
     cited = answer.get("citations") or {}
+    receipts = answer.get("receipts") or {}
     out: list[dict] = []
     if answer.get("kind") == "pr_decisions":
         pr = answer.get("pr") or {}
@@ -589,33 +753,58 @@ def render_narrative(answer: dict) -> list[dict]:
                 "text": f"Verdict for PR #{pr.get('number')} at head {head or 'unknown'}: "
                 f"{answer['verdict'].replace('_', ' ')}.",
                 "evidence": [],
+                "receipts": [],
             }
         )
         for f in answer.get("findings") or []:
             d = f["decision"]
-            ev = [q["evidence_id"] for q in (cited.get(d["id"]) or {}).get("quotes", [])]
+            ev = _quote_ids(cited, d["id"])
+            for e in f.get("via") or []:
+                other = e["source_id"] if e["target_id"] == d["id"] else e["target_id"]
+                ev += [x for x in _quote_ids(cited, other) if x not in ev]
             out.append(
                 {
                     "text": _SENTENCES[f["verdict"]].format(title=d["title"], id=d["id"]),
                     "evidence": ev,
+                    "receipts": list(f.get("receipts") or []),
                     "verdict": f["verdict"],
                 }
             )
     else:
         for oid in (answer.get("graph") or {}).get("history_order", []):
             node = answer["graph"]["nodes"][oid]
-            ev = [q["evidence_id"] for q in (cited.get(oid) or {}).get("quotes", [])]
-            out.append({"text": f"{node['title']} ({oid}), {node['status']}.", "evidence": ev})
+            out.append(
+                {
+                    "text": f"{node['title']} ({oid}), {node['status']}.",
+                    "evidence": _quote_ids(cited, oid),
+                    "receipts": [],
+                }
+            )
     for limit in answer.get("limits") or []:
-        out.append({"text": f"Limit: {limit}.", "evidence": []})
-    validate_citations(out, cited)
+        out.append({"text": f"Limit: {limit}.", "evidence": [], "receipts": []})
+    validate_citations(out, cited, receipts)
     return out
 
 
-def validate_citations(sentences: list[dict], citations: dict[str, dict]) -> None:
-    """Refuse any sentence that cites evidence absent from the answer's citations."""
+def validate_citations(
+    sentences: list[dict], citations: dict[str, dict], receipts: dict[str, dict] | None = None
+) -> None:
+    """Refuse a sentence whose cited proof is missing or does not support its claim.
+
+    Every quote and receipt id must be in the answer. A relationship verdict
+    must cite a relationship receipt; a confirmed supersession must also cite
+    a human approval receipt.
+    """
+    receipts = receipts or {}
     known = {q["evidence_id"] for c in citations.values() for q in c.get("quotes", [])}
     for sentence in sentences:
         missing = [e for e in sentence.get("evidence", []) if e not in known]
+        missing += [r for r in sentence.get("receipts", []) if r not in receipts]
         if missing:
             raise CitationError(f"narrative cites evidence not in the answer: {missing}")
+        kinds = {receipts[r]["kind"] for r in sentence.get("receipts", [])}
+        verdict = sentence.get("verdict")
+        if verdict in _RELATIONSHIP_VERDICTS and "relationship" not in kinds:
+            raise CitationError(f"a {verdict} sentence must cite the relationship it asserts")
+        if verdict == "confirmed_supersession" and "approval" not in kinds:
+            raise CitationError("a confirmed supersession must cite a recorded human approval")

@@ -38,12 +38,21 @@ necessary to reach the tool but never sufficient for corpus data.
 
    | Verdict | Means |
    |---|---|
-   | `confirmed_supersession` | An active `supersedes`/`corrects` edge from a PR decision that a person approved. |
+   | `confirmed_supersession` | An active `supersedes`/`corrects` edge from a PR decision, plus a recorded human approval event for that decision cited by the edge's activation receipt. A legacy `decided_by` alone is not proof (→ `insufficient_evidence`). |
    | `proposed_supersession` | Such an edge exists but nobody has approved it. Not an override. |
    | `conflict` | The PR's decision conflicts with it. Behavior may change contrary to it; that is not authorization. |
    | `compatible` | Recorded as compatible. |
    | `no_supported_override_found` | The PR touches its anchored code; nothing recorded overrides it. |
    | `insufficient_evidence` | Uncertain anchor, ticket-only link, or missing evidence. |
+
+   Rejected, withdrawn, kept-existing and superseded-existing links are audit
+   history: listed under `inactive_links`, never a current verdict.
+
+   **Revision binding.** The PR's own decisions count only from a description
+   revision imported at the frozen head (conversation comments have no head;
+   reviews and inline comments must be on that head). A moved head
+   (`expected_head_sha`), a stale import, or an unimported description makes
+   the overall verdict `insufficient_evidence`, whatever the findings say.
 
 5. **Overall verdict** is the strongest finding, except that a global
    `no_supported_override_found` is never returned while coverage is
@@ -55,14 +64,21 @@ necessary to reach the tool but never sufficient for corpus data.
    every attribution role with original and normalized labels plus
    `unknown_fields` / `inferred_fields`, and a separate importer/extractor
    section. Legacy rows are marked legacy with unknown quote and approval.
-7. **Narrative**: deterministic sentences over the findings, each listing the
-   evidence ids it rests on; `validate_citations` refuses an id not in the
-   answer. No model writes the answer.
+7. **Receipts**: each judged edge is a `relationship` receipt (the stored edge
+   plus every relationship-evidence record); a confirmed supersession adds an
+   `approval` receipt (the lifecycle event and its human approver attribution).
+8. **Narrative**: deterministic sentences over the findings, each listing the
+   quotes (both endpoints) and receipts it rests on. `validate_citations`
+   refuses an id not in the answer, a relationship verdict without a
+   relationship receipt, and a confirmed supersession without an approval
+   receipt. No model writes the answer.
 
 ## Other questions
 
 - Repo plus paths or symbols: decision history for that code, oldest first by
-  ancestry, with citations.
+  ancestry, with citations. `as_of_commit` is not supported yet: the answer is
+  `insufficient_evidence` with a limit saying these are current records, never
+  presented as what held at that commit.
 - Anything else, or a PR number without a repository: `needs_context`, naming
   what is missing. The service never guesses a repository and never runs an
   open-ended agent task.
