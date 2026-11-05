@@ -335,3 +335,43 @@ Anything else fails that replay, which makes the result inconclusive. A broken
 reply can never act as a keep-none control. Valid replies keep the production
 keep rule. Every output (`calls/*.json`, `decision.json`, `plan.json`,
 prompts, diffs) is written once with mode 0600 in 0700 directories.
+
+### Drafting/critique measurement study (HAI-12817 design S; diagnostic only)
+
+`tests/benchmarks/study_capture.py` implements the measurement study in
+`NEXT_EXPERIMENT_PLAN_v3.md`, design S: 12 development units × 1 run. It is not
+a parity or release measurement. It does not change the reviewer, its
+thresholds, or the ordinary parity defaults.
+
+```bash
+uv run python tests/benchmarks/study_capture.py plan --head <sha> --out <dir>           # offline manifest
+GITHUB_TOKEN=... MIRA_ROUTER_ACP_RELAY_ENTRY=<entry> uv run python tests/benchmarks/study_capture.py capture --out <dir> --approved-live
+GITHUB_TOKEN=... MIRA_ROUTER_ACP_RELAY_ENTRY=<entry> uv run python tests/benchmarks/study_capture.py label   --out <dir> --approved-live
+uv run python tests/benchmarks/study_capture.py report --out <dir>                       # offline
+```
+
+- **Manifest.** `plan` writes a frozen `study-manifest.json` (write-once, 0600, in a 0700 directory) with:
+  - the seeded, interleaved unit order;
+  - every planned unit-run;
+  - the frozen eligible golden ids (`11892-1` excluded for its invalid anchor);
+  - the per-rule planned sets, negative controls included;
+  - the predeclared rules.
+
+  `capture` and `label` refuse to run unless the manifest still equals the frozen design.
+- **Capture.** An ordinary `run_parity` with three diagnostic options:
+  - `ordered=True`: one unit at a time;
+  - `skip_posted_judge=True`: the blind labels judge every draft instead. `summarize` refuses such an artifact;
+  - the capture pool as its meter.
+
+  The defaults (`ordered=False`, `skip_posted_judge=False`, `meter=None`) are unchanged.
+- **Ledger.** One append-only `ledger.jsonl` with two pools:
+  - a capture pool (cap 119 − 36 = 83 for S);
+  - one disjoint 3-request label reservation per planned unit-run.
+
+  Each request is counted before it is sent. Capture can never spend a label reservation, and a label call can only spend its own. Nothing resets.
+- **Labels.** One blind judge call per captured unit-run that has drafts. Unit-runs with zero drafts make no call. A terminal stop (`STOP.json`) is restored before any request, so a stopped study never sends again.
+- **Report.** For every planned unit-run, its outcome and reason for any missingness. Rule definitions follow plan v3 §6:
+  - a required label that is missing or failed makes the unit-run incomplete;
+  - the judge error rate counts terminal per-unit outcomes, not attempts;
+  - when every unit-run a rule covers is a valid zero-draft capture, the judge error rate is N/A and the judge-validity precondition does not apply to the descriptive R-draft;
+  - precision and critique rules are not evaluable without a denominator.

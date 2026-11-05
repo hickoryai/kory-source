@@ -76,6 +76,11 @@ class ParityConfig:
     seat_budget: int = 0
     # Opt-in raw capture (HAI-12817). Empty = off, and the artifact is unchanged.
     capture_path: str = field(default_factory=lambda: os.environ.get(CAPTURE_ENV, ""))
+    # Diagnostic studies only (HAI-12817). Defaults keep the ordinary parity run.
+    # skip_posted_judge: no posted-comment judge call; the artifact cannot be scored.
+    # ordered: review units one at a time, in the order given.
+    skip_posted_judge: bool = False
+    ordered: bool = False
 
 
 class SeatBudgetExhausted(RuntimeError):
@@ -667,8 +672,13 @@ async def run_parity(
     judge_llm_factory: Any = None,
     revert_finder: Any = find_reverts,
     inputs: dict | None = None,
+    meter: Any = None,
 ) -> dict:
-    """Run every arm and run. Returns the artifact (the caller writes it)."""
+    """Run every arm and run. Returns the artifact (the caller writes it).
+
+    ``meter``, when given, replaces the ``SeatMeter(cfg.seat_budget)`` cap. It must
+    offer ``guard(llm)``, ``exhausted`` and ``as_dict()``.
+    """
     reviewer_family = model_family(cfg.reviewer_llm.model)
     judge_family = model_family(cfg.judge_llm.model)
     if (
@@ -705,6 +715,7 @@ async def run_parity(
             judge_llm_factory=judge_llm_factory,
             revert_finder=revert_finder,
             inputs=inputs,
+            meter=meter,
         )
     finally:
         _capture_sink.reset(sink_token)
@@ -727,6 +738,7 @@ async def _run_arms(
     judge_llm_factory: Any,
     revert_finder: Any,
     inputs: dict | None,
+    meter: Any = None,
 ) -> dict:
     judge_family = model_family(cfg.judge_llm.model)
     scored = [u for u in units if u.greptile_reviewed]
@@ -748,7 +760,7 @@ async def _run_arms(
         except Exception as exc:
             reverts[pr_url] = f"error: {str(exc)[:200]}"
 
-    meter = SeatMeter(cfg.seat_budget)
+    meter = meter if meter is not None else SeatMeter(cfg.seat_budget)
     # The judge never scores its own family: reviewer replies from it are refused.
     excluded = set() if cfg.allow_same_family_judge else {judge_family}
 
@@ -768,6 +780,21 @@ async def _run_arms(
             review = await review_unit(
                 u, arm, run, cfg.reviewer_llm, github_token, provider_factory, metered_factory
             )
+            if cfg.skip_posted_judge:
+                return {
+                    "unit_id": u.unit_id,
+                    "pr_url": u.pr_url,
+                    "arm": arm,
+                    "run": run,
+                    "review": review,
+                    "judge": {
+                        "skipped": True,
+                        "pool": [],
+                        "parsed": {},
+                        "error": "",
+                        "seat_calls": [],
+                    },
+                }
             label = f"{arm}|r{run}"
             attribution = f"judge|{arm}|r{run}|{u.unit_id}"
             token = _set_attribution(attribution)
@@ -799,7 +826,10 @@ async def _run_arms(
     for arm in cfg.arms:
         install_arm(arm)
         for run in range(1, cfg.runs + 1):
-            done = await asyncio.gather(*(_one(u, arm, run) for u in scored))
+            if cfg.ordered:
+                done = [await _one(u, arm, run) for u in scored]
+            else:
+                done = await asyncio.gather(*(_one(u, arm, run) for u in scored))
             records.extend(r for r in done if r is not None)
 
     # Cross-check every flagged location against the merged PR, once per unit.
@@ -834,6 +864,8 @@ async def _run_arms(
         },
         "seat_meter": meter.as_dict(),
         "harness": HARNESS,
+        **({"posted_judge_skipped": True} if cfg.skip_posted_judge else {}),
+        **({"ordered": True} if cfg.ordered else {}),
         "units": [u.as_dict() for u in units],
         "snapshots": {
             uid: {
@@ -927,6 +959,10 @@ def _pipeline(arm_rows: list[dict]) -> dict:
 
 def summarize(artifact: dict) -> dict:
     """The full report, computed only from the artifact."""
+    if artifact.get("posted_judge_skipped"):
+        raise ValueError(
+            "diagnostic capture: the posted-comment judge was skipped; not a parity artifact"
+        )
     cfg = artifact["config"]
     rule = cfg.get("rule") or DEFAULT_RULE
     rows = _unit_rows(artifact["records"])
