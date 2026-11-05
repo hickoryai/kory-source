@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -198,6 +199,14 @@ def test_ledger_survives_restart_without_reset(tmp_path):
     assert oct(path.stat().st_mode & 0o777) == "0o600"
 
 
+REVIEWER_BODY = {
+    "prompt": "review this",
+    "model": sc.REVIEWER_MODEL,
+    "priority": "review",
+    "timeout_seconds": 900,
+}
+
+
 class SpendingEngine(FakeEngine):
     """Spends three relay requests per review through the metered transport."""
 
@@ -207,7 +216,7 @@ class SpendingEngine(FakeEngine):
 
     async def review_pr(self, url):
         for _ in range(3):
-            await self.llm._transport({"body": {"model": "claude@x/opus"}})
+            await self.llm._transport({"body": dict(REVIEWER_BODY)})
         return await super().review_pr(url)
 
 
@@ -221,7 +230,7 @@ async def test_capture_pool_cap_stops_units_and_never_touches_label_reservations
 
     async def transport(request):
         sent.append(request)
-        return {"text": "{}", "actual_model": "claude@x/opus"}
+        return {"text": "{}", "actual_model": sc.REVIEWER_MODEL}
 
     def llm_factory(cfg):
         return SimpleNamespace(_transport=transport)
@@ -234,8 +243,8 @@ async def test_capture_pool_cap_stops_units_and_never_touches_label_reservations
         tmp_path / "l.jsonl", capture_pool=4, reservations=dict.fromkeys(keys, 3)
     )
     cfg = parity_runner.ParityConfig(
-        reviewer_llm=LLMConfig(provider="router-acp", model="claude@x/opus"),
-        judge_llm=LLMConfig(provider="router-acp", model="grok/grok-4.6"),
+        reviewer_llm=LLMConfig(provider="router-acp", model=sc.REVIEWER_MODEL),
+        judge_llm=LLMConfig(provider="router-acp", model=sc.JUDGE_MODEL),
         runs=1,
         arms=("registry_off",),
         skip_posted_judge=True,
@@ -427,7 +436,8 @@ def test_partial_coverage_uses_the_frozen_planned_denominator():
 
 
 class Judge:
-    def __init__(self, fail_times=0, model=sc.JUDGE_MODEL):
+    def __init__(self, fail_times=0, model=sc.JUDGE_MODEL, reply=None):
+        self.reply = reply
         self.sent: list[dict] = []
         self.fail_times = fail_times
         self.model = model
@@ -438,7 +448,11 @@ class Judge:
         self.sent.append(request)
         if len(self.sent) <= self.fail_times:
             raise RouterTransportError("busy", kind="seat_exhausted")  # a retryable state
-        return {"text": json.dumps({"issues": [], "evidence": []}), "actual_model": self.model}
+        if self.reply is not None:
+            return {"text": self.reply, "actual_model": self.model}
+        idx = [int(i) for i in re.findall(r"^\[(\d+)\] ", request["body"]["prompt"], re.M)]
+        issues = [{"comment_indices": [i], "verdict": "real", "severity": "major"} for i in idx]
+        return {"text": json.dumps({"issues": issues, "evidence": []}), "actual_model": self.model}
 
 
 async def _label_phase(tmp_path, judge_t, manifest=None, captured=None, ledger=None, state=None):
@@ -482,7 +496,7 @@ async def test_terminal_label_failure_is_counted_once_regardless_of_retries(tmp_
         key: 3
     }  # 1 call + 2 retries, own reservation
     rep = sc.analyze(m, captured, sc.load_labels(m, out))
-    assert rep["missingness"][key]["status"] == "judge_error"
+    assert rep["missingness"][key]["status"] == "label_error"
     pre = rep["rules"]["R-draft"]["precondition"]
     assert (pre["label_required"], pre["label_failed"], pre["judge_error_rate"]) == (1, 1, 1.0)
 
@@ -519,3 +533,228 @@ async def test_zero_draft_unit_runs_make_no_label_calls(tmp_path):
         tmp_path, judge, manifest=m, captured=captured
     )
     assert judge.sent == [] and res == {} and ledger.label_used == {}
+
+
+# ------------------------------------------------------------------ review fixes (6feec97)
+
+
+def _capture_world(monkeypatch, tmp_path, transport, pool=20):
+    monkeypatch.setattr(parity_runner, "ReviewEngine", SpendingEngine)
+    monkeypatch.setattr("mira.registry.get_registry", lambda create=True: FakeRegistry())
+    units = list(_units().values())
+    keys = [sc.unit_run_key(u.unit_id, 1) for u in units]
+    out = tmp_path / "out"
+    out.mkdir(mode=0o700, exist_ok=True)
+    ledger = sc.StudyLedger(
+        out / "ledger.jsonl", capture_pool=pool, reservations=dict.fromkeys(keys, 3)
+    )
+    state = cr.LiveState()
+    state.restore(out)
+    cfg = parity_runner.ParityConfig(
+        reviewer_llm=LLMConfig(provider="router-acp", model=sc.REVIEWER_MODEL),
+        judge_llm=LLMConfig(provider="router-acp", model=sc.JUDGE_MODEL),
+        runs=1,
+        arms=("registry_off",),
+        skip_posted_judge=True,
+        ordered=True,
+    )
+
+    async def no_reverts(*a):
+        return []
+
+    async def run():
+        return await parity_runner.run_parity(
+            units,
+            cfg,
+            "tok",
+            provider_factory=FakeProvider,
+            llm_factory=lambda c: SimpleNamespace(_transport=transport),
+            revert_finder=no_reverts,
+            meter=ledger.capture_meter(state),
+        )
+
+    return run, ledger, state, out
+
+
+@pytest.mark.parametrize(
+    "reply,reason",
+    [
+        ({"text": "{}", "actual_model": "claude@WRONG/opus"}, "model_pin_failure"),
+        ({"text": "router-acp · notice", "actual_model": sc.REVIEWER_MODEL}, "leak_detected"),
+    ],
+)
+async def test_capture_stops_durably_on_the_first_bad_reply(monkeypatch, tmp_path, reply, reason):
+    sent = []
+
+    async def transport(request):
+        sent.append(request)
+        return dict(reply)
+
+    run, ledger, state, out = _capture_world(monkeypatch, tmp_path, transport)
+    art = await run()
+    assert len(sent) == 1  # the engine swallowed the error, yet nothing more was sent
+    assert len(art["records"]) == 1 and "study_stop" in art["records"][0]["review"]["error"]
+    assert json.loads((out / "STOP.json").read_text())["reason"] == reason
+    assert ledger.capture_used == 1
+
+    # Restart: a fresh meter restores the stop and sends nothing, whatever the transport.
+    sent2 = []
+
+    async def good(request):
+        sent2.append(request)
+        return {"text": "{}", "actual_model": sc.REVIEWER_MODEL}
+
+    run2, ledger2, state2, _ = _capture_world(monkeypatch, tmp_path, good)
+    art2 = await run2()
+    assert sent2 == [] and art2["records"] == [] and state2.stop == reason
+    assert ledger2.capture_used == 1  # restored from the journal, never reset
+
+
+async def test_an_unexpected_request_body_is_refused_before_it_is_counted(tmp_path):
+    sent = []
+
+    async def transport(request):
+        sent.append(request)
+        return {"text": "{}", "actual_model": sc.REVIEWER_MODEL}
+
+    out = tmp_path / "out"
+    out.mkdir(mode=0o700)
+    ledger = sc.StudyLedger(out / "l.jsonl", 5, {})
+    state = cr.LiveState()
+    state.restore(out)
+    llm = ledger.capture_meter(state).guard(SimpleNamespace(_transport=transport))
+    for body in ({**REVIEWER_BODY, "model": sc.JUDGE_MODEL}, {**REVIEWER_BODY, "extra": 1}):
+        with pytest.raises(parity_runner.SeatBudgetExhausted, match="study_stop"):
+            await llm._transport({"body": body})
+    assert sent == [] and ledger.capture_used == 0
+    assert json.loads((out / "STOP.json").read_text())["reason"] == "unexpected_request"
+
+
+async def test_an_excluded_family_reply_is_a_pin_failure(tmp_path):
+    from mira.llm.router_acp import RouterTransportError
+
+    async def transport(request):
+        raise RouterTransportError(
+            "excluded", kind=parity_runner.EXCLUDED_STATE, body={"actual_model": "grok@x/g"}
+        )
+
+    out = tmp_path / "out"
+    out.mkdir(mode=0o700)
+    state = cr.LiveState()
+    state.restore(out)
+    llm = (
+        sc.StudyLedger(out / "l.jsonl", 5, {})
+        .capture_meter(state)
+        .guard(SimpleNamespace(_transport=transport))
+    )
+    with pytest.raises(parity_runner.SeatBudgetExhausted):
+        await llm._transport({"body": dict(REVIEWER_BODY)})
+    assert state.stop == "model_pin_failure"
+
+
+def test_an_unmetered_provider_is_rejected(tmp_path):
+    meter = sc.StudyLedger(tmp_path / "l.jsonl", 5, {}).capture_meter()
+    with pytest.raises(sc.StudyError, match="unmetered"):
+        meter.guard(SimpleNamespace())
+
+
+def test_runtime_must_match_the_manifest_head_clean_tree_and_relay(tmp_path):
+    m = {"head": "a" * 40, "config": {"relay": "3ed531ed098f"}}
+    entry = tmp_path / "releases" / "3ed531ed098f" / "relay" / "llm-complete.mjs"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("")
+
+    def git(head="a" * 40, dirty=""):
+        return lambda *a: head if a[0] == "rev-parse" else dirty
+
+    sc.verify_runtime(m, relay_entry=str(entry), git=git())
+    with pytest.raises(sc.StudyError, match="frozen at"):
+        sc.verify_runtime(m, relay_entry=str(entry), git=git(head="b" * 40))
+    with pytest.raises(sc.StudyError, match="modified"):
+        sc.verify_runtime(m, relay_entry=str(entry), git=git(dirty=" M x.py"))
+    with pytest.raises(sc.StudyError, match="pinned release"):
+        sc.verify_runtime(m, relay_entry=str(tmp_path / "other.mjs"), git=git())
+
+
+BAD_LABELS = [
+    "{}",
+    json.dumps({"issues": [], "evidence": []}),
+    json.dumps({"issues": [{"comment_indices": [99], "verdict": "real", "severity": "major"}]}),
+    json.dumps({"issues": [{"comment_indices": [0], "verdict": "maybe", "severity": "major"}]}),
+]
+
+
+@pytest.mark.parametrize("reply", BAD_LABELS)
+async def test_malformed_labels_are_terminal_errors_never_negative_evidence(tmp_path, reply):
+    judge = Judge(reply=reply)
+    res, ledger, out, captured, m = await _label_phase(tmp_path, judge)
+    key = f"{G1}|r1"
+    assert res[key]["status"] == "error" and len(judge.sent) == 1
+    rep = sc.analyze(m, captured, sc.load_labels(m, out))
+    assert (
+        rep["missingness"][key]["complete"] is False and rep["missingness"][key]["label_required"]
+    )
+    assert rep["rules"]["R-draft"]["precondition"]["label_failed"] == 1
+    assert (
+        rep["rules"]["R-draft"]["D_C"] == []
+        and rep["rules"]["R-draft"]["result"] == "not evaluable"
+    )
+
+
+def test_partial_and_duplicate_label_coverage_is_invalid():
+    units = _units()
+    k = f"{G1}|r1"
+    ur = _ur(k, [_draft(3, "a"), _draft(4, "b")], ["critique_deleted", "critique_kept"])
+    rec = _label(ur, units[G1], {0: ("real", "hickory-1-1")})["judge"]  # draft 1 never labeled
+    with pytest.raises(sc.LabelError, match="not labeled"):
+        sc.check_label_record(rec, 2)
+    dup = _label(ur, units[G1], {0: ("real", None), 1: ("real", None)})["judge"]
+    dup["parsed"]["issues"].append(dict(dup["parsed"]["issues"][0]))
+    with pytest.raises(sc.LabelError, match="more than one issue"):
+        sc.check_label_record(dup, 2)
+    m = _manifest()
+    captured = {key: _ur(key, [], []) for key in m["unit_runs"]} | {k: ur}
+    rep = sc.analyze(m, captured, {k: {"status": "ok", "judge": rec}})
+    assert rep["missingness"][k]["status"] == "label_invalid"
+
+
+async def test_label_phase_to_report_with_saved_diffs_and_sensitivities(tmp_path):
+    judge = Judge()  # labels every pool comment once, each as its own real issue
+    res, ledger, out, captured, m = await _label_phase(tmp_path, judge)
+    key = f"{G1}|r1"
+    assert res[key]["status"] == "ok"
+    diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,3 +1,3 @@\n-x\n+y\n"
+    ddir = out / "private" / "diffs"
+    ddir.mkdir(parents=True, mode=0o700)
+    snaps = {}
+    for uid in {k.split("|")[0] for k in m["unit_runs"]}:
+        (ddir / f"{uid}.diff").write_text(diff)
+        snaps[uid] = {"diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}
+    diffs = sc.saved_diffs(out, {"snapshots": snaps}, set(snaps))
+    rep = sc.analyze(m, captured, sc.load_labels(m, out), diffs)
+    assert rep["missingness"][key]["status"] == "complete_labeled" and rep["pending"] == []
+    assert isinstance(rep["rules"]["R-crit-recall"]["downstream_anchorable_deleted"], int)
+    assert "sensitivity_uncertain_as_not_real" in rep["rules"]["R-crit-precision"]
+    assert "sensitivity_uncertain_as_not_real" in rep["rules"]["R-fp"]["non_golden"]
+    full = rep["rules"]["sensitivity_full_golden"]
+    assert full["denominator"] == len(m["sensitivity_golden"])
+    no_diffs = sc.analyze(m, captured, sc.load_labels(m, out))
+    assert (
+        no_diffs["pending"]
+        and no_diffs["rules"]["R-crit-recall"]["downstream_anchorable_deleted"] == "pending"
+    )
+    (ddir / f"{G1}.diff").write_text("tampered")
+    with pytest.raises(sc.StudyError, match="saved diff hash"):
+        sc.saved_diffs(out, {"snapshots": snaps}, set(snaps))
+
+
+def test_full_golden_sensitivity_includes_the_excluded_anchor():
+    m = _manifest()
+    m["eligible_golden"] = ["hickory-1-1", "hickory-2-1"]  # pretend 1-2 is an invalid anchor
+    units = _units()
+    k = f"{G1}|r1"
+    ur = _ur(k, [_draft(4, "b")], ["critique_deleted"])
+    captured = {key: _ur(key, [], []) for key in m["unit_runs"]} | {k: ur}
+    rep = sc.analyze(m, captured, {k: _label(ur, units[G1], {0: ("real", "hickory-1-2")})})
+    assert rep["rules"]["R-draft"]["d"] == 0  # primary set excludes it
+    assert rep["rules"]["sensitivity_full_golden"]["d"] == 1  # sensitivity line includes it

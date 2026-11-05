@@ -26,6 +26,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -218,6 +219,37 @@ def build_manifest(design: dict, head: str, manifest_path: Path = MANIFEST) -> d
     }
 
 
+def verify_runtime(
+    manifest: dict,
+    repo: Path = ROOT,
+    relay_entry: str | None = None,
+    git: Any = None,
+) -> None:
+    """Before any request: the checkout is the manifest's head, clean, on the pinned relay."""
+
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git = git or _git
+    head = git("rev-parse", "HEAD")
+    if head != manifest["head"]:
+        raise StudyError(f"checkout is at {head}, manifest is frozen at {manifest['head']}")
+    if git("status", "--porcelain", "--untracked-files=no"):
+        raise StudyError("tracked files are modified; the code under test is not the manifest head")
+    entry = (
+        relay_entry
+        if relay_entry is not None
+        else os.environ.get("MIRA_ROUTER_ACP_RELAY_ENTRY", "")
+    )
+    release = f"/releases/{manifest['config']['relay']}/"
+    if not entry or release not in entry or not Path(entry).is_file():
+        raise StudyError(
+            f"relay entry {entry!r} is not the pinned release {manifest['config']['relay']}"
+        )
+
+
 # --- Two-pool ledger ----------------------------------------------------------------------
 
 
@@ -299,36 +331,91 @@ class StudyLedger:
             "unallocated_untouched": LEDGER["unallocated"],
         }
 
-    def capture_meter(self) -> CaptureMeter:
-        return CaptureMeter(self)
+    def capture_meter(self, state: Any = None) -> CaptureMeter:
+        return CaptureMeter(self, state)
 
     def label_meter(self) -> LabelMeter:
         return LabelMeter(self)
 
 
-class CaptureMeter:
-    """``run_parity`` meter over the capture pool only."""
+REQUEST_KEYS = frozenset({"prompt", "model", "priority", "timeout_seconds"})
 
-    def __init__(self, ledger: StudyLedger) -> None:
+
+class CaptureMeter:
+    """``run_parity`` meter over the capture pool, enforcing the reviewer request policy.
+
+    Every request must be a reviewer body (prompt, model, priority, timeout_seconds) for
+    the exact pinned model at ``review`` priority. It is counted before it is sent,
+    and every reply must come from that exact model with no router-notice leak
+    marker. Any violation writes ``STOP.json`` at once. From then on every request is
+    refused without being sent and no new unit starts, even if the engine swallows
+    the exception.
+    """
+
+    def __init__(
+        self,
+        ledger: StudyLedger,
+        state: Any = None,
+        model: str = REVIEWER_MODEL,
+        priority: str = "review",
+    ) -> None:
+        from .critique_replay import LiveState
+
         self.ledger = ledger
+        self.state = state if state is not None else LiveState()
+        self.model = model
+        self.priority = priority
 
     @property
     def exhausted(self) -> bool:
-        return self.ledger.capture_exhausted
+        return bool(self.state.stop) or self.ledger.capture_exhausted
+
+    def _stop(self, reason: str, detail: str) -> None:
+        from .parity_runner import SeatBudgetExhausted
+
+        self.state.set_stop(reason, detail)
+        raise SeatBudgetExhausted(f"study_stop: {reason}: {detail}")
 
     def guard(self, llm: Any) -> Any:
-        from .parity_runner import SeatBudgetExhausted
+        from .critique_replay import LEAK_MARKER
+        from .parity_runner import EXCLUDED_STATE, SeatBudgetExhausted
 
         inner = getattr(llm, "_transport", None)
         if inner is None:
-            return llm
+            raise StudyError("unmetered transport: the capture provider has no _transport to meter")
 
         async def _metered(request: dict[str, Any]) -> dict[str, Any]:
+            from mira.llm.router_acp import RouterTransportError
+
+            if self.state.stop:
+                raise SeatBudgetExhausted(f"study_stop: {self.state.stop}")
+            body = request.get("body") or {}
+            prompt = body.get("prompt")
+            if (
+                set(body) - REQUEST_KEYS
+                or body.get("model") != self.model
+                or body.get("priority") != self.priority
+                or not isinstance(prompt, str)
+                or not prompt
+            ):
+                self._stop("unexpected_request", f"model={body.get('model')!r} keys={sorted(body)}")
             try:
-                self.ledger.spend_capture(str((request.get("body") or {}).get("model", "")))
+                self.ledger.spend_capture(self.model)
             except LedgerStop as exc:
                 raise SeatBudgetExhausted(f"seat_budget_exhausted: {exc}") from exc
-            return await inner(request)
+            try:
+                payload = await inner(request)
+            except RouterTransportError as exc:
+                if exc.kind == EXCLUDED_STATE:
+                    actual = str((exc.body or {}).get("actual_model") or "unknown")
+                    self._stop("model_pin_failure", f"{self.model} answered by {actual}")
+                raise
+            actual = str(payload.get("actual_model") or "unknown")
+            if actual != self.model:
+                self._stop("model_pin_failure", f"{self.model} answered by {actual}")
+            if LEAK_MARKER in str(payload.get("text") or ""):
+                self._stop("leak_detected", "capture reply")
+            return payload
 
         llm._transport = _metered
         return llm
@@ -340,6 +427,7 @@ class CaptureMeter:
             "used": d["used"],
             "refused": d["refused"],
             "exhausted": self.exhausted,
+            "stop": self.state.stop or None,
         }
 
 
@@ -485,6 +573,43 @@ def draft_links(record: dict, golden_ids: set[str]) -> dict[int, dict]:
     return out
 
 
+class LabelError(ValueError):
+    """A judge reply that does not label every draft of the frozen blind pool exactly once."""
+
+
+def check_label_record(record: dict, n_drafts: int) -> None:
+    """Structural validity of one blind label. Anything else is a terminal label error."""
+    from .parity_judge import KORY, VERDICTS
+
+    if record.get("error"):
+        raise LabelError(f"judge error: {str(record['error'])[:120]}")
+    pool = record.get("pool") or []
+    draft_idx = {p["index"] for p in pool if p.get("owner") == KORY}
+    if len(draft_idx) != n_drafts:
+        raise LabelError(f"pool holds {len(draft_idx)} drafts, capture has {n_drafts}")
+    parsed = record.get("parsed")
+    issues = parsed.get("issues") if isinstance(parsed, dict) else None
+    if not isinstance(issues, list) or not issues:
+        raise LabelError("missing or empty issues")
+    seen: list[int] = []
+    for issue in issues:
+        if not isinstance(issue, dict) or issue.get("verdict") not in VERDICTS:
+            raise LabelError("an issue has no valid verdict")
+        idx = issue.get("comment_indices")
+        if not isinstance(idx, list) or not idx:
+            raise LabelError("an issue has no comment indices")
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in idx):
+            raise LabelError("a comment index is not an integer")
+        if any(not 0 <= i < len(pool) for i in idx):
+            raise LabelError("a comment index is out of range")
+        seen += idx
+    if len(seen) != len(set(seen)):
+        raise LabelError("a comment appears in more than one issue")
+    missing = draft_idx - set(seen)
+    if missing:
+        raise LabelError(f"{len(missing)} draft(s) not labeled")
+
+
 async def label_phase(
     manifest: dict,
     unit_runs: dict[str, UnitRun],
@@ -537,6 +662,7 @@ async def label_phase(
                 _expect.reset(token)
             if state.stop:
                 raise ReplayStop(state.stop, state.detail)
+            check_label_record(record, len(comments))  # raises -> terminal label error
             return {"judge": record}
 
         results[key] = await _once(out, f"label__{key.replace('|', '__')}", state, _label)
@@ -608,6 +734,16 @@ def unit_run_outcomes(
                 "reason": res["judge"]["error"][:200],
             }
         else:
+            try:
+                check_label_record(res["judge"], len(ur.drafts))
+            except LabelError as exc:
+                out[key] = {
+                    "complete": False,
+                    "label_required": True,
+                    "status": "label_invalid",
+                    "reason": str(exc),
+                }
+                continue
             out[key] = {"complete": True, "label_required": True, "status": "complete_labeled"}
     return out
 
@@ -633,7 +769,7 @@ def analyze(
             else {}
         )
         for i, d in enumerate(ur.drafts):
-            lk = links.get(i, {"verdict": "unlabeled", "golden": []})
+            lk = links[i]  # check_label_record guarantees every draft is labeled
             gold_e = [g for g in lk["golden"] if g in E]
             rows.append(
                 {
@@ -646,6 +782,7 @@ def analyze(
                     "C": gold_e if lk["verdict"] == "real" else [],
                     "Cu": gold_e if lk["verdict"] == "uncertain" else [],
                     "golden_any": bool(lk["golden"]),
+                    "gold": list(lk["golden"]),
                     "negative_control": bool(NEGATIVE_CONTROL.search(d.get("title", ""))),
                     "anchorable": _anchorable(d, diffs.get(ur.unit_id))
                     if diffs and ur.unit_id in diffs
@@ -654,6 +791,7 @@ def analyze(
             )
 
     reaching = ("critique_deleted", "critique_kept")
+    sets = _golden_sets(rows, E)
     D_C = {g for r in rows for g in r["C"]}
     D_U = {g for r in rows for g in r["Cu"]} - D_C
     A = {g for r in rows if r["stage"] in reaching for g in r["C"]}
@@ -737,7 +875,7 @@ def analyze(
         "wilson95": wilson(len(X), len(A)),
         "downstream_anchorable_deleted": sum(1 for r in deleted_copies if r["anchorable"])
         if diffs
-        else "not computed",
+        else "pending",
         "sensitivity_with_Cu": {"e": len(A_u), "x": len(X_u)},
     }
     if not pre["met"] or len(A) < RULES["crit_recall_min_e"]:
@@ -765,6 +903,22 @@ def analyze(
             if Fraction(dr, dr + dn) >= Fraction(kr, kr + kn) - RULES["crit_precision_margin"]
             else "does not fire"
         )
+    ur_ = sum(r["verdict"] == "uncertain" for r in rows if r["stage"] == "critique_deleted")
+    uk_ = sum(r["verdict"] == "uncertain" for r in rows if r["stage"] == "critique_kept")
+    sens: dict[str, Any] = {
+        "deleted": _ratio(dr, dr + dn + ur_),
+        "kept": _ratio(kr, kr + kn + uk_),
+    }
+    if not pre["met"] or dr + dn + ur_ < m or kr + kn + uk_ < m:
+        sens["result"] = "not evaluable"
+    else:
+        sens["result"] = (
+            "fires"
+            if Fraction(dr, dr + dn + ur_)
+            >= Fraction(kr, kr + kn + uk_) - RULES["crit_precision_margin"]
+            else "does not fire"
+        )
+    rp["sensitivity_uncertain_as_not_real"] = sens
     rules["R-crit-precision"] = rp
     rules["critique-side-candidate"] = {
         "result": "fires"
@@ -781,8 +935,10 @@ def analyze(
     rf: dict[str, Any] = {"precondition": pre}
     for name, rs in groups.items():
         real, nr, n = judged(rs)
+        unc = sum(r["verdict"] == "uncertain" for r in rs)
         rf[name] = {
             "not_real_share": _ratio(nr, real + nr),
+            "sensitivity_uncertain_as_not_real": _ratio(nr + unc, real + nr + unc),
             "drafts": n,
             "result": "reported"
             if pre["met"] and real + nr >= RULES["fp_min_judged"]
@@ -827,14 +983,79 @@ def analyze(
             )
         rules["R-intermittent"] = ri
 
+    # Full-golden sensitivity: the same rules over every golden id, invalid anchor included.
+    full = _golden_sets(rows, set(manifest["sensitivity_golden"]))
+    rules["sensitivity_full_golden"] = {
+        "denominator": len(manifest["sensitivity_golden"]),
+        "d": len(full["D_C"]),
+        "d_plus": len(full["D_C"]) + len(full["D_U"]),
+        "e": len(full["A"]),
+        "x": len(full["X"]),
+        "R-draft": "not evaluable"
+        if rd["result"] == "not evaluable"
+        else (
+            "low drafting coverage"
+            if Fraction(len(full["D_C"]) + len(full["D_U"]), len(manifest["sensitivity_golden"]))
+            <= RULES["draft_low_coverage"]
+            else "not low"
+        ),
+        "R-crit-recall": "not evaluable"
+        if not rr["precondition"]["met"] or len(full["A"]) < RULES["crit_recall_min_e"]
+        else (
+            "fires"
+            if Fraction(len(full["X"]), len(full["A"])) >= RULES["crit_recall_fires"]
+            else "does not fire"
+        ),
+    }
+    assert sets["D_C"] == D_C and sets["A"] == A and sets["X"] == X  # one definition, two uses
+    pending = [] if diffs else ["downstream anchorability (no hash-verified saved diffs supplied)"]
     return {
-        "schema": "hai-12817-study-report-v1",
+        "schema": "hai-12817-study-report-v2",
         "design": manifest["design"],
         "missingness": outcomes,
         "rules": rules,
+        "pending": pending,
         "rows": rows,
         "note": "Exploratory measurement. Not parity, release or acceptance evidence; binding gates unchanged.",
     }
+
+
+def _golden_sets(rows: list[dict], eligible: set[str]) -> dict[str, set[str]]:
+    """D_C, D_U, A and X (plan v3 §6.2) over a frozen golden set E."""
+    reaching = ("critique_deleted", "critique_kept")
+
+    def c(r: dict) -> list[str]:
+        return [g for g in r["gold"] if g in eligible] if r["verdict"] == "real" else []
+
+    def cu(r: dict) -> list[str]:
+        return [g for g in r["gold"] if g in eligible] if r["verdict"] == "uncertain" else []
+
+    D_C = {g for r in rows for g in c(r)}
+    D_U = {g for r in rows for g in cu(r)} - D_C
+    A = {g for r in rows if r["stage"] in reaching for g in c(r)}
+    X = {
+        g
+        for g in A
+        if all(
+            r["stage"] == "critique_deleted" for r in rows if g in c(r) and r["stage"] in reaching
+        )
+    }
+    return {"D_C": D_C, "D_U": D_U, "A": A, "X": X}
+
+
+def saved_diffs(out: Path, run_artifact: dict, unit_ids: set[str]) -> dict[str, str] | None:
+    """Hash-verified saved diffs, or None when any is absent. A mismatch is an error."""
+    ddir = out / "private" / "diffs"
+    found = {}
+    for uid in sorted(unit_ids):
+        path = ddir / f"{uid}.diff"
+        if not path.exists():
+            return None
+        text = path.read_text()
+        if _sha(text.encode()) != run_artifact["snapshots"][uid]["diff_sha256"]:
+            raise StudyError(f"{uid}: saved diff hash differs from the capture run")
+        found[uid] = text
+    return found
 
 
 def _unit_golden(manifest: dict, unit_id: str) -> set[str]:
@@ -902,7 +1123,11 @@ def cmd_capture(args: argparse.Namespace) -> int:  # pragma: no cover - live onl
     for name in ("capture-run.json", "capture.started", "STOP.json"):
         if (out / name).exists():
             raise SystemExit(f"refusing: {name} exists (no replacement capture)")
-    from .critique_replay import _hickory_cli
+    verify_runtime(manifest)
+    from .critique_replay import LiveState, _hickory_cli
+
+    state = LiveState()
+    state.restore(out)
 
     cli = _hickory_cli()
     cli._isolate_index("")
@@ -941,7 +1166,7 @@ def cmd_capture(args: argparse.Namespace) -> int:  # pragma: no cover - live onl
                 units,
                 cfg,
                 os.environ["GITHUB_TOKEN"],
-                meter=ledger.capture_meter(),
+                meter=ledger.capture_meter(state),
                 inputs={"split": "development", "study_manifest": manifest["head"]},
             )
         )
@@ -989,6 +1214,7 @@ def cmd_label(args: argparse.Namespace) -> int:  # pragma: no cover - live only
     manifest = json.loads((out / "study-manifest.json").read_text())
     if manifest != build_manifest(DESIGN_S, manifest["head"], Path(args.manifest)):
         raise SystemExit("study manifest no longer matches the frozen design")
+    verify_runtime(manifest)
     run_artifact = json.loads((out / "capture-run.json").read_text())
     unit_runs = load_capture(manifest, out / "private" / "capture.jsonl", run_artifact)
     from .critique_replay import LiveState, _hickory_cli, guard
@@ -1034,9 +1260,9 @@ def cmd_report(args: argparse.Namespace) -> int:
     manifest = json.loads((out / "study-manifest.json").read_text())
     run_artifact = json.loads((out / "capture-run.json").read_text())
     unit_runs = load_capture(manifest, out / "private" / "capture.jsonl", run_artifact)
-    print(
-        json.dumps(analyze(manifest, unit_runs, load_labels(manifest, out)), indent=1, default=str)
-    )
+    diffs = saved_diffs(out, run_artifact, {k.split("|")[0] for k in manifest["unit_runs"]})
+    report = analyze(manifest, unit_runs, load_labels(manifest, out), diffs)
+    print(json.dumps(report, indent=1, default=str))
     return 0
 
 
