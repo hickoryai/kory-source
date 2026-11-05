@@ -591,3 +591,77 @@ async def test_as_of_commit_is_reported_unsupported_not_echoed_as_proof(reg, wor
     assert "not supported" in out["limits"][0]
     current = svc.decision_history(REPO, ["src/app/auth.py"], [], rp.reader())
     assert current["verdict"] == "history"
+
+
+# ── mutation reach through HTTP and MCP (re-review) ─────────────────────
+
+
+async def _visible_proposal_conflicting_with_protected(reg, world) -> str:
+    out = await reg.put_object(
+        {
+            "kind": "decision",
+            "title": "Visible proposal",
+            "repo": REPO,
+            "session": "s",
+            "branch": "bp",
+        },
+        Actor("human", "author-1"),
+    )
+    p = out["object"]["id"]
+    reg.relate(p, world["D"], "conflicts_with", HUMAN, access=rp.reader())
+    return p
+
+
+async def test_http_resolve_cannot_reach_a_protected_target(reg, world):
+    p = await _visible_proposal_conflicting_with_protected(reg, world)
+    admin = _app(SimpleNamespace(id=1, username="admin", is_admin=True))  # admin, not listed
+    r = admin.post(f"/api/registry/objects/{p}/resolve", json={"choice": "supersede"})
+    assert r.status_code == 404
+    assert world["D"] not in r.text
+    assert reg.get(world["D"])["status"] == "approved"
+    assert reg.get(p)["status"] == "proposed"
+    detail = admin.get(f"/api/registry/objects/{p}").json()
+    assert all(world["D"] not in reason for reason in detail["unresolved"])
+    member = _app(SimpleNamespace(id=7, username="m", is_admin=True))  # listed in the policy
+    ok = member.post(f"/api/registry/objects/{p}/resolve", json={"choice": "supersede"})
+    assert ok.status_code == 200, ok.text
+    assert reg.get(world["D"])["status"] == "superseded"
+
+
+async def test_mcp_resolve_cannot_reach_a_protected_target(reg, world, monkeypatch):
+    from mira.registry import install
+
+    monkeypatch.setenv("REGISTRY_JWT_SECRET", "test-secret-of-adequate-length-123")
+    p = await _visible_proposal_conflicting_with_protected(reg, world)
+    app = FastAPI()
+    install(app)
+    client = TestClient(app)
+
+    def resolve(sub: str) -> dict:
+        tok = jwt.encode(
+            {"kind": "human", "sub": sub, "exp": int(time.time() + 600)},
+            "test-secret-of-adequate-length-123",
+            algorithm="HS256",
+        )
+        r = client.post(
+            "/mcp",
+            headers={"Authorization": f"Bearer {tok}"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "resolve_conflict",
+                    "arguments": {"id": p, "choice": "supersede"},
+                },
+            },
+        )
+        return r.json()["result"]
+
+    denied = resolve("unlisted-user")
+    assert denied["isError"] is True
+    assert denied["content"][0]["text"] == f"no registry object {p}"
+    assert reg.get(world["D"])["status"] == "approved"
+    ok = resolve(rp.READER_SUB)
+    assert ok["isError"] is False
+    assert reg.get(world["D"])["status"] == "superseded"
