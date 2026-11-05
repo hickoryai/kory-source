@@ -13,9 +13,17 @@ Linear: the client refuses any GraphQL mutation. It has three parts:
   stopped and a replayed page is a no-op. Issues still waiting on a link target
   are re-read at the end of each issue walk.
 
-Run with ``python -m mira.registry.linear inventory|import``. It covers every team
-in the workspace and every state, archived and trashed included; ``--team KEY``
-narrows it to the named teams. ``import`` is a dry run unless ``--apply`` is given.
+Run with ``python -m mira.registry.linear inventory|import``. It covers every
+team the corpus access policy enumerates (HAI-12825) and every state, archived
+and trashed included; ``--team KEY`` narrows it to named manifest teams. A team
+the workspace has but the manifest does not list is reported to the operator and
+never fetched or stored: a new team needs approval first. ``import`` is a dry
+run unless ``--apply`` is given. Both need ``REGISTRY_IMPORT_OPERATOR`` to name
+an operator the policy approves.
+
+Each issue description and comment is also kept as an immutable source
+revision with its author, bot, and invoker attribution (``provenance.py``), so
+a later edit adds a revision instead of erasing what was there.
 """
 
 from __future__ import annotations
@@ -32,12 +40,18 @@ from datetime import datetime
 
 import httpx
 
+from mira.registry import attribution as attr
+from mira.registry.access import AccessContext, AccessDenied, CorpusPolicy, require_import
+from mira.registry.imports import ImportRuns, ReadOnlyViolation, assert_read_only_graphql
 from mira.registry.model import Actor
+from mira.registry.provenance import ProvenanceStore, SourceRevision
 from mira.registry.service import Registry
 
 logger = logging.getLogger(__name__)
 
 SOURCE_SYSTEM = "linear"
+IMPORTER = "kory-source.linear"
+IMPORTER_VERSION = "2"
 DEFAULT_ENDPOINT = "https://api.linear.app/graphql"
 IMPORT_ACTOR = Actor("human", "linear-import")
 PAGE_SIZE = 50
@@ -67,8 +81,10 @@ query RegistryIssues($filter: IssueFilter!, $after: String, $first: Int!) {
   issues(filter: $filter, after: $after, first: $first, orderBy: updatedAt, includeArchived: true) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id identifier title description url updatedAt archivedAt trashed
-      team { key }
+      id identifier title description url createdAt updatedAt archivedAt trashed
+      team { id key }
+      creator { id displayName email app }
+      botActor { id name type subType userDisplayName }
       state { type }
       assignee { displayName email }
       project { id }
@@ -87,9 +103,10 @@ query RegistryComments($filter: CommentFilter!, $after: String, $first: Int!) {
   comments(filter: $filter, after: $after, first: $first, orderBy: updatedAt, includeArchived: true) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id body url createdAt updatedAt archivedAt
-      user { displayName email }
-      issue { id team { key } }
+      id body url createdAt updatedAt editedAt archivedAt
+      user { id displayName email app }
+      botActor { id name type subType userDisplayName }
+      issue { id team { id key } }
     }
   }
 }
@@ -177,8 +194,10 @@ class LinearClient:
         )
 
     def query(self, document: str, variables: dict) -> dict:
-        if document.lstrip().lower().startswith("mutation"):
-            raise LinearError("the Linear import client is read-only")
+        try:
+            assert_read_only_graphql(document)
+        except ReadOnlyViolation as exc:
+            raise LinearError(f"the Linear import client is read-only: {exc}") from None
         last = ""
         for attempt in range(MAX_ATTEMPTS):
             try:
@@ -313,16 +332,38 @@ def _comment_team(node: dict) -> str:
     return (((node.get("issue") or {}).get("team")) or {}).get("key") or ""
 
 
+def _admitted(policy: CorpusPolicy, team: dict | None) -> bool:
+    team = team or {}
+    return policy.admits_linear_team(team_id=team.get("id") or "", key=team.get("key") or "")
+
+
+def manifest_teams(policy: CorpusPolicy, teams: list[str] | None) -> list[str]:
+    """The team keys to walk: the manifest, or the requested subset of it."""
+    if teams is None:
+        return policy.team_keys
+    outside = [t for t in teams if t not in policy.team_keys]
+    if outside:
+        raise AccessDenied("a requested Linear team is not in the approved corpus manifest")
+    return list(teams)
+
+
 # ── inventory ───────────────────────────────────────────────────────────
 
 
-def inventory(client: LinearClient, teams: list[str] | None = None) -> dict:
-    """Count what Linear holds for ``teams`` (``None``: all) and name what the importer skips."""
-    team_rows = [
-        n
-        for nodes, _ in client.pages(TEAMS_QUERY, "teams", {})
-        for n in nodes
-        if not teams or n.get("key") in teams
+def inventory(
+    client: LinearClient, teams: list[str] | None = None, *, access: AccessContext
+) -> dict:
+    """Count what Linear holds for the manifest teams and name what the importer skips.
+
+    Operator-only output: ``unapproved_teams`` names workspace teams the
+    manifest does not list. Their content is never read.
+    """
+    policy = require_import(access)
+    teams = manifest_teams(policy, teams)
+    all_teams = [n for nodes, _ in client.pages(TEAMS_QUERY, "teams", {}) for n in nodes]
+    team_rows = [n for n in all_teams if n.get("key") in teams and _admitted(policy, n)]
+    unapproved = [
+        {"id": n.get("id"), "key": n.get("key")} for n in all_teams if not _admitted(policy, n)
     ]
     issues: Counter[str] = Counter()
     states: Counter[str] = Counter()
@@ -385,12 +426,18 @@ def inventory(client: LinearClient, teams: list[str] | None = None) -> dict:
         exceptions.append(
             f"comments: {comments['not_on_issue']} on documents, projects or updates; not imported"
         )
-    if teams:
+    if unapproved:
         exceptions.append(
-            "team filter: documents and comments not attached to an issue of the named teams "
-            "are not counted; run without --team to count the whole workspace"
+            f"teams: {len(unapproved)} workspace teams are not in the approved corpus manifest; "
+            "they were not read and need data-owner approval before import"
         )
+    exceptions.append(
+        "documents and comments not attached to an issue of a manifest team are not counted"
+    )
     return {
+        "corpus_id": policy.corpus_id,
+        "policy_version": policy.policy_version,
+        "unapproved_teams": unapproved,
         "teams": [
             {"key": t.get("key"), "name": t.get("name"), "archived": bool(t.get("archivedAt"))}
             for t in team_rows
@@ -429,20 +476,61 @@ class LinearImporter:
         client: LinearClient,
         teams: list[str] | None = None,
         *,
+        access: AccessContext,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.registry = registry
         self.client = client
-        self.teams = teams
+        self.requested_teams = teams
+        self.access = access
         self.clock = clock
+        self.provenance = ProvenanceStore(registry)
+        self.runs = ImportRuns(registry)
+        self.policy: CorpusPolicy | None = None
+        self.teams: list[str] = []
+        self._run: dict | None = None
+
+    def _policy(self) -> CorpusPolicy:
+        assert self.policy is not None, "run() checks the policy first"
+        return self.policy
+
+    def _active_run(self) -> dict:
+        assert self._run is not None, "evidence is written only on --apply"
+        return self._run
+
+    @property
+    def corpus(self) -> tuple[str, str]:
+        assert self.policy is not None
+        return self.policy.corpus_id, self.policy.policy_version
 
     def run(self, *, apply: bool = False) -> dict:
-        return {
-            "apply": apply,
-            "issues": self._walk("issues", apply),
-            "comments": self._walk("comments", apply),
-            "sync_status": self.registry.sync_status(SOURCE_SYSTEM),
-        }
+        # Scope is checked before any Linear call: a rejected team is never fetched.
+        self.policy = require_import(self.access)
+        self.teams = manifest_teams(self.policy, self.requested_teams)
+        out: dict = {"apply": apply, "corpus_id": self.policy.corpus_id}
+        for stream in ("issues", "comments"):
+            self._run = None
+            if apply:
+                self._run = self.runs.start(
+                    self.access,
+                    source_system=SOURCE_SYSTEM,
+                    stream=stream,
+                    importer=IMPORTER,
+                    importer_version=IMPORTER_VERSION,
+                    scope={"teams": sorted(self.teams), "manifest": self.policy.manifest_sha256},
+                )
+            try:
+                out[stream] = self._walk(stream, apply)
+            except Exception as exc:
+                if self._run is not None:
+                    self.runs.finish(self._run, complete=False, errors=[str(exc)])
+                raise
+            if self._run is not None:
+                done = self.runs.finish(self._run, complete=True, errors=out[stream]["errors"])
+                out[stream]["run_id"] = done["run_id"]
+                out[stream]["run_status"] = done["status"]
+        out["sync_status"] = self.registry.sync_status(SOURCE_SYSTEM, self.access)
+        return out
 
     # state rows
 
@@ -515,8 +603,11 @@ class LinearImporter:
             ids = pending[start : start + PENDING_BATCH]
             filt = _and(_team_filter(self.teams), {"id": {"in": ids}})
             for nodes, _ in self.client.pages(ISSUES_QUERY, "issues", filt):
-                items = [issue_item(n) for n in nodes]
-                results = self.registry.import_items(SOURCE_SYSTEM, items, IMPORT_ACTOR)
+                kept = [n for n in nodes if _admitted(self._policy(), n.get("team"))]
+                items = [issue_item(n) for n in kept]
+                results = self.registry.import_items(
+                    SOURCE_SYSTEM, items, IMPORT_ACTOR, corpus=self.corpus
+                )
                 counts["read"] += len(results)
                 for res in results:
                     if res["outcome"] == "error" or res.get("link_errors"):
@@ -538,30 +629,119 @@ class LinearImporter:
     ) -> None:
         for nodes, end_cursor in self.client.pages(document, stream, filt, after):
             if stream == "issues":
-                items = [issue_item(n) for n in nodes]
-                totals["read"] += len(items)
-                results = (
-                    self.registry.import_items(SOURCE_SYSTEM, items, IMPORT_ACTOR) if apply else []
+                kept = [n for n in nodes if _admitted(self._policy(), n.get("team"))]
+                totals["read"] += len(kept)
+                if len(nodes) > len(kept):
+                    totals["excluded_outside_manifest"] += len(nodes) - len(kept)
+                if not apply:
+                    continue
+                with self.runs.page(self._active_run(), self.access) as counts:
+                    self._issue_evidence(kept, counts)
+                results = self.registry.import_items(
+                    SOURCE_SYSTEM, [issue_item(n) for n in kept], IMPORT_ACTOR, corpus=self.corpus
                 )
             else:
                 kept = [
                     n
                     for n in nodes
-                    if n.get("issue") and (not self.teams or _comment_team(n) in self.teams)
+                    if n.get("issue")
+                    and _admitted(self._policy(), (n.get("issue") or {}).get("team"))
+                    and _comment_team(n) in self.teams
                 ]
                 totals["read"] += len(kept)
                 totals["skipped_other_team_or_not_on_issue"] += len(nodes) - len(kept)
-                items = [comment_item(n) for n in kept]
-                results = self.registry.import_comments(SOURCE_SYSTEM, items) if apply else []
+                if not apply:
+                    continue
+                with self.runs.page(self._active_run(), self.access) as counts:
+                    self._comment_evidence(kept, counts)
+                results = self.registry.import_comments(
+                    SOURCE_SYSTEM, [comment_item(n) for n in kept], corpus_id=self.corpus[0]
+                )
             for res in results:
                 totals[res["outcome"]] += 1
                 if res["outcome"] == "error" or res.get("link_errors"):
                     errors.append(res)
                 if res.get("sync_status") == "pending_links":
                     totals["pending_links"] += 1
-            if apply and end_cursor:
+            if end_cursor:
                 st["after_cursor"] = end_cursor
                 self._save(stream, st)
+
+    # immutable evidence
+
+    def _store(self, rev: SourceRevision, attrs: list, counts: Counter[str]) -> None:
+        assert self._run is not None
+        eid, created = self.provenance.record_revision(
+            rev, corpus=self.corpus, run_id=self._run["run_id"]
+        )
+        counts["fetched_versions"] += 1
+        counts["stored_evidence" if created else "duplicate_evidence"] += 1
+        tool = attr.tool_attribution(
+            "importer",
+            eid,
+            identity=self.access.principal,
+            version=f"{IMPORTER}/{IMPORTER_VERSION}",
+        )
+        for a in attrs:
+            for state in a.field_states().values():
+                counts[
+                    "unknown_fields" if state["state"] == "unknown" else "attributed_fields"
+                ] += 1
+        self.provenance.record_attributions([*attrs, tool], corpus_id=self.corpus[0])
+
+    def _issue_evidence(self, nodes: list[dict], counts: Counter[str]) -> None:
+        for node in nodes:
+            text = node.get("description") or ""
+            team = node.get("team") or {}
+            rev = SourceRevision(
+                SOURCE_SYSTEM,
+                "linear_issue_description",
+                node["id"],
+                text,
+                source_url=node.get("url") or "",
+                source_labels={
+                    "identifier": node.get("identifier"),
+                    "title": node.get("title"),
+                    "team_id": team.get("id"),
+                    "team_key": team.get("key"),
+                },
+                payload={k: node.get(k) for k in ("creator", "botActor", "archivedAt", "trashed")},
+                source_version=str(version(node.get("updatedAt"))),
+                source_created_at=to_epoch(node.get("createdAt")),
+                source_updated_at=to_epoch(node.get("updatedAt")),
+            )
+            counts["discovered"] += 1
+            found = attr.markers(text)
+            attrs = attr.linear_actor(rev.evidence_id, node, user_key="creator")
+            attrs += attr.from_markers(rev.evidence_id, found)
+            author = attr.author_from_account(attrs[0], found)
+            if author is not None:
+                attrs.append(author)
+            self._store(rev, attrs, counts)
+
+    def _comment_evidence(self, nodes: list[dict], counts: Counter[str]) -> None:
+        for node in nodes:
+            text = node.get("body") or ""
+            rev = SourceRevision(
+                SOURCE_SYSTEM,
+                "linear_comment",
+                node["id"],
+                text,
+                parent_source_id=(node.get("issue") or {}).get("id") or "",
+                source_url=node.get("url") or "",
+                payload={k: node.get(k) for k in ("user", "botActor", "archivedAt", "editedAt")},
+                source_version=str(version(node.get("updatedAt"))),
+                source_created_at=to_epoch(node.get("createdAt")),
+                source_updated_at=to_epoch(node.get("updatedAt")),
+            )
+            counts["discovered"] += 1
+            found = attr.markers(text)
+            attrs = attr.linear_actor(rev.evidence_id, node, user_key="user")
+            attrs += attr.from_markers(rev.evidence_id, found)
+            author = attr.author_from_account(attrs[0], found)
+            if author is not None:
+                attrs.append(author)
+            self._store(rev, attrs, counts)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -573,15 +753,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--apply", action="store_true", help="write to the registry")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
+    from mira.registry.access import operator_context
+
+    # Policy first: with no approved operator nothing is fetched from Linear.
+    access = operator_context()
     client = LinearClient.from_env()
     if args.command == "inventory":
-        out = inventory(client, args.team)
+        out = inventory(client, args.team, access=access)
     else:
         from mira.registry import get_registry
 
         registry = get_registry()
         assert registry is not None
-        out = LinearImporter(registry, client, args.team).run(apply=args.apply)
+        out = LinearImporter(registry, client, args.team, access=access).run(apply=args.apply)
     json.dump(out, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
     return 0

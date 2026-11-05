@@ -2,6 +2,11 @@
 
 Only approved objects reach a review: the block and the tool both filter on
 ``status = 'approved'``. Proposals stay out of review context entirely.
+
+Review output is posted on the PR, so both paths read with no corpus access
+context (HAI-12825): imported history from GitHub and Linear never enters a
+review prompt, a tool result, or a PR comment. ``REVIEW_ACCESS`` is that
+context; tests assert it stays empty.
 """
 
 from __future__ import annotations
@@ -13,6 +18,8 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 BLOCK_TITLE = "Kory Source registry (approved decisions and rules)"
+# No corpus membership, ever: see the module docstring.
+REVIEW_ACCESS = None
 _MAX_ENTRIES = 25
 _MAX_TOOL_HITS = 10
 
@@ -84,7 +91,9 @@ def registry_rule(pr_info: Any, paths: Iterable[str]) -> dict[str, str] | None:
     if registry is None:
         return None
     repo = f"{pr_info.owner}/{pr_info.repo}"
-    return render_block(registry.context_for_paths(repo, list(paths), include_proposals=False))
+    return render_block(
+        registry.context_for_paths(repo, list(paths), include_proposals=False, access=REVIEW_ACCESS)
+    )
 
 
 def search_approved(registry: Any, repo: str, args: dict) -> str:
@@ -100,6 +109,7 @@ def search_approved(registry: Any, repo: str, args: dict) -> str:
         symbol=args.get("symbol") or None,
         statuses=("approved",),
         limit=_MAX_TOOL_HITS,
+        access=REVIEW_ACCESS,
     )
     hits = [h for h in hits if h["kind"] in ("decision", "rule", "constraint", "requirement")]
     if not hits:

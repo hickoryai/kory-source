@@ -27,6 +27,7 @@ from mira.registry.uncited import (
     find_uncited,
     linked_tickets,
 )
+from tests import registry_policy as rp
 
 HUMAN = Actor("human", "zane")
 CITED = "reg_0123456789ab"
@@ -236,6 +237,21 @@ def test_findings_contract_for_pr_body_without_a_registry():
         assert f.body.startswith("The pull request body, line ")
         assert "does not block the merge" in f.body
     assert '"We decided to cache tokens for ten minutes."' in findings[0].body
+
+
+@pytest.fixture(autouse=True)
+def reviewer_may_read_linear():
+    """The deployment policy explicitly lets the PR reviewer read Linear mirrors."""
+    with rp.policy(rp.manifest(legacy_reviewer_sources=["linear"])):
+        yield
+
+
+def test_linear_mirror_is_not_read_unless_the_policy_lists_it(reg: Registry):
+    reg.import_items("linear", [_issue("HAI-901", "We decided to rotate keys weekly.")], HUMAN)
+    with rp.policy():  # approved corpus, but no legacy_reviewer_sources
+        assert [f for f in advisory_findings(_pr()) if "Linear" in f.body] == []
+    with rp.policy(None):  # no policy at all
+        assert [f for f in advisory_findings(_pr()) if "Linear" in f.body] == []
 
 
 def test_linked_linear_mirror_is_read_and_cited_lines_skipped(reg: Registry):

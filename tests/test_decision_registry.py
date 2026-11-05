@@ -239,7 +239,9 @@ async def test_import_replay_is_idempotent_and_versioned(reg):
     # Exact replay: nothing changes, no duplicate objects or links.
     third = reg.import_items("linear", items, HUMAN)
     assert {r["outcome"] for r in third} == {"unchanged"}
-    assert len(reg.works()) == 3
+    # Unclassified imported rows are denied to every caller (HAI-12825).
+    assert reg.works() == []
+    assert len(reg._select("kind = 'work'")) == 3
     assert len(reg.relationships(child["id"], direction="out", type="blocks")) == 1
 
     # Older version ignored; newer updates the row and replaces its links.
@@ -256,7 +258,7 @@ async def test_import_replay_is_idempotent_and_versioned(reg):
     assert child["title"] == "Child v2"
     assert reg.relationships(child["id"], direction="out", type="blocks") == []
     assert len(reg.relationships(child["id"], direction="out", type="relates")) == 1
-    assert reg.sync_status("linear") == {"synced": 3}
+    assert reg.sync_status("linear") == {}
 
 
 async def test_imported_claims_are_proposed_and_never_expire(reg, clock):
@@ -282,7 +284,7 @@ async def test_imported_claims_are_proposed_and_never_expire(reg, clock):
 # ── realization and merge ───────────────────────────────────────────────
 
 
-async def test_branch_events_drive_realization_to_approval(reg):
+async def test_branch_events_drive_realization_but_a_merge_never_approves(reg):
     obj = (await reg.put_object(claim(title="Unrelated", body="Cache the list."), AGENT))["object"]
     assert obj["conflict_check"] == "done"
     observe_github("push", {"ref": "refs/heads/feat/apps", "repository": {"full_name": REPO}}, reg)
@@ -291,12 +293,12 @@ async def test_branch_events_drive_realization_to_approval(reg):
     assert reg.get(obj["id"])["realization"] == "submitted"
     observe_github("pull_request", merge_event("feat/apps"), reg)
     done = reg.get(obj["id"])
+    # HAI-12825 authority policy: a merge is realization, not approval.
     assert (done["status"], done["realization"], done["basis"]) == (
-        "approved",
+        "proposed",
         "merged",
-        "merged_pr",
+        "statement",
     )
-    assert done["decided_by"] == AGENT.sub
     assert done["merge_commit"] == "abc123"
     assert done["pr"].endswith("/pull/7")
 
@@ -503,6 +505,7 @@ async def test_work_context_order_and_view(reg):
 async def test_get_context_ranks_merged_approval_above_stated_proposal(reg):
     merged = (await reg.put_object(claim(title="Merged", body="Cache."), AGENT))["object"]
     observe_github("pull_request", merge_event("feat/apps"), reg)
+    reg.approve(merged["id"], HUMAN)
     stated = (await reg.put_object(claim(title="Stated", body="Log.", branch="feat/2"), HUMAN))[
         "object"
     ]

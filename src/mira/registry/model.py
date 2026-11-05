@@ -32,6 +32,8 @@ EVIDENCE_RESULTS = ("pass", "fail", "inconclusive")
 
 RELATIONSHIP_TYPES = (
     "supersedes",
+    "corrects",
+    "compatible_with",
     "constrains",
     "derived_from",
     "conflicts_with",
@@ -53,6 +55,16 @@ WORK_LINKS = {
 }
 
 CONFLICT_RELATIONS = ("narrows", "widens", "reverses")
+
+# HAI-12825. Directed ancestry: newer or correcting revision -> older or corrected
+# revision. Their UNION must stay acyclic. Every other relationship is a
+# cross-link that may form a cycle and is traversed with visited sets.
+ANCESTRY_TYPES = ("supersedes", "corrects")
+# Semantic links with no direction of authority: either endpoint retrieves them,
+# and A->B plus B->A is one pair with two evidence records.
+SYMMETRIC_TYPES = ("compatible_with", "conflicts_with")
+# Relationship states that are audit records only, outside the operative DAG.
+INACTIVE_REL_STATUSES = ("rejected", "withdrawn", "kept_existing")
 EXPIRY_DAYS = 14
 
 _APPROVAL_WEIGHT = {

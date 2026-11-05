@@ -1,0 +1,7 @@
+{
+  "commits": [
+    {"message": "Add design notes\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", "files": {"docs/design.md": "# Design\n\n## Decisions\n- Registry rows carry a corpus id.\n", "src/app/auth.py": "def login(user):\n    # Decision: sessions last seven days.\n    return user\n", "tools/run.zig": "// we decided zig\n"}},
+    {"message": "Revise design notes", "files": {"docs/design.md": "# Design\n\n## Decisions\n- Registry rows carry a corpus id.\n- Merges are realization only.\n"}},
+    {"message": "Move auth", "rename": ["src/app/auth.py", "src/app/session.py"]}
+  ]
+}

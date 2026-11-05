@@ -1,8 +1,13 @@
 """The registry service: objects, relationships, lifecycle, and reads.
 
-Approval status is set by people (or by a clean merge of an agent proposal).
+Approval status is set by people. A merge is realization only: it never
+approves a proposal or applies a supersession (HAI-12825 authority policy).
 Realization is derived from branch and PR events. Confidence is recomputed on
 every write and never accepted from a caller.
+
+Every read and every mutation that names an object takes an ``access``
+context (``mira.registry.access``). Without one, imported corpus rows are
+invisible and indistinguishable from absent ones.
 """
 
 from __future__ import annotations
@@ -13,16 +18,22 @@ import logging
 import re
 import secrets
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
+from mira.registry import access as _access
+from mira.registry.access import AccessContext
+from mira.registry.authority import CycleError, check_ancestry_edge, check_symmetric, pair_key
 from mira.registry.conflicts import MAX_CANDIDATES, Judge
 from mira.registry.db import RegistryDB, is_unique_violation
 from mira.registry.model import (
+    ANCESTRY_TYPES,
     CLAIM_KINDS,
     DELIVERY_STATES,
     EVIDENCE_RESULTS,
     EXPIRY_DAYS,
+    INACTIVE_REL_STATUSES,
     KINDS,
     RELATIONSHIP_TYPES,
     WORK_LINKS,
@@ -79,6 +90,10 @@ COLUMNS = (
     "created_at",
     "updated_at",
     "restored_at",
+    "corpus_id",
+    "policy_version",
+    "authority_tier",
+    "decision_revision",
 )
 _COLS = ", ".join(COLUMNS)
 _REL_COLS = (
@@ -95,6 +110,8 @@ _REL_COLS = (
     "created_at",
     "resolved_by",
     "resolved_at",
+    "corpus_id",
+    "pair_key",
 )
 
 # Fields a caller may set. Everything else is derived or comes from the actor.
@@ -119,7 +136,8 @@ _CALLER_FIELDS = {
 }
 _INPUT_ONLY = {"kind", "concepts", "anchors"}
 _CALLER_BASES = ("statement", "repository_analysis")
-# Unresolved conflict checks: a pending, capped, or failed check blocks auto-approval.
+# Unresolved conflict checks: a pending, capped, or failed check keeps a merge
+# ``merged_with_conflict`` (HAI-12825: a merge never approves).
 _OPEN_CHECKS = ("pending", "partial", "failed")
 _REALIZED = ("in_progress", "submitted", "merged", "merged_with_conflict")
 # Approval queue: further-realized proposals first, because a merge already happened.
@@ -133,6 +151,16 @@ _REALIZATION_RANK = {
 }
 _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _DAY = 86400.0
+# PostgreSQL advisory lock serializing ancestry validation with its write, so
+# two concurrent inverse edges cannot both pass the cycle check.
+_ANCESTRY_LOCK = 1282_5002
+# Rows any caller may see: direct registry objects and non-corpus legacy mirrors.
+# The values are module constants, so inlining them is not an injection path.
+_LEGACY_ONLY = "corpus_id = '' AND source_system IN ({})".format(
+    ", ".join(f"'{s}'" for s in _access.LEGACY_VISIBLE_SOURCES)
+)
+# ``_linked`` without filtering: internal callers that never return rows.
+_UNFILTERED: Any = object()
 
 AnchorLookup = Callable[[str, str], "dict | None"]
 
@@ -248,6 +276,22 @@ class Registry:
             raise NotFound(f"no registry object {object_id}")
         return self._row(rows[0])
 
+    def get_visible(self, object_id: str, access: AccessContext | None) -> dict:
+        """``get`` for a caller. An invisible object is ``NotFound``, same words as absent."""
+        try:
+            obj = self.get(object_id)
+        except NotFound:
+            raise NotFound(f"no registry object {object_id}") from None
+        if not _access.visible(obj, access):
+            raise NotFound(f"no registry object {object_id}")
+        return obj
+
+    def _select_visible(
+        self, access: AccessContext | None, where: str = "1=1", params: Iterable = ()
+    ) -> list[dict]:
+        pred, pparams = _access.visible_sql(access)
+        return self._select(f"{pred} AND {where}", [*pparams, *params])
+
     def _select(self, where: str = "1=1", params: Iterable = ()) -> list[dict]:
         rows = self.db.execute(f"SELECT {_COLS} FROM registry_objects WHERE {where}", tuple(params))
         return [self._row(r) for r in rows]
@@ -302,6 +346,10 @@ class Registry:
             created_at=now,
             updated_at=now,
             restored_at=0.0,
+            corpus_id="",
+            policy_version="",
+            authority_tier="",
+            decision_revision=0,
         )
         if kind == "work":
             obj["delivery_state"] = "planned"
@@ -342,49 +390,167 @@ class Registry:
         relation: str = "",
         new_clause: str = "",
         existing_clause: str = "",
+        corpus_id: str = "",
     ) -> None:
         if type not in RELATIONSHIP_TYPES:
             raise RegistryError(f"unknown relationship type {type!r}")
         if source_id == target_id:
             raise RegistryError("an object cannot link to itself")
-        self.db.execute(
-            f"INSERT INTO registry_relationships ({', '.join(_REL_COLS)}) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0) "
-            "ON CONFLICT (source_id, target_id, type) DO UPDATE SET status = excluded.status, "
-            "relation = excluded.relation, new_clause = excluded.new_clause, "
-            "existing_clause = excluded.existing_clause",
-            (
-                new_id("rel_"),
-                source_id,
-                target_id,
-                type,
-                status,
-                relation,
-                new_clause,
-                existing_clause,
-                origin,
-                actor.sub,
-                self.clock(),
-            ),
+        with self._ancestry_guard(type):
+            if type in ANCESTRY_TYPES and status not in INACTIVE_REL_STATUSES:
+                self._check_ancestry(source_id, target_id, type)
+            self.db.execute(
+                f"INSERT INTO registry_relationships ({', '.join(_REL_COLS)}) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?) "
+                "ON CONFLICT (source_id, target_id, type) DO UPDATE SET status = excluded.status, "
+                "relation = excluded.relation, new_clause = excluded.new_clause, "
+                "existing_clause = excluded.existing_clause",
+                (
+                    new_id("rel_"),
+                    source_id,
+                    target_id,
+                    type,
+                    status,
+                    relation,
+                    new_clause,
+                    existing_clause,
+                    origin,
+                    actor.sub,
+                    self.clock(),
+                    corpus_id,
+                    pair_key(source_id, target_id, type),
+                ),
+            )
+
+    @contextmanager
+    def _ancestry_guard(self, type: str = "supersedes") -> Iterator[None]:
+        """Serialize ancestry validation with its write (SQLite: BEGIN IMMEDIATE)."""
+        if type not in ANCESTRY_TYPES:
+            yield
+            return
+        with self.db.transaction():
+            if self.db.postgres:
+                self.db.execute("SELECT pg_advisory_xact_lock(?)", (_ANCESTRY_LOCK,))
+            yield
+
+    def _ancestry_out(self, node: str) -> list[str]:
+        marks = ", ".join("?" for _ in INACTIVE_REL_STATUSES)
+        types = ", ".join("?" for _ in ANCESTRY_TYPES)
+        rows = self.db.execute(
+            f"SELECT target_id FROM registry_relationships WHERE source_id = ? "
+            f"AND type IN ({types}) AND status NOT IN ({marks})",
+            (node, *ANCESTRY_TYPES, *INACTIVE_REL_STATUSES),
         )
+        return [r[0] for r in rows]
+
+    def _check_ancestry(self, source_id: str, target_id: str, type: str) -> None:
+        try:
+            check_ancestry_edge(source_id, target_id, type, self._ancestry_out)
+        except CycleError as exc:
+            raise RegistryError(str(exc)) from None
 
     def _set_rel_status(self, source_id: str, target_id: str, type: str, status: str, by: str):
-        self.db.execute(
-            "UPDATE registry_relationships SET status = ?, resolved_by = ?, resolved_at = ? "
-            "WHERE source_id = ? AND target_id = ? AND type = ?",
-            (status, by, self.clock(), source_id, target_id, type),
-        )
+        with self._ancestry_guard(type):
+            if type in ANCESTRY_TYPES and status not in INACTIVE_REL_STATUSES:
+                rows = self.db.execute(
+                    "SELECT status FROM registry_relationships "
+                    "WHERE source_id = ? AND target_id = ? AND type = ?",
+                    (source_id, target_id, type),
+                )
+                if rows and rows[0][0] in INACTIVE_REL_STATUSES:
+                    # Reactivating an audit-only edge: it re-enters the DAG.
+                    self._check_ancestry(source_id, target_id, type)
+            self.db.execute(
+                "UPDATE registry_relationships SET status = ?, resolved_by = ?, resolved_at = ? "
+                "WHERE source_id = ? AND target_id = ? AND type = ?",
+                (status, by, self.clock(), source_id, target_id, type),
+            )
 
-    def _linked(self, object_id: str, type: str, direction: str = "out") -> list[dict]:
+    def _linked(
+        self, object_id: str, type: str, direction: str = "out", access: Any = _UNFILTERED
+    ) -> list[dict]:
         rels = self.relationships(object_id, direction=direction, type=type)
         key = "target_id" if direction == "out" else "source_id"
         out = []
         for rel in rels:
             try:
-                out.append(self.get(rel[key]))
+                obj = self.get(rel[key])
+            except NotFound:
+                continue
+            if access is _UNFILTERED or _access.visible(obj, access):
+                out.append(obj)
+        return out
+
+    def visible_relationships(self, object_id: str, access: AccessContext | None) -> list[dict]:
+        """Relationships of a visible object whose other endpoint is visible too."""
+        out = []
+        for rel in self.relationships(object_id):
+            other = rel["target_id"] if rel["source_id"] == object_id else rel["source_id"]
+            try:
+                if _access.visible(self.get(other), access):
+                    out.append(rel)
             except NotFound:
                 continue
         return out
+
+    def relate(
+        self,
+        source_id: str,
+        target_id: str,
+        type: str,
+        actor: Actor,
+        *,
+        status: str = "proposed",
+        new_clause: str = "",
+        existing_clause: str = "",
+        origin: str = "",
+        corpus_id: str = "",
+        access: AccessContext | None = None,
+    ) -> dict:
+        """Record a decision relationship with relation-specific cycle rules.
+
+        ``supersedes`` / ``corrects`` join the ancestry DAG and are refused if
+        they would close a cycle through either type. ``compatible_with`` /
+        ``conflicts_with`` are symmetric: a B->A submission after A->B joins the
+        existing pair (one relationship, both stances kept as evidence) instead
+        of creating a second link. Mixed cycles across types are valid.
+        """
+        self.get_visible(source_id, access)
+        self.get_visible(target_id, access)
+        if type in ("parent_of", "blocks", "addresses", "records", "verifies", "belongs_to"):
+            raise RegistryError(f"{type} is a work or concept link; use link_work")
+        try:
+            check_symmetric(source_id, target_id, type)
+        except ValueError as exc:
+            raise RegistryError(str(exc)) from None
+        key = pair_key(source_id, target_id, type)
+        if key:
+            rows = self.db.execute(
+                f"SELECT {', '.join(_REL_COLS)} FROM registry_relationships "
+                "WHERE type = ? AND ((source_id = ? AND target_id = ?) "
+                "OR (source_id = ? AND target_id = ?))",
+                (type, source_id, target_id, target_id, source_id),
+            )
+            if rows:
+                rel = self._rel(rows[0])
+                return {**rel, "merged_into_pair": True}
+        self._add_rel(
+            source_id,
+            target_id,
+            type,
+            actor,
+            status=status,
+            origin=origin,
+            new_clause=new_clause,
+            existing_clause=existing_clause,
+            corpus_id=corpus_id,
+        )
+        rows = self.db.execute(
+            f"SELECT {', '.join(_REL_COLS)} FROM registry_relationships "
+            "WHERE source_id = ? AND target_id = ? AND type = ?",
+            (source_id, target_id, type),
+        )
+        return {**self._rel(rows[0]), "merged_into_pair": False}
 
     # ── concepts and anchors ──────────────────────────────────────────
 
@@ -404,9 +570,11 @@ class Registry:
             if name and name.strip():
                 self._add_rel(object_id, self.concept(name, actor)["id"], "belongs_to", actor)
 
-    def link_anchor(self, object_id: str, anchor: dict, actor: Actor) -> dict:
+    def link_anchor(
+        self, object_id: str, anchor: dict, actor: Actor, access: AccessContext | None = None
+    ) -> dict:
         """Tie an object to a symbol. ``anchor_id`` is the HAI-11604 symbol anchor."""
-        obj = self.get(object_id)
+        obj = self.get_visible(object_id, access)
         repo = str(anchor.get("repo") or obj["repo"] or "").strip()
         path = str(anchor.get("path") or "").strip()
         qname = str(anchor.get("qualified_name") or "").strip()
@@ -424,11 +592,11 @@ class Registry:
             raise RegistryError("anchor needs a path or a resolvable anchor_id")
         self.db.execute(
             "INSERT INTO registry_anchors "
-            "(object_id, repo, path, qualified_name, symbol_kind, anchor_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "(object_id, repo, path, qualified_name, symbol_kind, anchor_id, created_at, "
+            "corpus_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (object_id, repo, path, qualified_name) DO UPDATE SET "
             "anchor_id = excluded.anchor_id, symbol_kind = excluded.symbol_kind",
-            (object_id, repo, path, qname, kind, anchor_id, self.clock()),
+            (object_id, repo, path, qname, kind, anchor_id, self.clock(), obj["corpus_id"]),
         )
         return {
             "object_id": object_id,
@@ -554,8 +722,10 @@ class Registry:
     async def put_work(self, fields: dict, actor: Actor) -> dict:
         return (await self.put_object({**fields, "kind": "work"}, actor))["object"]
 
-    def update_work(self, work_id: str, fields: dict, actor: Actor) -> dict:
-        obj = self.get(work_id)
+    def update_work(
+        self, work_id: str, fields: dict, actor: Actor, access: AccessContext | None = None
+    ) -> dict:
+        obj = self.get_visible(work_id, access)
         if obj["kind"] != "work":
             raise RegistryError(f"{work_id} is not a work object")
         if obj["source_system"] == "linear":
@@ -575,12 +745,19 @@ class Registry:
         self._validate(obj)
         return self._write(obj)
 
-    def link_work(self, work_id: str, target_id: str, type: str, actor: Actor) -> dict:
+    def link_work(
+        self,
+        work_id: str,
+        target_id: str,
+        type: str,
+        actor: Actor,
+        access: AccessContext | None = None,
+    ) -> dict:
         """Link work to a requirement, decision, child work, or dependency."""
+        work, target = self.get_visible(work_id, access), self.get_visible(target_id, access)
         if type not in WORK_LINKS:
             raise RegistryError(f"work link type must be one of {', '.join(WORK_LINKS)}")
         source_kind, target_kinds = WORK_LINKS[type]
-        work, target = self.get(work_id), self.get(target_id)
         if work["kind"] != source_kind:
             raise RegistryError(f"{work_id} is a {work['kind']}, not work")
         if target["kind"] not in target_kinds:
@@ -626,13 +803,13 @@ class Registry:
             )
         return False
 
-    def put_evidence(self, fields: dict, actor: Actor) -> dict:
+    def put_evidence(self, fields: dict, actor: Actor, access: AccessContext | None = None) -> dict:
         """Record a verification result for one or more requirements at a revision."""
         requirement_ids = list(fields.get("requirement_ids") or [])
         if not requirement_ids:
             raise RegistryError("evidence must name at least one requirement")
         for rid in requirement_ids:
-            if self.get(rid)["kind"] != "requirement":
+            if self.get_visible(rid, access)["kind"] != "requirement":
                 raise RegistryError(f"{rid} is not a requirement")
         result = str(fields.get("result") or "")
         if result not in EVIDENCE_RESULTS:
@@ -669,8 +846,11 @@ class Registry:
         the cap. Org-scope candidates only fill the remaining slots, ranked by
         word overlap, so a large org rulebook does not cap every check.
         """
+        # Legacy-visible claims only: judgments go back to the caller, so an
+        # imported corpus decision never becomes a candidate here (HAI-12825).
         approved = (
-            "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement')"
+            "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement') "
+            f"AND {_LEGACY_ONLY}"
         )
         own = self.anchors(obj["id"])
         anchor_ids: list[str] = []
@@ -750,7 +930,7 @@ class Registry:
         return judgments
 
     def unresolved(self, obj: dict) -> list[str]:
-        """Why this proposal may not auto-approve. Empty means it may."""
+        """Open conflicts on this proposal. A merge with any is ``merged_with_conflict``."""
         reasons = []
         if obj["conflict_check"] in _OPEN_CHECKS:
             reasons.append(f"conflict check {obj['conflict_check']}")
@@ -807,7 +987,7 @@ class Registry:
             )
         return views
 
-    def session_conflicts(self, session: str) -> dict:
+    def session_conflicts(self, session: str, access: AccessContext | None = None) -> dict:
         """Whether ``session`` still blocks push on an open conflict.
 
         Keep and supersede clear this session. Defer leaves the conflict in
@@ -819,7 +999,8 @@ class Registry:
         if not session:
             raise RegistryError("session is required")
         conflicts = []
-        rows = self._select(
+        rows = self._select_visible(
+            access,
             "session = ? AND status = 'proposed' "
             "AND kind IN ('decision', 'rule', 'constraint', 'requirement')",
             (session,),
@@ -832,9 +1013,10 @@ class Registry:
                 if rel["status"] != "proposed":
                     continue
                 try:
-                    if self.get(rel["target_id"])["status"] != "approved":
-                        continue
+                    target = self.get(rel["target_id"])
                 except NotFound:
+                    continue
+                if target["status"] != "approved" or not _access.visible(target, access):
                     continue
                 conflicts.append(
                     {
@@ -941,9 +1123,13 @@ class Registry:
         return [r for r in results if r is not None]
 
     def _review_candidates(self, repo: str, hunks: dict[str, dict]) -> list[dict]:
-        """Approved claims whose anchored symbol the diff actually touches."""
+        """Approved legacy-visible claims whose anchored symbol the diff touches.
+
+        Review output is posted to the PR, so corpus decisions never enter it.
+        """
         approved = (
-            "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement')"
+            "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement') "
+            f"AND {_LEGACY_ONLY}"
         )
         ranked = []
         seen: set[str] = set()
@@ -967,9 +1153,9 @@ class Registry:
         if not actor.is_human:
             raise Forbidden(f"only a person can {action}")
 
-    def approve(self, object_id: str, actor: Actor) -> dict:
+    def approve(self, object_id: str, actor: Actor, access: AccessContext | None = None) -> dict:
         self._require_human(actor, "approve")
-        obj = self.get(object_id)
+        obj = self.get_visible(object_id, access)
         if obj["status"] != "proposed":
             raise RegistryError(f"{object_id} is {obj['status']}, not proposed")
         open_conflicts = [r for r in self.unresolved(obj) if r.startswith("conflicts_with")]
@@ -982,9 +1168,15 @@ class Registry:
         self._apply_supersedes(object_id, actor)
         return self.get(object_id)
 
-    def reject(self, object_id: str, actor: Actor, reason: str = "") -> dict:
+    def reject(
+        self,
+        object_id: str,
+        actor: Actor,
+        reason: str = "",
+        access: AccessContext | None = None,
+    ) -> dict:
         self._require_human(actor, "reject")
-        obj = self.get(object_id)
+        obj = self.get_visible(object_id, access)
         if obj["status"] != "proposed":
             raise RegistryError(f"{object_id} is {obj['status']}, not proposed")
         obj.update(
@@ -995,9 +1187,9 @@ class Registry:
         )
         return self._write(obj)
 
-    def retire(self, object_id: str, actor: Actor) -> dict:
+    def retire(self, object_id: str, actor: Actor, access: AccessContext | None = None) -> dict:
         self._require_human(actor, "retire")
-        obj = self.get(object_id)
+        obj = self.get_visible(object_id, access)
         if obj["status"] != "approved":
             raise RegistryError(f"{object_id} is {obj['status']}, not approved")
         obj.update(
@@ -1005,23 +1197,37 @@ class Registry:
         )
         return self._write(obj)
 
-    def restore(self, object_id: str, actor: Actor) -> dict:
+    def restore(self, object_id: str, actor: Actor, access: AccessContext | None = None) -> dict:
         """Bring an expired proposal back. Its 14 days restart now."""
         self._require_human(actor, "restore")
-        obj = self.get(object_id)
+        obj = self.get_visible(object_id, access)
         if obj["status"] != "rejected" or obj["status_reason"] != "expired":
             raise RegistryError(f"{object_id} did not expire")
         obj.update(status="proposed", status_reason="", restored_at=self.clock())
         return self._write(obj)
 
-    def supersede(self, new_id: str, old_id: str, actor: Actor) -> dict:
+    def supersede(
+        self, new_id: str, old_id: str, actor: Actor, access: AccessContext | None = None
+    ) -> dict:
         """``new_id`` replaces ``old_id``.
 
         A proposal is replaced now: retired if it never reached code, else
         superseded. An approved object is superseded only when the new one is
-        approved; until then the link is proposed and blocks auto-approval.
+        approved; until then the link is proposed and blocks approval. The
+        cycle check covers the union of ``supersedes`` and ``corrects``.
         """
-        new, old = self.get(new_id), self.get(old_id)
+        return self._ancestry_link(new_id, old_id, "supersedes", actor, access)
+
+    def correct(
+        self, new_id: str, old_id: str, actor: Actor, access: AccessContext | None = None
+    ) -> dict:
+        """``new_id`` corrects ``old_id``: same lifecycle as supersede, kept as its own type."""
+        return self._ancestry_link(new_id, old_id, "corrects", actor, access)
+
+    def _ancestry_link(
+        self, new_id: str, old_id: str, type: str, actor: Actor, access: AccessContext | None
+    ) -> dict:
+        new, old = self.get_visible(new_id, access), self.get_visible(old_id, access)
         for o in (new, old):
             if o["kind"] not in CLAIM_KINDS:
                 raise RegistryError(f"{o['id']} is a {o['kind']}; only claims supersede")
@@ -1029,14 +1235,11 @@ class Registry:
             raise RegistryError(f"{old_id} is already {old['status']}")
         if new["status"] not in ("proposed", "approved"):
             raise RegistryError(f"{new_id} is {new['status']}")
-        if self._reaches(old_id, new_id, "supersedes"):
-            raise RegistryError("that supersession would make a cycle")
         applied = old["status"] == "proposed" or new["status"] == "approved"
-        self._add_rel(
-            new_id, old_id, "supersedes", actor, status="active" if applied else "proposed"
-        )
-        if applied:
-            self._replace(old, actor)
+        with self._ancestry_guard():
+            self._add_rel(new_id, old_id, type, actor, status="active" if applied else "proposed")
+            if applied:
+                self._replace(old, actor)
         return {"new": self.get(new_id), "old": self.get(old_id), "applied": applied}
 
     def _replace(self, old: dict, actor: Actor) -> None:
@@ -1047,19 +1250,24 @@ class Registry:
         self._write(old)
 
     def _apply_supersedes(self, new_id: str, actor: Actor) -> None:
-        for rel in self.relationships(new_id, direction="out", type="supersedes"):
-            if rel["status"] != "proposed":
-                continue
-            old = self.get(rel["target_id"])
-            if old["status"] in ("proposed", "approved"):
-                self._replace(old, actor)
-            self._set_rel_status(new_id, old["id"], "supersedes", "active", actor.sub)
+        """A person approved ``new_id``: its proposed ancestry edges take effect."""
+        self._require_human(actor, "apply a supersession")
+        for type in ANCESTRY_TYPES:
+            for rel in self.relationships(new_id, direction="out", type=type):
+                if rel["status"] != "proposed":
+                    continue
+                old = self.get(rel["target_id"])
+                if old["status"] in ("proposed", "approved"):
+                    self._replace(old, actor)
+                self._set_rel_status(new_id, old["id"], type, "active", actor.sub)
 
-    def resolve_conflict(self, object_id: str, choice: str, actor: Actor) -> dict:
+    def resolve_conflict(
+        self, object_id: str, choice: str, actor: Actor, access: AccessContext | None = None
+    ) -> dict:
         """A person answers keep, supersede, or defer for this proposal's session."""
         if not actor.is_human:
             raise Forbidden("resolve_conflict needs a person; an agent token cannot answer")
-        obj = self.get(object_id)
+        obj = self.get_visible(object_id, access)
         if actor.sub == obj["author"]:
             raise Forbidden("the author of a proposal cannot resolve its conflict")
         if choice not in ("keep", "supersede", "defer"):
@@ -1185,30 +1393,28 @@ class Registry:
         return changed
 
     def _merge(self, obj: dict) -> None:
-        if obj["status"] != "proposed":
-            obj["realization"] = "merged"
-            return
-        if self.unresolved(obj):
+        """A merge records realization only (HAI-12825 authority policy).
+
+        It never approves a proposal and never applies a proposed supersession:
+        a merged PR is not evidence that a person approved the decision in it.
+        """
+        if obj["status"] == "proposed" and self.unresolved(obj):
             obj["realization"] = "merged_with_conflict"
             return
         obj["realization"] = "merged"
-        if obj["author_kind"] == "agent":
-            # The merge is the human act; decided_by stays the agent author.
-            obj.update(status="approved", basis="merged_pr", decided_at=self.clock())
-            self._write(obj)
-            self._apply_supersedes(obj["id"], Actor("agent", obj["author"], obj["model"]))
 
     # ── reads ─────────────────────────────────────────────────────────
 
-    def detail(self, object_id: str) -> dict:
-        obj = self.get(object_id)
-        rels = self.relationships(object_id)
+    def detail(self, object_id: str, access: AccessContext | None = None) -> dict:
+        obj = self.get_visible(object_id, access)
+        rels = self.visible_relationships(object_id, access)
+        visible_ids = {r["source_id"] for r in rels} | {r["target_id"] for r in rels}
         return {
             **obj,
             "anchors": self.anchors(object_id),
-            "concepts": [c["title"] for c in self._linked(object_id, "belongs_to")],
+            "concepts": [c["title"] for c in self._linked(object_id, "belongs_to", access=access)],
             "relationships": rels,
-            "conflicts": self.conflict_views(obj),
+            "conflicts": [c for c in self.conflict_views(obj) if c["target_id"] in visible_ids],
             "unresolved": self.unresolved(obj) if obj["status"] == "proposed" else [],
         }
 
@@ -1223,9 +1429,11 @@ class Registry:
         symbol: str | None = None,
         statuses: Iterable[str] | None = None,
         limit: int = 20,
+        access: AccessContext | None = None,
     ) -> list[dict]:
         """Structured search, ranked by confidence. Concept and symbol never match prose."""
-        where, params = ["1=1"], []
+        pred, pparams = _access.visible_sql(access)
+        where, params = [pred], list(pparams)
         if kind:
             where.append("kind = ?")
             params.append(kind)
@@ -1261,9 +1469,13 @@ class Registry:
         )
         return rows[: max(1, min(int(limit), 100))]
 
-    def chain(self, object_id: str) -> list[dict]:
-        """The supersession chain through ``object_id``, oldest first, retired included."""
-        self.get(object_id)
+    def chain(self, object_id: str, access: AccessContext | None = None) -> list[dict]:
+        """The supersession chain through ``object_id``, oldest first, retired included.
+
+        Legacy view: it follows the first edge each way. ``history_graph`` walks
+        every ancestry and cross-link edge for completeness claims.
+        """
+        self.get_visible(object_id, access)
         older, newer = [], []
         node = object_id
         seen = {object_id}
@@ -1271,7 +1483,7 @@ class Registry:
             rels = [
                 r
                 for r in self.relationships(node, direction="out", type="supersedes")
-                if r["target_id"] not in seen
+                if r["target_id"] not in seen and self._visible_id(r["target_id"], access)
             ]
             if not rels:
                 break
@@ -1283,7 +1495,7 @@ class Registry:
             rels = [
                 r
                 for r in self.relationships(node, direction="in", type="supersedes")
-                if r["source_id"] not in seen
+                if r["source_id"] not in seen and self._visible_id(r["source_id"], access)
             ]
             if not rels:
                 break
@@ -1292,8 +1504,16 @@ class Registry:
             newer.append(node)
         nodes = [self.get(i) for i in [*reversed(older), object_id, *newer]]
         for node in nodes:
-            node["conflicts"] = self.conflict_views(node)
+            node["conflicts"] = [
+                c for c in self.conflict_views(node) if self._visible_id(c["target_id"], access)
+            ]
         return nodes
+
+    def _visible_id(self, object_id: str, access: AccessContext | None) -> bool:
+        try:
+            return _access.visible(self.get(object_id), access)
+        except NotFound:
+            return False
 
     def context_for_paths(
         self,
@@ -1303,6 +1523,7 @@ class Registry:
         symbols: Iterable[str] = (),
         concepts: Iterable[str] = (),
         include_proposals: bool = True,
+        access: AccessContext | None = None,
     ) -> list[dict]:
         """Claims on these files, symbols, or concepts, plus org-scope rules, by confidence."""
         statuses = ("approved", "proposed") if include_proposals else ("approved",)
@@ -1315,9 +1536,15 @@ class Registry:
                 obj = self.get(oid)
             except NotFound:
                 continue
-            if obj["kind"] in CLAIM_KINDS and obj["status"] in statuses:
+            if (
+                obj["kind"] in CLAIM_KINDS
+                and obj["status"] in statuses
+                and _access.visible(obj, access)
+            ):
                 found[oid] = obj
-        for obj in self._select("scope = 'org' AND kind = 'rule' AND status = 'approved'"):
+        for obj in self._select_visible(
+            access, "scope = 'org' AND kind = 'rule' AND status = 'approved'"
+        ):
             found.setdefault(obj["id"], obj)
         out = sorted(found.values(), key=lambda o: (-o["confidence"], o["created_at"]))
         for obj in out:
@@ -1325,36 +1552,37 @@ class Registry:
             obj["unresolved"] = self.unresolved(obj) if obj["status"] == "proposed" else []
         return out
 
-    def work_context(self, work_id: str) -> dict:
+    def work_context(self, work_id: str, access: AccessContext | None = None) -> dict:
         """Plan, requirements, decisions, children, dependencies, then evidence."""
-        work = self.get(work_id)
+        work = self.get_visible(work_id, access)
         if work["kind"] != "work":
             raise RegistryError(f"{work_id} is not a work object")
-        requirements = self._linked(work_id, "addresses")
+        a = access
+        requirements = self._linked(work_id, "addresses", access=a)
         evidence: list[dict] = []
         for req in requirements:
-            for ev in self._linked(req["id"], "verifies", direction="in"):
+            for ev in self._linked(req["id"], "verifies", direction="in", access=a):
                 ev["requirement_id"] = req["id"]
                 evidence.append(ev)
-        parent = self._linked(work_id, "parent_of", direction="in")
+        parent = self._linked(work_id, "parent_of", direction="in", access=a)
         return {
             "work": work,
             "requirements": requirements,
-            "decisions": self._linked(work_id, "records"),
-            "children": self._linked(work_id, "parent_of"),
+            "decisions": self._linked(work_id, "records", access=a),
+            "children": self._linked(work_id, "parent_of", access=a),
             "dependencies": {
                 "parent": parent[0] if parent else None,
-                "blocks": self._linked(work_id, "blocks"),
-                "blocked_by": self._linked(work_id, "blocks", direction="in"),
-                "relates": self._linked(work_id, "relates"),
+                "blocks": self._linked(work_id, "blocks", access=a),
+                "blocked_by": self._linked(work_id, "blocks", direction="in", access=a),
+                "relates": self._linked(work_id, "relates", access=a),
             },
             "evidence": evidence,
             "comments": self.comments_for(work),
         }
 
-    def work_view(self, work_id: str) -> dict:
+    def work_view(self, work_id: str, access: AccessContext | None = None) -> dict:
         """Implementation (derived from PR events), verification (evidence only), delivery."""
-        ctx = self.work_context(work_id)
+        ctx = self.work_context(work_id, access)
         records = [*ctx["requirements"], *ctx["decisions"]]
         counts: dict[str, int] = {}
         for rec in records:
@@ -1384,14 +1612,19 @@ class Registry:
             "verification": verification,
         }
 
-    def queue(self) -> list[dict]:
+    def queue(self, access: AccessContext | None = None) -> list[dict]:
         """Proposals for review: unresolved conflicts first, then realization, then age."""
-        rows = self._select(
-            "status = 'proposed' AND kind IN ('decision', 'rule', 'constraint', 'requirement')"
+        rows = self._select_visible(
+            access,
+            "status = 'proposed' AND kind IN ('decision', 'rule', 'constraint', 'requirement')",
         )
         for obj in rows:
             obj["unresolved"] = self.unresolved(obj)
-            obj["conflicts"] = [c for c in self.conflict_views(obj) if c["status"] == "proposed"]
+            obj["conflicts"] = [
+                c
+                for c in self.conflict_views(obj)
+                if c["status"] == "proposed" and self._visible_id(c["target_id"], access)
+            ]
         return sorted(
             rows,
             key=lambda o: (
@@ -1401,23 +1634,26 @@ class Registry:
             ),
         )
 
-    def expired(self) -> list[dict]:
-        return self._select(
-            "status = 'rejected' AND status_reason = 'expired' ORDER BY decided_at DESC"
+    def expired(self, access: AccessContext | None = None) -> list[dict]:
+        return self._select_visible(
+            access, "status = 'rejected' AND status_reason = 'expired' ORDER BY decided_at DESC"
         )
 
-    def concepts(self) -> list[dict]:
+    def concepts(self, access: AccessContext | None = None) -> list[dict]:
         out = []
-        for c in self._select("kind = 'concept' ORDER BY LOWER(title)"):
-            c["member_count"] = len(self.concept_members(c["id"]))
+        for c in self._select_visible(access, "kind = 'concept' ORDER BY LOWER(title)"):
+            members = [m for m in self.concept_members(c["id"]) if self._visible_id(m, access)]
+            c["member_count"] = len(members)
             out.append(c)
         return out
 
-    def anchor_index(self) -> list[dict]:
+    def anchor_index(self, access: AccessContext | None = None) -> list[dict]:
+        pred, params = _access.visible_sql(access, "o")
         rows = self.db.execute(
             "SELECT a.repo, a.path, a.qualified_name, a.symbol_kind, a.anchor_id, a.object_id, "
             "o.title, o.status, o.kind FROM registry_anchors a JOIN registry_objects o "
-            "ON o.id = a.object_id ORDER BY a.repo, a.path, a.qualified_name"
+            f"ON o.id = a.object_id WHERE {pred} ORDER BY a.repo, a.path, a.qualified_name",
+            params,
         )
         grouped: dict[tuple, dict] = {}
         for row in rows:
@@ -1429,8 +1665,8 @@ class Registry:
             )
         return list(grouped.values())
 
-    def works(self) -> list[dict]:
-        return self._select("kind = 'work' ORDER BY updated_at DESC")
+    def works(self, access: AccessContext | None = None) -> list[dict]:
+        return self._select_visible(access, "kind = 'work' ORDER BY updated_at DESC")
 
     # ── import (HAI-11606 seam) ───────────────────────────────────────
 
@@ -1442,8 +1678,13 @@ class Registry:
         *,
         status: str | None = None,
         basis: str = "migration",
+        corpus: tuple[str, str] = ("", ""),
     ) -> list[dict]:
         """Idempotent upsert keyed by ``(source_system, source_id, source_version)``.
+
+        ``corpus`` is ``(corpus_id, policy_version)`` from an import operator's
+        access context. Rows written with it are visible only to that corpus's
+        approved readers; an existing unclassified row is classified by it.
 
         Same version is a no-op, an older one is ignored, a newer one updates the
         row and replaces its imported links. Links whose target has not arrived
@@ -1462,12 +1703,12 @@ class Registry:
                 try:
                     with self.db.transaction():
                         outcome, obj = self._upsert_import(
-                            source_system, item, actor, status, basis
+                            source_system, item, actor, status, basis, corpus
                         )
                 except _ConcurrentInsert:
                     with self.db.transaction():
                         outcome, obj = self._upsert_import(
-                            source_system, item, actor, status, basis
+                            source_system, item, actor, status, basis, corpus
                         )
             except RegistryError as exc:
                 results.append(
@@ -1500,7 +1741,13 @@ class Registry:
         return rows[0] if rows else None
 
     def _upsert_import(
-        self, system: str, item: dict, actor: Actor, status: str | None, basis: str
+        self,
+        system: str,
+        item: dict,
+        actor: Actor,
+        status: str | None,
+        basis: str,
+        corpus: tuple[str, str] = ("", ""),
     ) -> tuple[str, dict]:
         source_id = str(item.get("source_id") or "")
         if not source_id:
@@ -1513,6 +1760,11 @@ class Registry:
         if kind not in KINDS:
             raise RegistryError(f"unknown kind {kind!r}")
         existing = self.by_source(system, source_id)
+        if existing is not None and corpus[0] and existing["corpus_id"] != corpus[0]:
+            if existing["corpus_id"]:
+                raise RegistryError("source row belongs to another corpus")
+            existing.update(corpus_id=corpus[0], policy_version=corpus[1])
+            self._write(existing)
         if existing is not None:
             if version == existing["source_version"]:
                 return "unchanged", existing
@@ -1522,7 +1774,14 @@ class Registry:
             outcome = "updated"
         else:
             obj = self._blank(kind, actor)
-            obj.update(source_system=system, source_id=source_id, scope="org", basis=basis)
+            obj.update(
+                source_system=system,
+                source_id=source_id,
+                scope="org",
+                basis=basis,
+                corpus_id=corpus[0],
+                policy_version=corpus[1],
+            )
             if status:
                 obj["status"] = status
             outcome = "created"
@@ -1599,7 +1858,7 @@ class Registry:
                     raise RegistryError("imports cannot assert conflicts")
                 if type in WORK_LINKS:
                     self._check_work_link(src, dst, type)
-                self._add_rel(src, dst, type, actor, origin=origin)
+                self._add_rel(src, dst, type, actor, origin=origin, corpus_id=obj["corpus_id"])
             except RegistryError as exc:
                 errors.append(f"{type} -> {target_source}: {exc}")
         obj = self.get(obj["id"])
@@ -1610,7 +1869,9 @@ class Registry:
 
     # ── mirrored comments (HAI-11606) ─────────────────────────────────
 
-    def import_comments(self, source_system: str, comments: list[dict]) -> list[dict]:
+    def import_comments(
+        self, source_system: str, comments: list[dict], *, corpus_id: str = ""
+    ) -> list[dict]:
         """Upsert comments keyed by ``(source_system, source_id)`` with the same
         version rules as objects. A comment whose parent is not imported yet is
         stored anyway and attaches when the parent arrives.
@@ -1633,6 +1894,7 @@ class Registry:
                 float(c.get("source_created_at") or 0),
                 1 if c.get("archived") else 0,
                 self.clock(),
+                corpus_id,
             )
             with self.db.transaction():
                 outcome = self._upsert_comment(source_system, source_id, parent, version, values)
@@ -1652,14 +1914,21 @@ class Registry:
             inserted = self.db.execute(
                 "INSERT INTO registry_comments (id, source_system, source_id, "
                 "parent_source_id, author, body, source_url, source_version, "
-                "source_created_at, archived, synced_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "source_created_at, archived, synced_at, corpus_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (source_system, source_id) DO NOTHING RETURNING id",
                 (new_id("cmt_"), source_system, source_id, parent, *values),
             )
             if inserted:
                 return "created"
             rows = self.db.execute(select, (source_system, source_id))
+        if values[-1]:
+            # Classify a legacy comment into the importing corpus.
+            self.db.execute(
+                "UPDATE registry_comments SET corpus_id = ? WHERE source_system = ? "
+                "AND source_id = ? AND corpus_id = ''",
+                (values[-1], source_system, source_id),
+            )
         if version == rows[0][0]:
             return "unchanged"
         if version < rows[0][0]:
@@ -1667,7 +1936,8 @@ class Registry:
         self.db.execute(
             "UPDATE registry_comments SET parent_source_id = ?, author = ?, "
             "body = ?, source_url = ?, source_version = ?, source_created_at = ?, "
-            "archived = ?, synced_at = ? WHERE source_system = ? AND source_id = ?",
+            "archived = ?, synced_at = ?, corpus_id = ? "
+            "WHERE source_system = ? AND source_id = ?",
             (parent, *values, source_system, source_id),
         )
         return "updated"
@@ -1685,18 +1955,22 @@ class Registry:
         keys = ("id", "source_id", "author", "body", "source_url", "created_at")
         return [dict(zip(keys, r, strict=True)) for r in rows]
 
-    def work_by_ticket(self, ticket: str) -> dict:
+    def work_by_ticket(self, ticket: str, access: AccessContext | None = None) -> dict:
         """The work object mirrored for a ticket key such as ``HAI-123``."""
-        rows = self._select("kind = 'work' AND ticket = ? AND source_system <> ''", (ticket,))
+        rows = self._select_visible(
+            access, "kind = 'work' AND ticket = ? AND source_system <> ''", (ticket,)
+        )
         if not rows:
             raise NotFound(f"no imported work for ticket {ticket}")
         return rows[0]
 
-    def sync_status(self, source_system: str) -> dict:
+    def sync_status(self, source_system: str, access: AccessContext | None = None) -> dict:
+        """Counts by sync status over rows the caller may see; others are not counted."""
+        pred, params = _access.visible_sql(access)
         rows = self.db.execute(
-            "SELECT sync_status, COUNT(*) FROM registry_objects WHERE source_system = ? "
-            "GROUP BY sync_status",
-            (source_system,),
+            f"SELECT sync_status, COUNT(*) FROM registry_objects WHERE {pred} "
+            "AND source_system = ? GROUP BY sync_status",
+            (*params, source_system),
         )
         return {r[0]: r[1] for r in rows}
 

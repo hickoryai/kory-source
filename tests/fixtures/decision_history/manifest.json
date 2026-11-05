@@ -1,0 +1,7 @@
+{
+  "description": "Fixture corpus for HAI-12825 tests. Synthetic; not real history.",
+  "repositories": ["hickoryai/kory-source", "hickoryai/hickory-ai"],
+  "linear_teams": ["HAI", "OPS"],
+  "excluded_on_purpose": {"linear_teams": ["SECRET"], "repositories": ["hickoryai/private-other"]},
+  "files": ["github.json", "linear.json", "git_history.json", "expected.json", "access_policy.json", "relationship_cycles.json"]
+}
