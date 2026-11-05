@@ -229,13 +229,15 @@ def _llms(monkeypatch, script: Scripted, meter: cr.ReplayMeter, state: cr.LiveSt
     )
 
 
-async def _execute(monkeypatch, tmp_path, w, script, budget=cr.REPLAY_BUDGET, out=None):
+async def _execute(monkeypatch, tmp_path, w, script, budget=cr.REPLAY_BUDGET, out=None, tweak=None):
     inputs = _load(w)
     out = out or (tmp_path / "out")
     out.mkdir(mode=0o700, exist_ok=True)
     meter = cr.ReplayMeter(out / "meter.jsonl", budget)
     state = cr.LiveState()
     critic, judge = _llms(monkeypatch, script, meter, state)
+    if tweak:
+        tweak(critic)
     decision = await cr.execute(inputs, w["diffs"], out, critic, judge, meter, state)
     return decision, meter, out
 
@@ -503,3 +505,137 @@ def test_plan_is_offline_and_fits_the_reserve(tmp_path):
     assert set(prompts) == {f"label__{u}" for u in UNITS} | {
         f"replay__{u}__{c}" for u in UNITS for c in ("C0", "C1")
     }
+
+
+# ------------------------------------------------------------------ review fixes (04ff9f2)
+
+
+class LeakyCritic(Scripted):
+    async def critic(self, request):
+        reply = await super().critic(request)
+        return {**reply, "text": reply["text"] + " " + cr.LEAK_MARKER + "notice"}
+
+
+def _wrong_priority(critic):
+    critic.config.router_acp_priority = "interactive"  # the body no longer equals the captured one
+
+
+@pytest.mark.parametrize(
+    "first,tweak,reason",
+    [
+        (lambda: Scripted(critic_model="claude@x/sonnet"), None, "model_pin_failure"),
+        (LeakyCritic, None, "leak_detected"),
+        (Scripted, _wrong_priority, "unexpected_request"),
+    ],
+)
+@pytest.mark.parametrize("crashed_before_decision", [False, True])
+async def test_terminal_stops_resume_with_zero_new_calls(
+    monkeypatch, tmp_path, first, tweak, reason, crashed_before_decision
+):
+    w = _world(tmp_path)
+    out = tmp_path / "out"
+    script = first()
+    decision, meter, _ = await _execute(monkeypatch, tmp_path, w, script, out=out, tweak=tweak)
+    assert decision["outcome"] == "stopped" and decision["reasons"] == [reason]
+    assert json.loads((out / "STOP.json").read_text())["reason"] == reason
+    stored = json.loads((out / "decision.json").read_text())
+    assert stored == json.loads(json.dumps(decision, default=str))
+    used = meter.used
+    if crashed_before_decision:  # the process died after the stop but before deciding
+        (out / "decision.json").unlink()
+
+    fresh = Scripted()  # a correct transport and a new LiveState: still nothing may be sent
+    again, meter2, _ = await _execute(monkeypatch, tmp_path, w, fresh, out=out)
+    assert fresh.critic_sent == fresh.judge_sent == []
+    assert meter2.used == used
+    assert again["outcome"] == "stopped" and again["reasons"] == [reason]
+    assert json.loads((out / "decision.json").read_text())["outcome"] == "stopped"
+
+
+async def test_a_finished_decision_is_returned_without_new_calls(monkeypatch, tmp_path):
+    w = _world(tmp_path)
+    out = tmp_path / "out"
+    decision, _, _ = await _execute(monkeypatch, tmp_path, w, Scripted(), out=out)
+    fresh = Scripted()
+    again, _, _ = await _execute(monkeypatch, tmp_path, w, fresh, out=out)
+    assert fresh.critic_sent == fresh.judge_sent == []
+    assert again == json.loads((out / "decision.json").read_text())
+    assert again["outcome"] == decision["outcome"] == "promising"
+
+
+class BrokenC0(Scripted):
+    """C0 answers with a malformed verdict list; C1 answers normally."""
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    async def critic(self, request):
+        reply = await super().critic(request)
+        if cr.C1_HEADING not in request["body"]["prompt"]:
+            reply = {**reply, "text": self.text}
+        return reply
+
+
+BAD_REPLIES = [
+    "{}",
+    '{"verdicts": []}',
+    '{"verdicts": "plausible"}',
+    '{"verdicts": [{"index": 1, "evidence": "plausible", "reason": "r"}]}',
+    '{"verdicts": [{"index": 0, "evidence": "plausible"}, {"index": 0, "evidence": "plausible"}]}',
+    '{"verdicts": [{"index": "0", "evidence": "plausible"}]}',
+    '{"verdicts": [{"index": 0, "evidence": "maybe"}]}',
+    '{"verdicts": [{"index": 0}]}',
+    "not json at all",
+]
+
+
+@pytest.mark.parametrize("text", BAD_REPLIES)
+async def test_malformed_c0_reply_can_never_be_a_valid_control(monkeypatch, tmp_path, text):
+    w = _world(tmp_path)
+    decision, _, out = await _execute(monkeypatch, tmp_path, w, BrokenC0(text))
+    assert decision["outcome"] == "inconclusive"
+    assert "a replay did not complete" in decision["reasons"]
+    c0 = json.loads((out / "calls" / f"replay__{UNITS[0]}__C0.json").read_text())
+    assert c0["status"] == "error" and "kept" not in c0
+
+
+@pytest.mark.parametrize(
+    "verdicts,n,ok",
+    [
+        ([{"index": 1, "evidence": "proven"}, {"index": 0, "evidence": "plausible"}], 2, True),
+        ([{"evidence": "proven"}, {"evidence": "unsupported"}], 2, True),  # positional, complete
+        ([{"index": 0, "evidence": "proven"}], 2, False),  # a draft has no verdict
+        ([{"index": 0, "evidence": "proven"}, {"evidence": "proven"}], 2, False),  # mixed
+        ([{"index": 0, "evidence": "proven"}, {"index": 2, "evidence": "proven"}], 2, False),
+        ([{"index": True, "evidence": "proven"}], 1, False),
+        ([{"index": 0, "keep": True}], 1, False),  # old binary shape: no evidence grade
+    ],
+)
+def test_verdict_schema(verdicts, n, ok):
+    if ok:
+        cr.check_verdicts({"verdicts": verdicts}, n)
+    else:
+        with pytest.raises(cr.ReplayReplyError):
+            cr.check_verdicts({"verdicts": verdicts}, n)
+
+
+def test_valid_replies_keep_production_semantics():
+    drafts = [_draft(3, "a", conf=0.85), _draft(4, "b", conf=0.7), _draft(5, "c")]
+    data = {
+        "verdicts": [
+            {"index": 0, "evidence": "plausible"},  # WARNING and 0.85: kept
+            {"index": 1, "evidence": "plausible"},  # 0.7 < 0.8: dropped
+            {"index": 2, "evidence": "proven"},
+        ]
+    }
+    assert cr.critique_keep(data, drafts) == ([0, 2], ["plausible", "plausible", "proven"])
+
+
+def test_a_malformed_captured_reply_is_rejected_as_input(tmp_path):
+    def blank(records):
+        next(r for r in records if r["kind"] == "seat_call")["response"]["text"] = "{}"
+
+    w = _world(tmp_path, mutate=blank)
+    with pytest.raises(cr.ReplayInputError, match="unusable"):
+        _load(w)

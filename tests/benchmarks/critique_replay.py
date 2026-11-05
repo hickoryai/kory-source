@@ -191,8 +191,49 @@ def _sums(step1: Path) -> dict[str, str]:
     return out
 
 
+GRADES = ("proven", "plausible", "unsupported")
+
+
+class ReplayReplyError(ValueError):
+    """A critic reply that does not grade every draft exactly once."""
+
+
+def check_verdicts(data: Any, n: int) -> None:
+    """Require one well-formed verdict per draft before a keep set can count.
+
+    ``self_critique`` silently treats a missing, empty or partial verdict list
+    as "keep none", which would look like a valid control. Here such a reply
+    fails the replay instead.
+    """
+    verdicts = data.get("verdicts") if isinstance(data, dict) else None
+    if not isinstance(verdicts, list) or not verdicts:
+        raise ReplayReplyError("missing, empty or non-list verdicts")
+    if len(verdicts) != n:
+        raise ReplayReplyError(f"{len(verdicts)} verdicts for {n} drafts")
+    if not all(isinstance(v, dict) for v in verdicts):
+        raise ReplayReplyError("a verdict is not an object")
+    indexed = ["index" in v for v in verdicts]
+    if any(indexed) and not all(indexed):
+        raise ReplayReplyError("mixed indexed and positional verdicts")
+    if all(indexed):
+        idx = [v["index"] for v in verdicts]
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in idx):
+            raise ReplayReplyError("a verdict index is not an integer")
+        if sorted(idx) != list(range(n)):
+            raise ReplayReplyError(
+                f"verdict indices {sorted(idx)} do not cover 0..{n - 1} once each"
+            )
+    if any(v.get("evidence") not in GRADES for v in verdicts):
+        raise ReplayReplyError("a verdict has no valid evidence grade")
+
+
 def critique_keep(data: dict, drafts: list[dict]) -> tuple[list[int], list[str]]:
-    """The kept indices and grades for one critic reply, decided exactly like ``self_critique``."""
+    """The kept indices and grades for one critic reply, decided exactly like ``self_critique``.
+
+    The reply must pass ``check_verdicts`` first; for a valid reply the keep
+    semantics are the production ones.
+    """
+    check_verdicts(data, len(drafts))
     from mira.core.passes import _critique_keep
     from mira.models import ReviewComment, Severity
 
@@ -367,7 +408,10 @@ def load_inputs(
                 used.add(match)
                 links.append(match)
             text = str(call["response"].get("text") or "")
-            kept, _ = critique_keep(parse_reply(text), ci["drafts"])
+            try:
+                kept, _ = critique_keep(parse_reply(text), ci["drafts"])
+            except Exception as exc:  # no JSON object, or a malformed verdict list
+                raise ReplayInputError(f"{uid}: captured critic reply is unusable: {exc}") from exc
             if kept != co["kept_indices"]:
                 raise ReplayInputError(f"{uid}: keep rule does not reproduce the captured decision")
             review.critique = Critique(
@@ -599,10 +643,40 @@ _expect: contextvars.ContextVar[tuple[str, Callable[[dict], bool]] | None] = con
 )
 
 
+TERMINAL_STOPS = (
+    "model_pin_failure",
+    "leak_detected",
+    "unexpected_request",
+    "seat_budget_exhausted",
+)
+
+
 @dataclass
 class LiveState:
+    """The run's stop flag, persisted to ``STOP.json`` the moment it is set."""
+
     stop: str = ""
     detail: str = ""
+    path: Path | None = None
+
+    def set_stop(self, reason: str, detail: str = "") -> None:
+        if not self.stop:
+            self.stop, self.detail = reason, detail
+        if self.path is not None and not self.path.exists():
+            write_once(self.path, {"reason": self.stop, "detail": self.detail})
+
+    def restore(self, out: Path) -> None:
+        """Reload any earlier terminal stop before a single new request can leave."""
+        self.path = out / "STOP.json"
+        if self.path.exists():
+            saved = json.loads(self.path.read_text())
+            self.stop, self.detail = saved["reason"], saved.get("detail", "")
+            return
+        for result in sorted((out / "calls").glob("*.json")) if (out / "calls").exists() else []:
+            rec = json.loads(result.read_text())
+            if rec.get("status") == "stopped" and rec.get("reason") in TERMINAL_STOPS:
+                self.set_stop(rec["reason"], rec.get("detail", ""))
+                return
 
 
 def guard(llm: Any, meter: ReplayMeter, state: LiveState, model: str) -> Any:
@@ -610,24 +684,26 @@ def guard(llm: Any, meter: ReplayMeter, state: LiveState, model: str) -> Any:
     inner = llm._transport
 
     async def _guarded(request: dict) -> dict:
+        if state.stop:  # a stopped run sends nothing more, whatever asks
+            raise ReplayStop(state.stop, state.detail)
         expected = _expect.get()
         body = request.get("body") or {}
         if expected is None or not expected[1](body):
-            state.stop, state.detail = "unexpected_request", (expected or ("none",))[0]
+            state.set_stop("unexpected_request", (expected or ("none",))[0])
             raise ReplayStop(state.stop, state.detail)
         try:
             meter.spend(expected[0])
         except ReplayStop as exc:
-            state.stop = exc.reason
+            state.set_stop(exc.reason, str(exc))
             raise
         payload = await inner(request)
         actual = str(payload.get("actual_model") or "unknown")
         if actual != model:
-            state.stop, state.detail = "model_pin_failure", f"{model} answered by {actual}"
+            state.set_stop("model_pin_failure", f"{model} answered by {actual}")
             raise ReplayStop(state.stop, state.detail)
         if LEAK_MARKER in str(payload.get("text") or ""):
-            state.stop = "leak_detected"
-            raise ReplayStop(state.stop, expected[0])
+            state.set_stop("leak_detected", expected[0])
+            raise ReplayStop(state.stop, state.detail)
         return payload
 
     llm._transport = _guarded
@@ -822,8 +898,17 @@ async def execute(
     meter: ReplayMeter,
     state: LiveState,
 ) -> dict:
-    """Label, check D, replay, decide. Every result is written once under ``out``."""
+    """Label, check D, replay, decide. Every result is written once under ``out``.
+
+    A run that already has a decision returns it with no new requests. A run
+    that stopped earlier (pin failure, leak, unexpected request, budget)
+    restores that stop first, so it sends nothing either.
+    """
     verify_diffs(inputs, diffs)
+    decision_path = out / "decision.json"
+    if decision_path.exists():
+        return json.loads(decision_path.read_text())
+    state.restore(out)
     labels: dict[str, dict[int, dict]] = {}
     label_status: dict[str, dict] = {}
     for uid, review in sorted(inputs.reviews.items()):
@@ -884,9 +969,9 @@ async def execute(
                     out, f"replay__{uid}__{cond}", state, _replay
                 )
     decision = decide(inputs, labels, label_status, replays, meter.as_dict())
-    decision_path = out / "decision.json"
-    if not decision_path.exists():
-        write_once(decision_path, decision)
+    if state.stop in TERMINAL_STOPS[:3] and decision["outcome"] != "stopped":
+        decision = {**decision, "outcome": "stopped", "reasons": [state.stop]}
+    write_once(decision_path, decision)
     return decision
 
 

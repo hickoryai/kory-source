@@ -321,5 +321,17 @@ uv run python tests/benchmarks/critique_replay.py decide --step1 ... --out ...
 - the global ledger is 87 (Step 1) + 126 + 87 unallocated = 300.
 
 **Resume.** A call that started but has no result is recorded as interrupted
-and never retried. Every output (`calls/*.json`, `decision.json`, `plan.json`,
+and never retried. A terminal stop (pin failure, leak marker, unexpected
+request body, or budget) is written to `STOP.json` the moment it happens. It is
+restored before any request on resume, so a stopped run never sends again. An
+existing `decision.json` is returned as is, with no calls.
+
+**Critic replies.** A replayed reply must grade every draft exactly once:
+- a non-empty `verdicts` list with one entry per draft;
+- either all entries indexed, covering `0..n-1` once each, or all positional;
+- every `evidence` one of proven, plausible or unsupported.
+
+Anything else fails that replay, which makes the result inconclusive. A broken
+reply can never act as a keep-none control. Valid replies keep the production
+keep rule. Every output (`calls/*.json`, `decision.json`, `plan.json`,
 prompts, diffs) is written once with mode 0600 in 0700 directories.
