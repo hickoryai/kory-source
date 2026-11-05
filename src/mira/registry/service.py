@@ -443,6 +443,11 @@ class Registry:
             raise RegistryError("a relationship cannot join two corpora")
         return next(iter(found), "")
 
+    def _lock_row(self, object_id: str) -> None:
+        """Take the per-object lock inside an already-open transaction."""
+        if self.db.postgres:
+            self.db.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (object_id,))
+
     @contextmanager
     def _object_lock(self, object_id: str) -> Iterator[None]:
         """One transaction per lifecycle change, serialized per object.
@@ -759,6 +764,10 @@ class Registry:
     def update_work(
         self, work_id: str, fields: dict, actor: Actor, access: AccessContext | None = None
     ) -> dict:
+        with self._object_lock(work_id):
+            return self._update_work_locked(work_id, fields, access)
+
+    def _update_work_locked(self, work_id: str, fields: dict, access: AccessContext | None) -> dict:
         obj = self.get_visible(work_id, access)
         if obj["kind"] != "work":
             raise RegistryError(f"{work_id} is not a work object")
@@ -926,12 +935,10 @@ class Registry:
         obj = self.get(object_id)
         candidates, remainder = self.conflict_candidates(obj)
         if not candidates:
-            obj["conflict_check"] = "partial" if remainder else "done"
-            self._write(obj)
+            self._set_conflict_check(object_id, "partial" if remainder else "done")
             return []
         if self.judge is None:
-            obj["conflict_check"] = "failed"
-            self._write(obj)
+            self._set_conflict_check(object_id, "failed")
             return []
 
         async def _one(cand: dict) -> dict | None:
@@ -958,10 +965,17 @@ class Registry:
                     existing_clause=j["existing_clause"],
                 )
         failed = len(judgments) < len(candidates)
-        obj = self.get(object_id)
-        obj["conflict_check"] = "failed" if failed else ("partial" if remainder else "done")
-        self._write(obj)
+        self._set_conflict_check(
+            object_id, "failed" if failed else ("partial" if remainder else "done")
+        )
         return judgments
+
+    def _set_conflict_check(self, object_id: str, value: str) -> None:
+        """Write only the check result onto the current row (the judge may take a while)."""
+        with self._object_lock(object_id):
+            obj = self.get(object_id)
+            obj["conflict_check"] = value
+            self._write(obj)
 
     def unresolved(self, obj: dict, access: Any = _UNFILTERED) -> list[str]:
         """Open conflicts on this proposal. A merge with any is ``merged_with_conflict``.
@@ -1467,13 +1481,23 @@ class Registry:
                     self._replace(old, actor)
             return {"new": self.get(new_id), "old": self.get(old_id), "applied": applied}
 
-    def _replace(self, old: dict, actor: Actor) -> None:
-        if old["status"] == "proposed" and old["realization"] == "stated":
-            old.update(status="retired", status_reason="superseded_before_realization")
-        else:
-            old.update(status="superseded", status_reason="superseded")
-        self._write(old)
-        self._lifecycle(old, old["status_reason"], actor)
+    def _replace(self, old: dict | str, actor: Actor) -> None:
+        """Supersede ``old`` from its current row, never from a caller's snapshot.
+
+        Locks the target, re-reads it, and changes it only if it is still
+        proposed or approved, so a concurrent retirement or rejection stands.
+        """
+        old_id = old if isinstance(old, str) else old["id"]
+        with self._object_lock(old_id):
+            fresh = self.get(old_id)
+            if fresh["status"] not in ("proposed", "approved"):
+                return
+            if fresh["status"] == "proposed" and fresh["realization"] == "stated":
+                fresh.update(status="retired", status_reason="superseded_before_realization")
+            else:
+                fresh.update(status="superseded", status_reason="superseded")
+            self._write(fresh)
+            self._lifecycle(fresh, fresh["status_reason"], actor)
 
     def _latest_approval(self, object_id: str) -> str:
         """The newest approval-event evidence id for an object, or ``''``."""
@@ -1512,11 +1536,11 @@ class Registry:
             for rel in self.relationships(new_id, direction="out", type=type):
                 if rel["status"] != "proposed":
                     continue
-                old = self.get(rel["target_id"])
-                if old["status"] in ("proposed", "approved"):
-                    self._replace(old, actor)
-                self._set_rel_status(new_id, old["id"], type, "active", actor.sub)
-                self._rel_receipt(new_id, old["id"], type, actor, "activated by approval", approval)
+                self._replace(rel["target_id"], actor)
+                self._set_rel_status(new_id, rel["target_id"], type, "active", actor.sub)
+                self._rel_receipt(
+                    new_id, rel["target_id"], type, actor, "activated by approval", approval
+                )
 
     def resolve_conflict(
         self, object_id: str, choice: str, actor: Actor, access: AccessContext | None = None
@@ -1580,21 +1604,22 @@ class Registry:
             self._write(obj)
             approval = self._lifecycle(obj, "approved_supersede", actor)
             for r in conflicts:
-                old = self.get(r["target_id"])
+                target = r["target_id"]
                 self._set_rel_status(
-                    object_id, old["id"], "conflicts_with", "superseded_existing", actor.sub
+                    object_id, target, "conflicts_with", "superseded_existing", actor.sub
                 )
+                self._rel_receipt(object_id, target, "conflicts_with", actor, "superseded existing")
+                self._add_rel(object_id, target, "supersedes", actor)
                 self._rel_receipt(
-                    object_id, old["id"], "conflicts_with", actor, "superseded existing"
+                    object_id, target, "supersedes", actor, "approved supersession", approval
                 )
-                self._add_rel(object_id, old["id"], "supersedes", actor)
-                self._rel_receipt(
-                    object_id, old["id"], "supersedes", actor, "approved supersession", approval
-                )
-                if old["status"] in ("approved", "proposed"):
-                    old.update(status="superseded", status_reason="superseded")
-                    self._write(old)
-                    self._lifecycle(old, "superseded", actor)
+                # Re-read under the target's lock: a concurrent retirement stands.
+                with self._object_lock(target):
+                    old = self.get(target)
+                    if old["status"] in ("approved", "proposed"):
+                        old.update(status="superseded", status_reason="superseded")
+                        self._write(old)
+                        self._lifecycle(old, "superseded", actor)
             self._apply_supersedes(object_id, actor, approval, access)
             return self.get(object_id)
 
@@ -1608,19 +1633,40 @@ class Registry:
             "AND (CASE WHEN restored_at > created_at THEN restored_at ELSE created_at END) <= ?",
             (cutoff,),
         )
-        for obj in stale:
-            with self._object_lock(obj["id"]):
+        expired: list[str] = []
+        for listed in stale:
+            with self._object_lock(listed["id"]):
+                obj = self.get(listed["id"])  # re-read: a person may have acted since
+                if not self._expirable(obj, cutoff):
+                    continue
                 obj.update(status="rejected", status_reason="expired", decided_at=self.clock())
                 self._write(obj)
                 self._lifecycle(obj, "expired", None)
-        return [o["id"] for o in stale]
+                expired.append(obj["id"])
+        return expired
+
+    @staticmethod
+    def _expirable(obj: dict, cutoff: float) -> bool:
+        return (
+            obj["status"] == "proposed"
+            and obj["author_kind"] == "agent"
+            and obj["source_system"] == ""
+            and obj["realization"] in ("stated", "in_progress")
+            and obj["kind"] in CLAIM_KINDS
+            and max(obj["restored_at"], obj["created_at"]) <= cutoff
+        )
 
     def refresh_confidence(self) -> int:
         """Recompute age-dependent confidence for open proposals."""
-        rows = self._select("status = 'proposed'")
-        for obj in rows:
-            self._write(obj)
-        return len(rows)
+        count = 0
+        for listed in self._select("status = 'proposed'"):
+            with self._object_lock(listed["id"]):
+                obj = self.get(listed["id"])  # never write back a stale snapshot
+                if obj["status"] != "proposed":
+                    continue
+                self._write(obj)
+                count += 1
+        return count
 
     # ── realization ───────────────────────────────────────────────────
 
@@ -1633,14 +1679,25 @@ class Registry:
 
     def on_push(self, repo: str, branch: str) -> list[str]:
         changed = []
-        for obj in self._on_branch(repo, branch):
-            if obj["realization"] == "stated":
-                with self._object_lock(obj["id"]):
-                    obj["realization"] = "in_progress"
-                    self._write(obj)
-                    self._lifecycle(obj, "realization_in_progress", None)
+        for listed in self._on_branch(repo, branch):
+            with self._object_lock(listed["id"]):
+                obj = self.get(listed["id"])  # re-read and recheck under the lock
+                if not self._on_this_branch(obj, repo, branch) or obj["realization"] != "stated":
+                    continue
+                obj["realization"] = "in_progress"
+                self._write(obj)
+                self._lifecycle(obj, "realization_in_progress", None)
                 changed.append(obj["id"])
         return changed
+
+    @staticmethod
+    def _on_this_branch(obj: dict, repo: str, branch: str) -> bool:
+        return (
+            obj["repo"].lower() == repo.lower()
+            and obj["branch"] == branch
+            and obj["status"] in ("proposed", "approved")
+            and obj["kind"] in CLAIM_KINDS
+        )
 
     def on_pull_request(
         self,
@@ -1658,9 +1715,10 @@ class Registry:
             if listed["realization"] in ("merged", "merged_with_conflict"):
                 continue
             with self._object_lock(listed["id"]):
-                changed += self._pull_request_event(
-                    self.get(listed["id"]), action, merged, pr_url, merge_commit
-                )
+                obj = self.get(listed["id"])
+                if not self._on_this_branch(obj, repo, branch):
+                    continue
+                changed += self._pull_request_event(obj, action, merged, pr_url, merge_commit)
         return changed
 
     def _pull_request_event(
@@ -2053,6 +2111,10 @@ class Registry:
         if kind not in KINDS:
             raise RegistryError(f"unknown kind {kind!r}")
         existing = self.by_source(system, source_id)
+        if existing is not None:
+            # Serialize with lifecycle changes to this object, then use its current row.
+            self._lock_row(existing["id"])
+            existing = self.get(existing["id"])
         if existing is not None and corpus[0] and existing["corpus_id"] != corpus[0]:
             if existing["corpus_id"]:
                 raise RegistryError("source row belongs to another corpus")
@@ -2154,6 +2216,7 @@ class Registry:
                 self._add_rel(src, dst, type, actor, origin=origin, corpus_id=obj["corpus_id"])
             except RegistryError as exc:
                 errors.append(f"{type} -> {target_source}: {exc}")
+        self._lock_row(obj["id"])
         obj = self.get(obj["id"])
         obj["sync_status"] = "error" if errors else ("pending_links" if missing else "synced")
         obj["synced_at"] = self.clock()
