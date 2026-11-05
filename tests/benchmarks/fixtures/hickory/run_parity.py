@@ -266,7 +266,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
             return 1
         print("rescore matches the stored summary")
         return 0
-    print(render_markdown(summary))
+    sys.stdout.write(render_markdown(summary))
     return 0
 
 

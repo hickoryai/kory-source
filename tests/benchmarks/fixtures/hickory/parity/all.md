@@ -68,4 +68,3 @@ Cluster bootstrap by PR, 10000 resamples, seed 11607, confidence 0.95; margin 0.
 - metered: 1335 of 1500 seat sessions, 0 refused at the cap
 
 `fixed_later` is biased toward Greptile (authors fixed what Greptile showed them) and can include base-branch merges into the PR's own files.
-
