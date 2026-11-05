@@ -646,13 +646,27 @@ class ProvenanceStore:
             "created_by",
             "created_at",
         )
-        return self._rows(
+        rows = self._rows(
             f"SELECT {', '.join(cols)} FROM registry_relationship_evidence "
             "WHERE relationship_id = ? ORDER BY created_at, id",
             (relationship_id,),
             cols,
             access,
         )
+        # A receipt names both endpoints: it is readable only when both are.
+        return [
+            r
+            for r in rows
+            if self._visible_object(r["source_object_id"], access)
+            and self._visible_object(r["target_object_id"], access)
+        ]
+
+    def _visible_object(self, object_id: str, access: AccessContext | None) -> bool:
+        try:
+            self.registry.get_visible(object_id, access)
+            return True
+        except NotFound:
+            return False
 
     def _rows(
         self,
