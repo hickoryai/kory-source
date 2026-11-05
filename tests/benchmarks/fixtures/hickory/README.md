@@ -259,3 +259,67 @@ created `0600` in a `0700` directory. An existing file is never overwritten:
 `run` fails before any model call. Request headers, which carry the relay bearer
 token, are never written. Keep captures under `/opt/dev/artifacts`, never in the
 repository or a PR.
+
+### Paired critique replay (HAI-12817, steps 2-3)
+
+`tests/benchmarks/critique_replay.py` re-runs one captured critique stage. It
+never re-samples a review. Inputs are pinned:
+- the capture's and run artifact's SHA-256, plus `SHA256SUMS`;
+- the manifest hash;
+- the 14 predeclared development units;
+- the reviewer and judge pins;
+- Step 1's seat use.
+
+Each snapshot diff is refetched and must match the run artifact's hash. Any
+mismatch, unlisted record, held-out unit, unlinked critique draft, or keep
+decision the rule cannot reproduce stops the command before any model call.
+
+```bash
+# Dry run: no model calls. Writes plan.json plus private diffs and prompts.
+GITHUB_TOKEN="$(gh auth token)" uv run python tests/benchmarks/critique_replay.py plan \
+  --step1 /opt/dev/artifacts/HAI-12817/step1 --out /opt/dev/artifacts/HAI-12817/step2
+# Live, only with parent approval: re-checks every input against plan.json first.
+MIRA_ROUTER_ACP_RELAY_ENTRY=<loopback entry> uv run python tests/benchmarks/critique_replay.py run \
+  --step1 /opt/dev/artifacts/HAI-12817/step1 --out /opt/dev/artifacts/HAI-12817/step2 --approved-live
+# Offline: recompute the decision from the stored results.
+uv run python tests/benchmarks/critique_replay.py decide --step1 ... --out ...
+```
+
+1. **Labels first.** For each review with drafts there is one blind judge call.
+   The pool is Greptile's comments plus every captured draft, including drafts
+   the noise filter dropped, with full bodies and the snapshot diff.
+   - The judge never sees severity, confidence, grades, keep status, condition,
+     or which comments are golden.
+   - A draft counts as golden only when the judge groups it with that golden
+     finding's comment and calls it real. Non-golden does not mean false
+     positive: every draft gets its own label.
+2. **Small-sample stop.** D is the number of golden findings the captured
+   critique dropped. If the labels confirm D < 3, the result is inconclusive and
+   nothing is replayed.
+3. **Replay.**
+   - **C0** re-sends the captured critic request body byte for byte.
+   - **C1** inserts one section before `## Required output`: that review's own
+     captured tool results plus the untruncated diff hunks for each draft.
+
+   C1 changes context and truncation together, so it cannot attribute an
+   effect to either one. Both conditions use the captured keep rule
+   (`passes._critique_keep`), and the same pinned model must answer.
+4. **Decision.** The predeclared rule:
+   - precision floor exactly 5/6 − 0.02 = 61/75;
+   - new-keep error rate ≤ 1/5, including with uncertain labels counted as not
+     real;
+   - negative controls ≤ 1/10;
+   - C0 reproducibility ≥ 9/10;
+   - judge errors ≤ 1/20.
+
+   An empty denominator is inconclusive. A pin failure, leak marker, or
+   unexpected request body stops the run.
+
+**Budget.** One append-only `meter.jsonl` covers labels and replays:
+- the cap is 126 requests, including retries;
+- each request is counted before it is sent;
+- the global ledger is 87 (Step 1) + 126 + 87 unallocated = 300.
+
+**Resume.** A call that started but has no result is recorded as interrupted
+and never retried. Every output (`calls/*.json`, `decision.json`, `plan.json`,
+prompts, diffs) is written once with mode 0600 in 0700 directories.
