@@ -963,8 +963,12 @@ class Registry:
         self._write(obj)
         return judgments
 
-    def unresolved(self, obj: dict) -> list[str]:
-        """Open conflicts on this proposal. A merge with any is ``merged_with_conflict``."""
+    def unresolved(self, obj: dict, access: Any = _UNFILTERED) -> list[str]:
+        """Open conflicts on this proposal. A merge with any is ``merged_with_conflict``.
+
+        With ``access`` (a caller's view), blockers on objects the caller cannot
+        see are left out, so no hidden id is ever named.
+        """
         reasons = []
         if obj["conflict_check"] in _OPEN_CHECKS:
             reasons.append(f"conflict check {obj['conflict_check']}")
@@ -975,9 +979,36 @@ class Registry:
                 target = self.get(rel["target_id"])
             except NotFound:
                 continue
-            if target["status"] == "approved":
-                reasons.append(f"{rel['type']} {target['id']}")
+            if target["status"] != "approved":
+                continue
+            if access is not _UNFILTERED and not _access.visible(target, access):
+                continue
+            reasons.append(f"{rel['type']} {target['id']}")
         return reasons
+
+    def _require_affected_visible(
+        self, root_id: str, ids: Iterable[str], access: AccessContext | None
+    ) -> None:
+        """Refuse a change that would touch any object the caller cannot see.
+
+        Checked inside the change's transaction, before any write. The refusal
+        names only the root object, exactly like a root the caller cannot see.
+        """
+        for oid in ids:
+            try:
+                target = self.get(oid)
+            except NotFound:
+                continue
+            if not _access.visible(target, access):
+                raise NotFound(f"no registry object {root_id}")
+
+    def _approval_affects(self, object_id: str) -> list[str]:
+        """Objects an approval of ``object_id`` would change or is blocked by."""
+        out = []
+        for rel in self.relationships(object_id, direction="out"):
+            if rel["status"] == "proposed" and rel["type"] in (*ANCESTRY_TYPES, "conflicts_with"):
+                out.append(rel["target_id"])
+        return out
 
     def _record_prompt(self, session: str, object_id: str, candidate_id: str) -> None:
         self.db.execute(
@@ -1322,6 +1353,8 @@ class Registry:
         self._require_human(actor, "approve")
         with self._object_lock(object_id):
             obj = self.get_visible(object_id, access)
+            # Supersession targets and blockers must all be visible to this caller.
+            self._require_affected_visible(object_id, self._approval_affects(object_id), access)
             if obj["status"] != "proposed":
                 raise RegistryError(f"{object_id} is {obj['status']}, not proposed")
             open_conflicts = [r for r in self.unresolved(obj) if r.startswith("conflicts_with")]
@@ -1332,7 +1365,7 @@ class Registry:
             )
             self._write(obj)
             approval = self._lifecycle(obj, "approved", actor)
-            self._apply_supersedes(object_id, actor, approval)
+            self._apply_supersedes(object_id, actor, approval, access)
             return self.get(object_id)
 
     def reject(
@@ -1458,9 +1491,23 @@ class Registry:
             return ""
         return ids[-1] if ids else ""
 
-    def _apply_supersedes(self, new_id: str, actor: Actor, approval: str = "") -> None:
-        """A person approved ``new_id``: its proposed ancestry edges take effect."""
+    def _apply_supersedes(
+        self, new_id: str, actor: Actor, approval: str = "", access: Any = _UNFILTERED
+    ) -> None:
+        """A person approved ``new_id``: its proposed ancestry edges take effect.
+
+        Every target must be visible to the caller; callers check this before
+        writing, and this re-check runs before any edge or target changes.
+        """
         self._require_human(actor, "apply a supersession")
+        if access is not _UNFILTERED:
+            targets = [
+                r["target_id"]
+                for t in ANCESTRY_TYPES
+                for r in self.relationships(new_id, direction="out", type=t)
+                if r["status"] == "proposed"
+            ]
+            self._require_affected_visible(new_id, targets, access)
         for type in ANCESTRY_TYPES:
             for rel in self.relationships(new_id, direction="out", type=type):
                 if rel["status"] != "proposed":
@@ -1492,6 +1539,13 @@ class Registry:
             ]
             if not conflicts:
                 raise RegistryError("no proposed conflict to answer")
+            # Every object the answer touches (conflict targets, and for supersede
+            # any other proposed ancestry target) must be visible to this caller.
+            self._require_affected_visible(
+                object_id,
+                [r["target_id"] for r in conflicts] + self._approval_affects(object_id),
+                access,
+            )
             now = self.clock()
             if choice == "defer":
                 # The object stays proposed and the conflict stays open for merge.
@@ -1541,7 +1595,7 @@ class Registry:
                     old.update(status="superseded", status_reason="superseded")
                     self._write(old)
                     self._lifecycle(old, "superseded", actor)
-            self._apply_supersedes(object_id, actor, approval)
+            self._apply_supersedes(object_id, actor, approval, access)
             return self.get(object_id)
 
     def expire(self) -> list[str]:
@@ -1654,7 +1708,7 @@ class Registry:
             "concepts": [c["title"] for c in self._linked(object_id, "belongs_to", access=access)],
             "relationships": rels,
             "conflicts": [c for c in self.conflict_views(obj) if c["target_id"] in visible_ids],
-            "unresolved": self.unresolved(obj) if obj["status"] == "proposed" else [],
+            "unresolved": self.unresolved(obj, access) if obj["status"] == "proposed" else [],
         }
 
     def search(
@@ -1788,7 +1842,7 @@ class Registry:
         out = sorted(found.values(), key=lambda o: (-o["confidence"], o["created_at"]))
         for obj in out:
             obj["anchors"] = self.anchors(obj["id"])
-            obj["unresolved"] = self.unresolved(obj) if obj["status"] == "proposed" else []
+            obj["unresolved"] = self.unresolved(obj, access) if obj["status"] == "proposed" else []
         return out
 
     def work_context(self, work_id: str, access: AccessContext | None = None) -> dict:
@@ -1858,7 +1912,7 @@ class Registry:
             "status = 'proposed' AND kind IN ('decision', 'rule', 'constraint', 'requirement')",
         )
         for obj in rows:
-            obj["unresolved"] = self.unresolved(obj)
+            obj["unresolved"] = self.unresolved(obj, access)
             obj["conflicts"] = [
                 c
                 for c in self.conflict_views(obj)

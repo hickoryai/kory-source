@@ -247,3 +247,78 @@ async def test_concurrent_lifecycle_writers_on_postgres_never_collide():
         rp.drop_registry_tables(regs[0].db)
         for r in regs:
             r.db.close()
+
+
+# ── mutations that reach past the visible root (re-review) ──────────────
+
+TABLES = (
+    "registry_objects",
+    "registry_relationships",
+    "registry_source_revisions",
+    "registry_decision_versions",
+    "registry_attributions",
+    "registry_relationship_evidence",
+    "registry_conflict_answers",
+)
+UNLISTED = Actor("human", "unlisted-user")
+
+
+def _snapshot(reg) -> dict:
+    return {t: reg.db.execute(f"SELECT * FROM {t} ORDER BY 1") for t in TABLES}
+
+
+async def _visible_root_protected_target(reg, edge: str) -> tuple[str, str]:
+    p = await _legacy_decision(reg, "Visible proposal", "bp")
+    d = _corpus_decision(reg, "d", "Protected approved")
+    reg.approve(d, HUMAN, rp.reader())
+    if edge == "conflicts_with":
+        reg.relate(p, d, "conflicts_with", HUMAN, access=rp.reader())
+    else:
+        reg.supersede(p, d, HUMAN, rp.reader())  # proposed: d is approved, p is not
+    return p, d
+
+
+@pytest.mark.parametrize("choice", ["supersede", "keep"])
+@pytest.mark.parametrize("ctx", [None, DENIED, ENGINEER], ids=["none", "denied", "engineer"])
+async def test_resolve_conflict_cannot_reach_a_protected_target(reg, choice, ctx):
+    p, d = await _visible_root_protected_target(reg, "conflicts_with")
+    before = _snapshot(reg)
+    with pytest.raises(NotFound) as exc:
+        reg.resolve_conflict(p, choice, UNLISTED, ctx)
+    assert str(exc.value) == f"no registry object {p}"  # names only the visible root
+    assert d not in str(exc.value)
+    assert _snapshot(reg) == before
+    assert reg.get(d)["status"] == "approved"
+
+
+@pytest.mark.parametrize("ctx", [None, DENIED, ENGINEER], ids=["none", "denied", "engineer"])
+async def test_approve_cannot_apply_a_supersession_onto_a_protected_target(reg, ctx):
+    p, d = await _visible_root_protected_target(reg, "supersedes")
+    before = _snapshot(reg)
+    with pytest.raises(NotFound) as exc:
+        reg.approve(p, UNLISTED, ctx)
+    assert str(exc.value) == f"no registry object {p}"
+    assert _snapshot(reg) == before
+    assert reg.get(d)["status"] == "approved"
+
+
+async def test_views_of_the_visible_root_never_name_the_hidden_blocker(reg):
+    p, d = await _visible_root_protected_target(reg, "conflicts_with")
+    for view in (
+        reg.detail(p, None)["unresolved"],
+        next(o for o in reg.queue(None) if o["id"] == p)["unresolved"],
+    ):
+        assert all(d not in reason for reason in view)
+    assert any(d in r for r in reg.detail(p, rp.reader())["unresolved"])
+
+
+async def test_an_approved_corpus_reader_can_still_resolve_and_approve(reg):
+    p, d = await _visible_root_protected_target(reg, "conflicts_with")
+    reg.resolve_conflict(p, "supersede", Actor("human", "pat"), rp.reader())
+    assert reg.get(d)["status"] == "superseded" and reg.get(p)["status"] == "approved"
+    q = await _legacy_decision(reg, "Second", "bq")
+    e = _corpus_decision(reg, "e", "Another protected")
+    reg.approve(e, HUMAN, rp.reader())
+    reg.supersede(q, e, HUMAN, rp.reader())
+    reg.approve(q, HUMAN, rp.reader())
+    assert reg.get(e)["status"] == "superseded"
