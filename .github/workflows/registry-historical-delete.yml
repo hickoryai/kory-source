@@ -1,0 +1,164 @@
+name: Registry historical delete
+
+# One-off removal of the historical private container package
+# ghcr.io/hickoryai/kory-source, whose versions failed the registry history
+# audit. Manual dispatch only; dispatching it, in either mode, needs a
+# maintainer's approval on the record first.
+#
+# Dry run (version_ids empty): lists the package's live visibility and every
+#   active version to the job summary. Deletes nothing; the token can only
+#   read packages.
+# Real run (version_ids set): requires confirm_package == kory-source and the
+#   supplied version ids to EXACTLY equal the live version id set, re-read in
+#   the deleting job. Any mismatch fails before anything is deleted. On a match
+#   it deletes the whole package in one call, then checks that it is gone.
+#
+# Only the package entity is deleted, never single versions. GitHub refuses to
+# delete the last tagged version of a package on its own (it answers 400 and
+# asks for the package to be deleted instead), so deleting the package is the
+# only way to remove every version, tagged and untagged, in one step.
+#
+# The target is hard-coded below and is never taken from inputs or from the
+# repository context, so no other owner or package can be targeted.
+#
+# GITHUB_TOKEN can delete the package only while this repository has the
+# Admin role on it (package settings -> Manage Actions access). GitHub grants
+# that by default to the repository whose workflow published the package. If
+# the role is missing, the DELETE call fails, nothing is removed, and the run
+# fails.
+on:
+  workflow_dispatch:
+    inputs:
+      version_ids:
+        description: >-
+          Comma-separated version ids to delete. Leave empty for a dry run.
+          Must exactly equal the live version id set.
+        required: false
+        default: ""
+        type: string
+      confirm_package:
+        description: Type the package name (kory-source) to confirm a real run.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: registry-historical-delete
+  cancel-in-progress: false
+
+env:
+  TARGET_ORG: hickoryai
+  TARGET_PACKAGE: kory-source
+  PACKAGE_API: /orgs/hickoryai/packages/container/kory-source
+
+jobs:
+  inventory:
+    # Read-only for both modes. The dry run ends here.
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    steps:
+      - name: List package visibility and every version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_IDS: ${{ inputs.version_ids }}
+        run: |
+          set -euo pipefail
+          package=$(gh api "$PACKAGE_API")
+          versions=$(gh api --paginate "$PACKAGE_API/versions?per_page=100" | jq -s 'add')
+          {
+            echo "## Registry historical delete: inventory"
+            echo
+            echo "Target: \`ghcr.io/$TARGET_ORG/$TARGET_PACKAGE\` (container)"
+            echo
+            echo "Visibility: \`$(jq -r .visibility <<< "$package")\`"
+            echo "Active versions: $(jq length <<< "$versions")"
+            echo
+            echo "| id | tags | created_at | digest |"
+            echo "| --- | --- | --- | --- |"
+            jq -r 'sort_by(.id)[] | "| \(.id) | \(.metadata.container.tags | join(", ")) | \(.created_at) | `\(.name)` |"' <<< "$versions"
+            echo
+            echo "After a delete, GitHub lets a package admin restore the package for 30 days."
+            echo "A restore would bring back these private versions with the contents that"
+            echo "failed the registry history audit."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$VERSION_IDS" ]; then
+            echo "**Dry run: nothing was deleted.**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  delete:
+    needs: inventory
+    if: inputs.version_ids != ''
+    runs-on: ubuntu-latest
+    # The only job that can write packages.
+    permissions:
+      packages: write
+    steps:
+      - name: Check confirmation and exact version set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_IDS: ${{ inputs.version_ids }}
+          CONFIRM_PACKAGE: ${{ inputs.confirm_package }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; printf '**Refused, nothing deleted:** %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+
+          [ "$CONFIRM_PACKAGE" = "$TARGET_PACKAGE" ] \
+            || fail "confirm_package must be exactly '$TARGET_PACKAGE'."
+
+          supplied=$(tr ',' '\n' <<< "$VERSION_IDS" | tr -d '[:blank:]' | sed '/^$/d')
+          [ -n "$supplied" ] || fail "version_ids has no ids."
+          if grep -qvE '^[0-9]+$' <<< "$supplied"; then
+            fail "version_ids must be comma-separated numeric ids."
+          fi
+          [ -z "$(sort <<< "$supplied" | uniq -d)" ] || fail "version_ids repeats an id."
+
+          # Re-read the live set here, not in the inventory job, so a version
+          # pushed between the two jobs still blocks the delete.
+          live=$(gh api --paginate "$PACKAGE_API/versions?per_page=100" --jq '.[].id')
+          [ -n "$live" ] || fail "the package has no active versions."
+          if [ "$(sort -n <<< "$supplied")" != "$(sort -n <<< "$live")" ]; then
+            fail "version_ids ($(sort -n <<< "$supplied" | paste -sd, -)) do not exactly equal the live version ids ($(sort -n <<< "$live" | paste -sd, -))."
+          fi
+          echo "Supplied ids exactly match the live version ids: $(sort -n <<< "$live" | paste -sd, -)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete the package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh api --method DELETE "$PACKAGE_API"; then
+            {
+              echo "**Delete failed.** GitHub refused to delete \`ghcr.io/$TARGET_ORG/$TARGET_PACKAGE\`."
+              echo "If the error is 403 or 404, this repository lacks the Admin role on the package:"
+              echo "a package admin must grant it under package settings -> Manage Actions access."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+      - name: Verify the package is gone
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com$PACKAGE_API")
+          if [ "$status" != "404" ]; then
+            echo "::error::Package still answers HTTP $status after delete."
+            echo "**Verification failed:** the package still answers HTTP $status." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          {
+            echo "**Deleted and verified:** \`ghcr.io/$TARGET_ORG/$TARGET_PACKAGE\` now answers HTTP 404."
+            echo
+            echo "GitHub lets a package admin restore a deleted package for 30 days."
+            echo "A restore would bring back the private historical versions with the contents"
+            echo "that failed the registry history audit. Do not restore it."
+          } >> "$GITHUB_STEP_SUMMARY"
