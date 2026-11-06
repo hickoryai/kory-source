@@ -1275,7 +1275,7 @@ async def test_capture_records_full_drafts_critique_and_tools(monkeypatch, tmp_p
         {
             "verdicts": [
                 {"index": 0, "evidence": "proven", "reason": "shown"},
-                {"index": 1, "evidence": "plausible", "reason": "not shown"},
+                {"index": 1, "evidence": "unsupported", "reason": "contradicted"},
             ]
         }
     )

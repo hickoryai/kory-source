@@ -227,14 +227,32 @@ def check_verdicts(data: Any, n: int) -> None:
         raise ReplayReplyError("a verdict has no valid evidence grade")
 
 
+def capture_time_keep(verdict: dict, comment: Any) -> bool:
+    """The production keep rule as it was when the frozen captures were made.
+
+    The step1 capture was taken at a head where a ``plausible`` grade needed
+    WARNING+ and drafter confidence >= 0.8. Replaying those frozen decisions
+    must use that rule, not whatever the reviewer ships today.
+    """
+    from mira.models import Severity
+
+    evidence = verdict.get("evidence")
+    if evidence == "proven":
+        return True
+    if evidence == "plausible":
+        return comment.severity >= Severity.WARNING and comment.confidence >= 0.8
+    if evidence == "unsupported":
+        return False
+    return verdict.get("keep") is True
+
+
 def critique_keep(data: dict, drafts: list[dict]) -> tuple[list[int], list[str]]:
-    """The kept indices and grades for one critic reply, decided exactly like ``self_critique``.
+    """The kept indices and grades for one critic reply, decided like ``self_critique`` did at capture.
 
     The reply must pass ``check_verdicts`` first; for a valid reply the keep
-    semantics are the production ones.
+    semantics are the capture-time production ones (``capture_time_keep``).
     """
     check_verdicts(data, len(drafts))
-    from mira.core.passes import _critique_keep
     from mira.models import ReviewComment, Severity
 
     comments = [ReviewComment(**{**d, "severity": Severity[d["severity"]]}) for d in drafts]
@@ -254,7 +272,7 @@ def critique_keep(data: dict, drafts: list[dict]) -> tuple[list[int], list[str]]
         if not 0 <= idx < len(comments):
             continue
         grades[idx] = str(v.get("evidence", "keep=false"))
-        if _critique_keep(v, comments[idx]):
+        if capture_time_keep(v, comments[idx]):
             keep.add(idx)
     return sorted(keep), grades
 
