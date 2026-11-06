@@ -239,3 +239,9 @@ a release and visibility gate, separate from PR checks) runs
 including every platform image and attestation manifest, config, and layer. Any
 finding, unreadable version, or incomplete listing fails the run.
 Its results are bounded pattern evidence, not proof that history is safe.
+`.github/workflows/registry-historical-delete.yml` is a one-off, manually dispatched
+removal of one hard-coded historical package that failed that audit. With no version
+ids it only lists the package; a real run needs the package name typed to confirm and
+the exact live version id set, and it deletes the whole package and then checks that
+it is gone. A restore within GitHub's 30-day window would bring the audited contents
+back.
