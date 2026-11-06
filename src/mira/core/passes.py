@@ -393,7 +393,10 @@ def _critique_keep(verdict: dict, comment: ReviewComment) -> bool:
     if evidence == "proven":
         return True
     if evidence == "plausible":
-        return comment.severity >= Severity.WARNING and comment.confidence >= 0.8
+        # Real findings that depend on code the critic can't see land here. The
+        # drafter's own confidence already passed the noise-filter floor, so a
+        # second, stricter confidence cut only deletes them.
+        return comment.severity >= Severity.WARNING
     if evidence == "unsupported":
         return False
     # Older binary shape (model fallback): honor it.
