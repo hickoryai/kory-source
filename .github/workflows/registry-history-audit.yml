@@ -1,25 +1,20 @@
 name: Registry history audit
 
-# Read-only evidence for a visibility decision: audits every active version of
-# the container package (tagged and untagged, every platform image and
-# attestation, config, history, and layer). It never pushes, deletes, or
-# changes visibility; the token is limited to reading contents and packages.
+# Release/visibility gate, not a PR code check: run it by hand (Actions ->
+# Registry history audit -> Run workflow) before deciding a package's
+# visibility. It audits every active version of the container package
+# (tagged and untagged, every platform image and attestation, config, history,
+# and layer) and fails while any published version has findings. It never
+# pushes, deletes, or changes visibility; the token can only read contents and
+# packages. The scripts' unit tests run in CI with the rest of the suite.
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/registry-history-audit.yml
-      - scripts/audit_public_image.py
-      - scripts/audit_registry_history.py
 
 permissions:
   contents: read
 
 jobs:
   audit:
-    # Fork pull requests get no package access; skip rather than fail.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read

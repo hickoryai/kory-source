@@ -233,7 +233,8 @@ Export the effective context with `docker build --target build-context
 --output type=local,dest=/tmp/public-context .` and inspect it with
 `--context /tmp/public-context`; CI and both release paths run this check.
 Before changing a package's visibility, audit its published history too:
-`.github/workflows/registry-history-audit.yml` (read-only, `packages: read`) runs
+`.github/workflows/registry-history-audit.yml` (manual dispatch, read-only, `packages: read`;
+a release and visibility gate, separate from PR checks) runs
 `scripts/audit_registry_history.py` over every active tagged and untagged version,
 including every platform image and attestation manifest, config, and layer. Any
 finding, unreadable version, or incomplete listing fails the run.
