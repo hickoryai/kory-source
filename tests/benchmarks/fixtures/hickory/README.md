@@ -61,9 +61,24 @@ unit of comparison is therefore **one PR at one commit Greptile reviewed**:
   of both reviewers' scores.
 
 The frozen manifest yields 46 units (25 held-out, 21 development). The
-reviewer sees only the PR title, the description minus lines that mention
-Greptile, and the snapshot diff. It sees no bot threads, so the engine stays
-in round one.
+reviewer sees only the fixture's PR title and the snapshot diff. It sees no
+PR description and no bot threads, so the engine stays in round one.
+
+Every reviewer read is pinned to the unit's commit (HAI-12817). The engine
+reads sources and the repo tree at `pr_info.head_branch`, the live branch;
+`PinnedGitHubProvider` rewrites that ref to `unit.sha`, and lists file
+history from `unit.sha` instead of the default branch. Before HAI-12817 the
+diff was pinned but source reads, the tree, history, title, and description
+were live, so artifacts without `"harness": "hai-12817-pinned-reads"` came
+from different reviewer inputs. Compare a baseline and a candidate only when
+both ran on the same harness.
+
+Since HAI-12817 the router-acp provider answers the engine's agentic loop
+with JSON tool calls, so the reviewer can call `read_file`, `grep_repo`, and
+`search_decisions`. The harness answers `search_decisions` with
+`[registry unavailable]` in both arms: the live search has no as-of filter,
+and in `registry_off` it would leak the registry. The A/B still measures the
+prompt block only.
 
 ### Blind judge
 
@@ -181,6 +196,11 @@ GITHUB_TOKEN="$(gh auth token)" uv run python tests/benchmarks/fixtures/hickory/
 - for every (unit, arm, run): the exact judge prompt, its SHA-256, the
   shuffle seed, the pool with owners, the raw and parsed judge responses, the
   neutral Kory comments, latency, and seat calls;
+- for every review: the engine's audit trail (per-chunk drafts, the
+  reviewer's tool calls, and each comment a filter or critique stage
+  dropped), plus reviewed and skipped paths. The report summarizes them
+  under "Pipeline (informational)". Scoring never reads them, and artifacts
+  without them still rescore;
 - the later-fix evidence and the reverts.
 
 `rescore` uses nothing else. `run` aborts before any call if the seat-session
@@ -188,8 +208,170 @@ estimate exceeds `--seat-budget`. The budget is also a hard cap during the
 run: every relay request counts as one seat session, and once the count
 reaches the budget each further request fails with `seat_budget_exhausted`
 and no new unit starts. A run that hits the cap is `inconclusive`.
+The `plan` estimate counts one-shot reviews only. With agentic hops a review
+can take up to six more seat calls per chunk, so set the budget from the
+worst case, not the estimate.
 
 Both arms replace the engine's whole registry hook with the prompt block
 alone. The contradiction check (HAI-12196) does not run in either arm: it
 would judge decisions approved after Greptile's review, and its seat calls
 fall outside the A/B and the budget estimate.
+
+### Raw capture (opt-in, HAI-12817)
+
+The audit trail keeps titles and drop reasons only. To keep everything the reviewer
+saw and said, set `KORY_PARITY_CAPTURE_PATH` to a new file outside the repository
+before `run`:
+
+```bash
+KORY_PARITY_CAPTURE_PATH=/opt/dev/artifacts/<ticket>/private/capture.jsonl \
+  GITHUB_TOKEN="$(gh auth token)" uv run python tests/benchmarks/fixtures/hickory/run_parity.py run ...
+```
+
+Without the variable nothing is patched or written, and the artifact is the same
+as before. With it, the harness wraps only harness-owned hooks. Each wrapper
+records, then passes the same arguments through and returns the same value. So
+replies, call counts, call order, model pins and the seat meter do not change.
+The artifact gains one `capture` key (`schema`, `path`, `records`, `sha256` of
+the file). Scoring never reads the capture.
+
+The file is JSON Lines, schema `hai-12817-capture-v1`. Every record has `seq`,
+`kind`, `attribution` (`review|<arm>|r<run>|<unit>`) and `stage` (`review`,
+`agentic_review`, `security`, `dependency`, `self_critique`, `summary`,
+`pr_summary`).
+
+| kind | source hook | fields |
+|---|---|---|
+| `header` | `run_parity` | schema, harness, reviewer model, arms, runs, seed, unit ids |
+| `seat_call` | reviewer transport, inside the excluded-family check and the seat meter | `request` (the relay body: exact `prompt`, `model`, `priority`, `timeout_seconds`), then `response` (the relay payload: `text`, `actual_model`, …) or `error` (`type`, `kind`, `detail`, `body`), and `duration_s` |
+| `noise_filter` | `engine.filter_noise` | `drafts` (every comment in, all fields: body, `existing_code`, confidence, severity, `source_pass`) and `kept` |
+| `critique_input` | `engine.self_critique` | `drafts` (full comments, before the critic's 500/400/1200-character cuts), `diff_paths`, `learned_rules`, `custom_rules` |
+| `critique_output` | `engine.self_critique` | `kept_indices` into `drafts` |
+| `tool_call` | `AgenticToolExecutor.execute`, and the harness's own `search_decisions` answer | `executor`, `tool`, `args`, `result` (the exact string fed back to the model), `answered_by` |
+
+The critic's exact prompt and raw reply are the `seat_call` records with
+`stage == "self_critique"`. Judge calls are not captured: the artifact already
+holds their prompts and replies. Refused calls (past the seat cap) never reach
+the transport, so they are not captured either.
+
+The capture holds private source code and full model output, so the file is
+created `0600` in a `0700` directory. An existing file is never overwritten:
+`run` fails before any model call. Request headers, which carry the relay bearer
+token, are never written. Keep captures under `/opt/dev/artifacts`, never in the
+repository or a PR.
+
+### Paired critique replay (HAI-12817, steps 2-3)
+
+`tests/benchmarks/critique_replay.py` re-runs one captured critique stage. It
+never re-samples a review. Inputs are pinned:
+- the capture's and run artifact's SHA-256, plus `SHA256SUMS`;
+- the manifest hash;
+- the 14 predeclared development units;
+- the reviewer and judge pins;
+- Step 1's seat use.
+
+Each snapshot diff is refetched and must match the run artifact's hash. Any
+mismatch, unlisted record, held-out unit, unlinked critique draft, or keep
+decision the rule cannot reproduce stops the command before any model call.
+
+```bash
+# Dry run: no model calls. Writes plan.json plus private diffs and prompts.
+GITHUB_TOKEN="$(gh auth token)" uv run python tests/benchmarks/critique_replay.py plan \
+  --step1 /opt/dev/artifacts/HAI-12817/step1 --out /opt/dev/artifacts/HAI-12817/step2
+# Live, only with parent approval: re-checks every input against plan.json first.
+MIRA_ROUTER_ACP_RELAY_ENTRY=<loopback entry> uv run python tests/benchmarks/critique_replay.py run \
+  --step1 /opt/dev/artifacts/HAI-12817/step1 --out /opt/dev/artifacts/HAI-12817/step2 --approved-live
+# Offline: recompute the decision from the stored results.
+uv run python tests/benchmarks/critique_replay.py decide --step1 ... --out ...
+```
+
+1. **Labels first.** For each review with drafts there is one blind judge call.
+   The pool is Greptile's comments plus every captured draft, including drafts
+   the noise filter dropped, with full bodies and the snapshot diff.
+   - The judge never sees severity, confidence, grades, keep status, condition,
+     or which comments are golden.
+   - A draft counts as golden only when the judge groups it with that golden
+     finding's comment and calls it real. Non-golden does not mean false
+     positive: every draft gets its own label.
+2. **Small-sample stop.** D is the number of golden findings the captured
+   critique dropped. If the labels confirm D < 3, the result is inconclusive and
+   nothing is replayed.
+3. **Replay.**
+   - **C0** re-sends the captured critic request body byte for byte.
+   - **C1** inserts one section before `## Required output`: that review's own
+     captured tool results plus the untruncated diff hunks for each draft.
+
+   C1 changes context and truncation together, so it cannot attribute an
+   effect to either one. Both conditions use the captured keep rule
+   (`passes._critique_keep`), and the same pinned model must answer.
+4. **Decision.** The predeclared rule:
+   - precision floor exactly 5/6 − 0.02 = 61/75;
+   - new-keep error rate ≤ 1/5, including with uncertain labels counted as not
+     real;
+   - negative controls ≤ 1/10;
+   - C0 reproducibility ≥ 9/10;
+   - judge errors ≤ 1/20.
+
+   An empty denominator is inconclusive. A pin failure, leak marker, or
+   unexpected request body stops the run.
+
+**Budget.** One append-only `meter.jsonl` covers labels and replays:
+- the cap is 126 requests, including retries;
+- each request is counted before it is sent;
+- the global ledger is 87 (Step 1) + 126 + 87 unallocated = 300.
+
+**Resume.** A call that started but has no result is recorded as interrupted
+and never retried. A terminal stop (pin failure, leak marker, unexpected
+request body, or budget) is written to `STOP.json` the moment it happens. It is
+restored before any request on resume, so a stopped run never sends again. An
+existing `decision.json` is returned as is, with no calls.
+
+**Critic replies.** A replayed reply must grade every draft exactly once:
+- a non-empty `verdicts` list with one entry per draft;
+- either all entries indexed, covering `0..n-1` once each, or all positional;
+- every `evidence` one of proven, plausible or unsupported.
+
+Anything else fails that replay, which makes the result inconclusive. A broken
+reply can never act as a keep-none control. Valid replies keep the production
+keep rule. Every output (`calls/*.json`, `decision.json`, `plan.json`,
+prompts, diffs) is written once with mode 0600 in 0700 directories.
+
+### Drafting/critique measurement study (HAI-12817 design S; diagnostic only)
+
+`tests/benchmarks/study_capture.py` implements the measurement study in
+`NEXT_EXPERIMENT_PLAN_v3.md`, design S: 12 development units × 1 run. It is not
+a parity or release measurement. It does not change the reviewer, its
+thresholds, or the ordinary parity defaults.
+
+```bash
+uv run python tests/benchmarks/study_capture.py plan --head <sha> --out <dir>           # offline manifest
+GITHUB_TOKEN=... MIRA_ROUTER_ACP_RELAY_ENTRY=<entry> uv run python tests/benchmarks/study_capture.py capture --out <dir> --approved-live
+GITHUB_TOKEN=... MIRA_ROUTER_ACP_RELAY_ENTRY=<entry> uv run python tests/benchmarks/study_capture.py label   --out <dir> --approved-live
+uv run python tests/benchmarks/study_capture.py report --out <dir>                       # offline
+```
+
+- **Manifest.** `plan` writes a frozen `study-manifest.json` (write-once, 0600, in a 0700 directory) with:
+  - the seeded, interleaved unit order;
+  - every planned unit-run;
+  - the frozen eligible golden ids (`11892-1` excluded for its invalid anchor);
+  - the per-rule planned sets, negative controls included;
+  - the predeclared rules.
+
+  `capture` and `label` refuse to run unless the manifest still equals the frozen design.
+- **Capture.** An ordinary `run_parity` with three diagnostic options:
+  - `ordered=True`: one unit at a time;
+  - `skip_posted_judge=True`: the blind labels judge every draft instead. `summarize` refuses such an artifact;
+  - the capture pool as its meter.
+
+  The defaults (`ordered=False`, `skip_posted_judge=False`, `meter=None`) are unchanged.
+- **Ledger.** One append-only `ledger.jsonl` with two pools:
+  - a capture pool (cap 119 − 36 = 83 for S);
+  - one disjoint 3-request label reservation per planned unit-run.
+
+  Each request is counted before it is sent. Capture can never spend a label reservation, and a label call can only spend its own. Nothing resets.
+- **Labels.** One blind judge call per captured unit-run that has drafts. Unit-runs with zero drafts make no call. A terminal stop (`STOP.json`) is restored before any request, so a stopped study never sends again.
+- **Report.** For every planned unit-run, its outcome and reason for any missingness. Rule definitions follow plan v3 §6:
+  - a required label that is missing or failed makes the unit-run incomplete;
+  - the judge error rate counts terminal per-unit outcomes, not attempts;
+  - when every unit-run a rule covers is a valid zero-draft capture, the judge error rate is N/A and the judge-validity precondition does not apply to the descriptive R-draft;
+  - precision and critique rules are not evaluable without a denominator.

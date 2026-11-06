@@ -38,11 +38,12 @@ class TestKeepRule:
         c = _comment(severity=Severity.BLOCKER, confidence=1.0)
         assert not _critique_keep({"evidence": "unsupported"}, c)
 
-    def test_plausible_kept_only_when_severe_and_confident(self):
+    def test_plausible_kept_when_warning_or_above(self):
         assert _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, confidence=0.8))
         assert _critique_keep({"evidence": "plausible"}, _comment(Severity.BLOCKER, 0.95))
-        assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, 0.7))
+        assert _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, 0.7))
         assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.SUGGESTION, 0.95))
+        assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.NITPICK, 0.99))
 
     def test_legacy_keep_boolean_honored(self):
         c = _comment()

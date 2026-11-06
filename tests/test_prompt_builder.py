@@ -238,3 +238,35 @@ class TestReviewPromptCrossBoundaryTracing:
         messages = build_review_prompt(files, config)
         system = messages[0]["content"]
         assert "## Cross-Boundary Tracing" in system
+
+
+class TestReviewPromptDraftingCoverage:
+    """The drafter is told to hunt for defects, not to confirm the change or cap its output."""
+
+    def _system(self) -> str:
+        files = [
+            FileDiff(
+                path="test.py",
+                change_type=FileChangeType.MODIFIED,
+                hunks=[HunkInfo(1, 5, 1, 5, "content")],
+                language="python",
+                added_lines=1,
+                deleted_lines=1,
+            )
+        ]
+        return build_review_prompt(files, MiraConfig())[0]["content"]
+
+    def test_review_method_section_precedes_cross_boundary_tracing(self):
+        system = self._system()
+        assert "## Review Method" in system
+        assert system.index("## Review Method") < system.index("## Cross-Boundary Tracing")
+
+    def test_method_covers_state_lifetime_and_duplicated_rules(self):
+        system = self._system()
+        assert "not reset when their key" in system
+        assert "the same rule implemented in two places" in system
+
+    def test_no_comment_count_target(self):
+        system = self._system()
+        assert "or fewer** comments" not in system
+        assert "There is no target comment count" in system
