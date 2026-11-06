@@ -249,6 +249,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         if log is not None:
             log.close()
     _write(Path(args.out), artifact)
+    fatal = (artifact.get("seat_meter") or {}).get("fatal")
+    if fatal:
+        print(f"run stopped, not scorable: {fatal}", file=sys.stderr)
+        return 5
     return 0
 
 

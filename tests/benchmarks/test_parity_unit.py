@@ -813,8 +813,63 @@ async def test_seat_meter_refuses_past_the_cap():
         "used": 2,
         "refused": 1,
         "exhausted": True,
+        "fatal": "",
     }
     assert parity_runner.SeatMeter(0).exhausted is False  # 0 = no cap
+
+
+async def test_pinned_fallback_stops_the_whole_run():
+    replies = iter(
+        [
+            {"actual_model": "claude@acct/opus", "text": "{}"},
+            {"actual_model": "codex/gpt-6-astra", "text": "{}"},
+        ]
+    )
+    sent = []
+
+    async def transport(request):
+        sent.append(request)
+        return next(replies)
+
+    meter = parity_runner.SeatMeter(0)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    pinned = {"body": {"model": "claude@acct/opus"}}
+    await llm._transport(pinned)
+    assert meter.exhausted is False
+    await llm._transport(pinned)  # the fallback reply itself is returned; the client rejects it
+    assert meter.exhausted is True
+    assert meter.fatal == "pinned model claude@acct/opus served by codex/gpt-6-astra"
+    with pytest.raises(parity_runner.SeatBudgetExhausted, match="run_stopped"):
+        await llm._transport(pinned)
+    assert len(sent) == 2 and meter.as_dict()["refused"] == 1
+
+
+async def test_unpinned_requests_never_trip_the_pin_guard():
+    async def transport(request):
+        return {"actual_model": "codex/gpt-6-astra"}
+
+    meter = parity_runner.SeatMeter(0)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    await llm._transport({"body": {"model": "auto"}})
+    await llm._transport({})
+    assert meter.fatal == "" and meter.exhausted is False
+
+
+async def test_fatal_meter_makes_the_verdict_invalid(monkeypatch):
+    art, _ = await _artifact(monkeypatch)
+    art = json.loads(json.dumps(art))
+    art["seat_meter"] = {
+        "budget": 0,
+        "used": 2,
+        "refused": 1,
+        "exhausted": True,
+        "fatal": "pinned model a served by b",
+    }
+    summary = parity_runner.summarize(art)
+    assert summary["parity_verdict"] == "invalid"
+    md = parity_runner.render_markdown(summary)
+    assert "**Verdict: invalid**" in md
+    assert "run stopped, not scorable: pinned model a served by b" in md
 
 
 def test_exhausted_budget_is_inconclusive():

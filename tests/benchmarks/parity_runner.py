@@ -29,6 +29,7 @@ from typing import Any
 
 from mira.config import FilterConfig, LLMConfig, MiraConfig, ReviewConfig
 from mira.core.engine import ReviewEngine
+from mira.llm.router_acp import UNPINNED_MODELS
 
 from .parity_judge import GREPTILE, KORY, judge_unit, rescore_unit
 from .parity_snapshot import (
@@ -98,10 +99,13 @@ class SeatMeter:
         self.budget = budget
         self.used = 0
         self.refused = 0
+        # First pinned request served by another model. A fallback reply is not
+        # evidence for the pinned reviewer, so it stops the whole run.
+        self.fatal = ""
 
     @property
     def exhausted(self) -> bool:
-        return bool(self.budget) and self.used >= self.budget
+        return bool(self.fatal) or (bool(self.budget) and self.used >= self.budget)
 
     def guard(self, llm: Any) -> Any:
         inner = getattr(llm, "_transport", None)
@@ -111,9 +115,23 @@ class SeatMeter:
         async def _metered(request: dict[str, Any]) -> dict[str, Any]:
             if self.exhausted:
                 self.refused += 1
+                if self.fatal:
+                    raise SeatBudgetExhausted(f"run_stopped: {self.fatal}")
                 raise SeatBudgetExhausted(f"seat_budget_exhausted: {self.used}/{self.budget} used")
             self.used += 1
-            return await inner(request)
+            payload = await inner(request)
+            requested = str(((request.get("body") or {}).get("model")) or "")
+            actual = (
+                str((payload or {}).get("actual_model") or "") if isinstance(payload, dict) else ""
+            )
+            if (
+                requested not in UNPINNED_MODELS
+                and actual
+                and actual != requested
+                and not self.fatal
+            ):
+                self.fatal = f"pinned model {requested} served by {actual}"
+            return payload
 
         llm._transport = _metered
         return llm
@@ -124,6 +142,7 @@ class SeatMeter:
             "used": self.used,
             "refused": self.refused,
             "exhausted": self.exhausted or self.refused > 0,
+            "fatal": self.fatal,
         }
 
 
@@ -1115,7 +1134,13 @@ def summarize(artifact: dict) -> dict:
         "arms": arms,
         "registry_ab": ab,
         "shipped_arm": shipped,
-        "parity_verdict": arms[shipped]["parity"]["verdict"] if shipped in arms else "inconclusive",
+        "parity_verdict": (
+            "invalid"
+            if meter.get("fatal")
+            else arms[shipped]["parity"]["verdict"]
+            if shipped in arms
+            else "inconclusive"
+        ),
     }
 
 
@@ -1238,6 +1263,8 @@ def render_markdown(summary: dict) -> str:
         lines.append(
             f"- metered: {meter['used']} of {meter['budget'] or 'unlimited'} seat sessions, {meter['refused']} refused at the cap"
         )
+        if meter.get("fatal"):
+            lines.append(f"- run stopped, not scorable: {meter['fatal']}")
     lines += [
         "",
         "`fixed_later` is biased toward Greptile (authors fixed what Greptile showed them) and can include base-branch merges into the PR's own files.",
