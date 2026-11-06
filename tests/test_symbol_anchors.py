@@ -539,15 +539,15 @@ def test_fingerprint_ignores_the_symbol_name() -> None:
     assert left == right
 
 
-def test_index_repos_help_documents_iam_login() -> None:
+def test_index_repos_help_requires_runtime_repository_selection() -> None:
     from click.testing import CliRunner
 
     from mira.cli import main
 
     result = CliRunner().invoke(main, ["index-repos", "--help"])
     assert result.exit_code == 0
-    assert "auto-iam-authn" in result.output
-    assert "kory-source-indexer" in result.output
+    assert "--repo owner/repo" in result.output
+    assert "credentials at runtime" in result.output
 
 
 def test_symbol_info_defaults_keep_old_callers() -> None:

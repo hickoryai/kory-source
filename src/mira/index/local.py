@@ -26,14 +26,7 @@ from mira.index.store import FileSummary, IndexStore
 
 logger = logging.getLogger(__name__)
 
-# Repositories the Cloud Run job indexes when no --repo flag is passed.
-# A workstation run passes owner/repo=/checkout so rename detection can run.
-DEFAULT_INDEX_REPOS = (
-    "hickoryai/hickory-ai",
-    "hickoryai/goose",
-    "zaneclaes/router-acp",
-    "hickoryai/kory-source",
-)
+# Repository selection is supplied explicitly at runtime.
 
 
 @dataclass

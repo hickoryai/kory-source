@@ -1,4 +1,4 @@
-"""Read-only Linear import into the registry (HAI-11606).
+"""Read-only Linear import into the registry.
 
 Linear stays authoritative during the dual-write. This module only reads
 Linear: the client refuses any GraphQL mutation. It has three parts:
@@ -14,7 +14,7 @@ Linear: the client refuses any GraphQL mutation. It has three parts:
   are re-read at the end of each issue walk.
 
 Run with ``python -m mira.registry.linear inventory|import``. It covers every
-team the corpus access policy enumerates (HAI-12825) and every state, archived
+team the corpus access policy enumerates and every state, archived
 and trashed included; ``--team KEY`` narrows it to named manifest teams. A team
 the workspace has but the manifest does not list is reported to the operator and
 never fetched or stored: a new team needs approval first. ``import`` is a dry
@@ -74,8 +74,7 @@ STATE_DELIVERY = {
 RELATIONS_PAGE = 50  # the relations(first:) in ISSUES_QUERY
 PENDING_BATCH = 50  # ids per ``id: {in: [...]}`` re-read of pending issues
 
-# Field names follow hickory-ai's production Linear poller
-# (hickory-ui/backend/app/services/engineering_metrics/linear_poller.py).
+# Request only the fields required for read-only imports.
 ISSUES_QUERY = """
 query RegistryIssues($filter: IssueFilter!, $after: String, $first: Int!) {
   issues(filter: $filter, after: $after, first: $first, orderBy: updatedAt, includeArchived: true) {

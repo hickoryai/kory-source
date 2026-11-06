@@ -22,7 +22,7 @@ def create_llm(config: LLMConfig) -> LLMProviderProtocol:
         return CodexCLIProvider(config)
 
     if config.provider in {"router-acp", "router_acp"}:
-        # Router-acp calls run on the requester's seats (HAI-12330). Only the
+        # Router-acp calls run on the requester's seats. Only the
         # review API has a requester; everything else fails closed.
         from mira.llm.router_acp import UnconfiguredSeatProvider
 

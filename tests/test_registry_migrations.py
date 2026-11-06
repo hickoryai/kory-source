@@ -1,7 +1,8 @@
-"""Versioned additive registry migrations (HAI-12825)."""
+"""Versioned additive registry migrations."""
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import threading
@@ -85,6 +86,92 @@ def test_edited_released_migration_stops_startup(tmp_path):
     edited = [Migration(1, "provenance", migrations.available()[0].sql + "\n-- edited")]
     with pytest.raises(MigrationError, match="immutable"):
         migrations.migrate(db, known=edited)
+
+
+RELEASED_001_SHA256 = "0fcb1bff083ff2355aa5ee0e40d6162cf98bce2fe89b4235ee5aead63a9798c6"
+
+
+def _released_001() -> Migration:
+    """Migration 001 exactly as v0.11.0 shipped it (only its first comment line differed)."""
+    current = migrations.available()[0]
+    first = "-- " + "HAI" + "-12825: decision provenance. Additive only; never edit after release."
+    body = current.sql.split("\n", 1)[1]
+    return Migration(1, "provenance", first + "\n" + body)
+
+
+def _stamp(path: Path, sha: str) -> None:
+    """A database migrated by a release whose migration 001 had checksum ``sha``."""
+    db = RegistryDB(path=str(path))
+    db.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE registry_schema_migrations SET sha256 = ? WHERE version = 1", (sha,))
+
+
+def test_released_v0_11_0_checksum_is_reproduced_and_statements_are_unchanged():
+    released, current = _released_001(), migrations.available()[0]
+    assert released.sha256 == RELEASED_001_SHA256
+    assert current.sha256 != RELEASED_001_SHA256
+    assert current.statements() == released.statements()
+    assert current.ledger_sha256 == RELEASED_001_SHA256
+
+
+def test_database_stamped_by_v0_11_0_starts_without_rewriting_the_ledger(tmp_path):
+    path = tmp_path / "v0110.db"
+    _stamp(path, RELEASED_001_SHA256)
+    db = RegistryDB(path=str(path))
+    assert migrations.migrate(db) == []
+    assert migrations.applied(db) == {1: ("provenance", RELEASED_001_SHA256)}
+    db.close()
+
+
+def test_fresh_database_records_the_released_checksum_so_rollback_still_starts(tmp_path):
+    db = RegistryDB(path=str(tmp_path / "fresh.db"))
+    assert migrations.applied(db)[1][1] == RELEASED_001_SHA256
+    migrations._check([_released_001()], migrations.applied(db))  # v0.11.0's own check
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        hashlib.sha256(b"tampered").hexdigest(),
+        # The packaged file's own digest is not the released ledger value.
+        "b5fb28a0e97ea1a944831b571fe558fdd9faa2efbfa4e053745c986be57f7cfd",
+        # An unreleased intermediate edit of the comment.
+        "f5b9c505b2160898f5311c4d57a866ada2ec2c64e43bc45cb7f61b5082ccd281",
+    ],
+)
+def test_unknown_ledger_checksum_for_001_still_stops_startup(tmp_path, recorded):
+    path = tmp_path / "tampered.db"
+    _stamp(path, recorded)
+    with pytest.raises(MigrationError, match="immutable"):
+        RegistryDB(path=str(path))
+
+
+def test_released_alias_does_not_cover_any_other_edit_of_001(tmp_path):
+    path = tmp_path / "v0110.db"
+    _stamp(path, RELEASED_001_SHA256)
+    db = RegistryDB(path=str(path))
+    current = migrations.available()[0]
+    for edited_sql in (
+        current.sql + "\n-- edited",
+        current.sql.replace("CREATE TABLE", "CREATE  TABLE", 1),
+        _released_001().sql + "\n",
+    ):
+        edited = Migration(1, "provenance", edited_sql)
+        assert edited.ledger_sha256 == edited.sha256
+        with pytest.raises(MigrationError, match="immutable"):
+            migrations.migrate(db, known=[edited])
+    db.close()
+
+
+def test_ledger_aliases_only_cover_comment_lines():
+    by_version = {m.version: m for m in migrations.available()}
+    for (version, file_sha), ledger_sha in migrations.LEDGER_CHECKSUMS.items():
+        mig = by_version[version]
+        assert mig.sha256 == file_sha
+        assert ledger_sha == RELEASED_001_SHA256 and version == 1
+        assert mig.statements() == _released_001().statements()
 
 
 def test_failed_migration_rolls_back_whole_file(tmp_path):

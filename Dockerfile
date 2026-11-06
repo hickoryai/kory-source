@@ -1,3 +1,8 @@
+# syntax=docker/dockerfile:1
+# Export the effective (dockerignore-filtered) inputs for pre-publication review.
+FROM scratch AS build-context
+COPY . /
+
 # ── Stage 1: build the React UI ───────────────────────────────────
 FROM node:20-slim AS ui-builder
 ARG CODEX_VERSION=0.145.0
@@ -8,15 +13,23 @@ RUN npm install --global --no-audit --no-fund "@openai/codex@${CODEX_VERSION}"
 COPY ui/mira/ ./
 RUN npm run build
 
-# ── Stage 2: backend + bundled UI ─────────────────────────────────
+# Build only the selected Python package; never install the repository in runtime.
+FROM python:3.12-slim AS python-builder
+WORKDIR /build
+COPY pyproject.toml README.md LICENSE ./
+COPY src/mira/ src/mira/
+RUN pip wheel --no-cache-dir --wheel-dir /wheels ".[serve,bedrock]"
+
+# ── Stage 3: backend + bundled UI ─────────────────────────────────
 FROM python:3.12-slim
 LABEL org.opencontainers.image.source="https://github.com/miracodeai/mira"
 LABEL org.opencontainers.image.description="Self-hostable AI code reviewer"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
-COPY . /app
-RUN pip install --no-cache-dir "/app[serve,bedrock]"
+# Mount wheels so neither build inputs nor wheel archives persist in a layer.
+RUN --mount=type=bind,from=python-builder,source=/wheels,target=/wheels \
+    pip install --no-cache-dir --no-index --find-links=/wheels "mira-reviewer[serve,bedrock]"
 
 # Codex CLI is bundled for the optional codex-cli backend. Keep the version
 # pinned above so image rebuilds do not silently change the review runtime.

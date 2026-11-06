@@ -1,4 +1,4 @@
-"""Resolve historical decision anchors to a later commit (HAI-12825).
+"""Resolve historical decision anchors to a later commit.
 
 An adapter over existing read APIs; it does not change the indexer or its
 anchor algorithm. Order, mirroring ``mira.index.anchors``:

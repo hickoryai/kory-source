@@ -596,7 +596,7 @@ function WorkPanel({
   )
 }
 
-// ── HAI-12825: evidence, attribution, history, questions ─────────────────
+// ── evidence, attribution, history, questions ─────────────────
 
 function Field({ label, value, unknown }: { label: string; value: unknown; unknown?: boolean }) {
   if (unknown || value === null || value === undefined || value === "") {

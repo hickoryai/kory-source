@@ -1,4 +1,4 @@
--- HAI-12825: decision provenance. Additive only; never edit after release.
+-- Decision provenance. Additive only; never edit the statements after release.
 -- (Amended once before any release, in review: revisions are keyed by observation.)
 -- Statements end with a semicolon at end of line. Portable SQLite/PostgreSQL.
 

@@ -1,6 +1,6 @@
 """Read-only GitHub history import: PR descriptions, conversation, reviews, inline comments.
 
-HAI-12825. Each record becomes an immutable source revision with its posting
+Each record becomes an immutable source revision with its posting
 account, any self-stated agent/model/invoker markers, and (for decision-like
 passages) a proposed decision citing the exact quote.
 

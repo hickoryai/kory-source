@@ -200,3 +200,42 @@ mypy src/mira/ --ignore-missing-imports
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
+
+### Runtime organization configuration
+
+The image includes no organization repository selection or deployment configuration.
+Mount configuration and credentials at runtime; do not add them to the build context.
+`mira index-repos` requires one or more explicit `--repo owner/repo` arguments
+(or `--repo owner/repo=/checkout` for local rename detection). A deployment that
+relied on a built-in list sets `MIRA_INDEX_REPOS="owner/one owner/two"` instead;
+an explicit `--repo` overrides it. Without either, the command exits with a usage error.
+
+The optional router provider uses a runtime-installed tracing adapter selected by
+`MIRA_TRACING_MODULE` (an importable module name). That module must export
+`setup_otlp_tracing(endpoint=..., service_name=..., token=..., environment=...)` and
+an async `traced_llm_call`. Set `LLM_OTLP_ENDPOINT` at runtime; `token` comes from
+`CLAUDE_OTEL_SHARED_TOKEN` and `environment` from `ENVIRONMENT` when set. An unset
+endpoint, an unset or unimportable module, or a failing setup stops router calls
+(fails closed). `MIRA_ROUTER_ACP_ALLOW_UNTRACED=1` remains
+an explicit opt-out for environments that do not require tracing.
+
+Before distributing an image, run `python3 scripts/audit_public_image.py --source .`
+and audit its Docker-save archive with `--image /path/to/image.tar`. The audit
+checks known organization markers, internal ticket IDs, credential patterns,
+configuration/history and every layer, including subsequently deleted files.
+It prints categories and hashed locators, never matching contents. It preserves
+copyright attribution and the public repository provenance labels. Known AWS
+documentation keys and a reviewed upstream Codex binary (exact path and SHA-256)
+have narrow exceptions; a changed binary requires a fresh upstream review. This bounded
+check supplements manual content review; it does not certify arbitrary data safe.
+Audit wheel archives (`--wheel`) and generated UI directories (`--frontend`) too.
+Export the effective context with `docker build --target build-context
+--output type=local,dest=/tmp/public-context .` and inspect it with
+`--context /tmp/public-context`; CI and both release paths run this check.
+Before changing a package's visibility, audit its published history too:
+`.github/workflows/registry-history-audit.yml` (manual dispatch, read-only, `packages: read`;
+a release and visibility gate, separate from PR checks) runs
+`scripts/audit_registry_history.py` over every active tagged and untagged version,
+including every platform image and attestation manifest, config, and layer. Any
+finding, unreadable version, or incomplete listing fails the run.
+Its results are bounded pattern evidence, not proof that history is safe.

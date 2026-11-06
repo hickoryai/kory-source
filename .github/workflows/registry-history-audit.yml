@@ -1,0 +1,36 @@
+name: Registry history audit
+
+# Release/visibility gate, not a PR code check: run it by hand (Actions ->
+# Registry history audit -> Run workflow) before deciding a package's
+# visibility. It audits every active version of the container package
+# (tagged and untagged, every platform image and attestation, config, history,
+# and layer) and fails while any published version has findings. It never
+# pushes, deletes, or changes visibility; the token can only read contents and
+# packages. The scripts' unit tests run in CI with the rest of the suite.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Audit every active package version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE: ${{ github.event.repository.name }}
+        run: |
+          set -o pipefail
+          python3 -I scripts/audit_registry_history.py --owner "$OWNER" --package "$PACKAGE" \
+            | tee /tmp/registry-history-audit.txt
+          status=${PIPESTATUS[0]}
+          { echo '```'; cat /tmp/registry-history-audit.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

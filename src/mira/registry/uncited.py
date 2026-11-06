@@ -1,4 +1,4 @@
-"""Advisory findings for decisions stated without a registry ID (HAI-12775).
+"""Advisory findings for decisions stated without a registry ID.
 
 A pull request body, or the description of a Linear ticket it links, can state
 a decision ("we decided ...", or an item under "Decisions I made") without
@@ -232,7 +232,7 @@ def _mirror(registry: Any, ticket: str) -> dict | None:
 
     The finding is posted on the PR, so the reviewer reads only sources the
     corpus policy explicitly lists in ``legacy_reviewer_sources``. Without
-    that, imported ticket text never reaches a PR comment (HAI-12825).
+    that, imported ticket text never reaches a PR comment.
     """
     from mira.registry.access import reviewer_context
 

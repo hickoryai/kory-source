@@ -2,7 +2,7 @@ name: Release
 
 # Gated release: pushing a v* tag runs the offline test suite first; the
 # container is built and pushed ONLY if the tests pass. The gate needs no
-# provider API key (HAI-12329): plain `uv run pytest` skips the `eval` and
+# provider API key: plain `uv run pytest` skips the `eval` and
 # `benchmark` markers via pyproject `addopts`. The LLM evals stay in
 # evals.yml (manual dispatch, and the beta release gate).
 on:
@@ -59,10 +59,29 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
 
-      - name: Build and push
+      - name: Audit build inputs
+        run: |
+          python3 scripts/audit_public_image.py --source .
+          docker build --target build-context --output type=local,dest=/tmp/public-context .
+          python3 scripts/audit_public_image.py --context /tmp/public-context
+
+      - name: Build candidate locally
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: true
+          push: false
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Audit every candidate layer before pushing the same image
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          first_tag=$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)
+          docker save "$first_tag" -o /tmp/candidate.tar
+          python3 scripts/audit_public_image.py --image /tmp/candidate.tar
+          while IFS= read -r tag; do
+            test -z "$tag" || docker push "$tag"
+          done <<< "$IMAGE_TAGS"

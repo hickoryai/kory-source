@@ -113,7 +113,7 @@ export interface NewWork {
   owner: string
 }
 
-// HAI-12825: provenance, history and cited questions. Only approved
+// Provenance, history and cited questions. Only approved
 // complete-corpus readers get data; everyone else gets the same 404.
 
 export interface Attribution {

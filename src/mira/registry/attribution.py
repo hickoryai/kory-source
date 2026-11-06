@@ -1,6 +1,6 @@
 """Who said, ran, directed, reviewed, approved, imported, and extracted a decision.
 
-HAI-12825 keeps these roles apart. One ``author`` string cannot tell a bot
+The registry keeps these roles apart. One ``author`` string cannot tell a bot
 account from the model behind it, the person who invoked it, or the importer
 that later copied the text. Each attribution row records:
 
