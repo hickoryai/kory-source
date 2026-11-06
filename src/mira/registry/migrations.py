@@ -1,4 +1,4 @@
-"""Versioned, additive registry migrations (implementation contract).
+"""Versioned, additive registry migrations.
 
 ``db.SCHEMA`` stays the idempotent base. Everything added after it lives in
 ``registry/migrations/NNN_name.sql`` and is applied once, in order, inside one
@@ -11,6 +11,11 @@ file's SHA-256.
 - A ledger row this code does not know (a newer deployment ran first), or a
   checksum that no longer matches a released file, stops startup. Released
   migration files are never edited; add a new one instead.
+- One audited exception: after release, a comment-only edit removed an internal
+  reference from ``001_provenance.sql``. ``LEDGER_CHECKSUMS`` binds that exact
+  current file to its released checksum, and the ledger keeps recording the
+  released value, so databases stamped by either release start and roll back
+  cleanly. Any other byte change still stops startup.
 - Nothing here drops or rewrites data. Rollback is disabling the features that
   read the new tables, not deleting provenance.
 """
@@ -33,6 +38,15 @@ CREATE TABLE IF NOT EXISTS registry_schema_migrations (
 """
 # Arbitrary constant: the PostgreSQL advisory lock that serializes migrations.
 ADVISORY_LOCK_KEY = 1282_5001
+# (version, SHA-256 of the packaged file) -> SHA-256 the ledger records for it.
+# Only for comment-only edits made after release; the SQL statements are
+# byte-identical. Never add an entry for a change that alters a statement.
+LEDGER_CHECKSUMS: dict[tuple[int, str], str] = {
+    (
+        1,
+        "b5fb28a0e97ea1a944831b571fe558fdd9faa2efbfa4e053745c986be57f7cfd",
+    ): "0fcb1bff083ff2355aa5ee0e40d6162cf98bce2fe89b4235ee5aead63a9798c6",  # v0.11.0
+}
 _FILE = re.compile(r"^(?P<version>\d{3})_(?P<name>[a-z0-9_]+)\.sql$")
 
 
@@ -49,6 +63,11 @@ class Migration:
     @property
     def sha256(self) -> str:
         return hashlib.sha256(self.sql.encode()).hexdigest()
+
+    @property
+    def ledger_sha256(self) -> str:
+        """The checksum recorded in, and required of, the migration ledger."""
+        return LEDGER_CHECKSUMS.get((self.version, self.sha256), self.sha256)
 
     def statements(self) -> list[str]:
         body = "\n".join(
@@ -88,7 +107,7 @@ def _check(known: list[Migration], done: dict[int, tuple[str, str]]) -> None:
                 f"registry schema has migration {version} ({name}) that this code does not "
                 "know; deploy the newer code or restore the matching image"
             )
-        if mig.sha256 != sha:
+        if mig.ledger_sha256 != sha:
             raise MigrationError(
                 f"registry migration {version} ({name}) changed after it was applied; "
                 "released migrations are immutable"
@@ -113,7 +132,7 @@ def migrate(db: Any, *, now: float = 0.0, known: list[Migration] | None = None) 
             db.execute(
                 "INSERT INTO registry_schema_migrations (version, name, sha256, applied_at) "
                 "VALUES (?, ?, ?, ?)",
-                (mig.version, mig.name, mig.sha256, now),
+                (mig.version, mig.name, mig.ledger_sha256, now),
             )
             ran.append(mig.version)
     _check(known, applied(db))

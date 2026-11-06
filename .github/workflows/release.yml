@@ -2,7 +2,7 @@ name: Release
 
 # Gated release: pushing a v* tag runs the offline test suite first; the
 # container is built and pushed ONLY if the tests pass. The gate needs no
-# provider API key (HAI-12329): plain `uv run pytest` skips the `eval` and
+# provider API key: plain `uv run pytest` skips the `eval` and
 # `benchmark` markers via pyproject `addopts`. The LLM evals stay in
 # evals.yml (manual dispatch, and the beta release gate).
 on:

@@ -125,7 +125,7 @@ async def run_pr_review(
     config = load_config()
     from mira.dashboard.models_config import llm_config_for
 
-    # Router-acp seats belong to the client that asked (implementation contract); a webhook
+    # Router-acp seats belong to the client that asked; a webhook
     # has none. Fail before review_pr can post a placeholder comment.
     try:
         refuse_unrequested_seat(config.llm, "webhook review")

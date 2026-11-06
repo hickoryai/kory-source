@@ -4,7 +4,7 @@ Stateless JSON-RPC: each POST carries a bearer registry JWT and gets a JSON
 response (the spec allows ``application/json`` instead of an SSE stream). No
 server-initiated messages, so GET returns 405.
 
-Corpus access (implementation contract) is decided here on every call from the verified
+Corpus access is decided here on every call from the verified
 token's ``sub`` against the deployment policy. ``kind``, ``model`` and the
 ``kory.source`` capability the gateway checked grant nothing by themselves;
 this server is the final gate for wrapped and direct calls alike.
@@ -118,7 +118,7 @@ TOOLS = [
     _tool(
         "get_context",
         "Call before the first source edit. With work_id, or ticket (a Linear key such as "
-        "implementation contract): the plan, then requirements, decisions, children, dependencies, "
+        "ENG-123): the plan, then requirements, decisions, children, dependencies, "
         "evidence, and the ticket's comments. With repo plus paths, symbols, or concepts: "
         "claims in play with approval status, realization, and confidence, proposals "
         "flagged.",

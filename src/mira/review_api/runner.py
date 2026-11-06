@@ -3,7 +3,7 @@
 Every model role uses the router-acp seat provider. Kory Source runs no
 inference for a job: each logical model call becomes a ``review_api_work``
 row that the client who submitted the job runs on its own seats and posts
-back (implementation contract). The relay URL, token, and session are never read here.
+back. The relay URL, token, and session are never read here.
 There is no cloud-key or local fallback, ensemble sampling and tool calling
 stay off, and cross-PR overlap detection is skipped because it reads other
 PRs. Each job observes
@@ -51,7 +51,7 @@ _CODE_ERRORS = {
     "router_acp_model_mismatch": "model_mismatch",
 }
 
-# Hook for registry-supplied review rules (implementation contract). Each provider takes
+# Hook for registry-supplied review rules. Each provider takes
 # the frozen snapshot and returns ``{"title", "content"}`` rules that are
 # appended to the custom rules the engine already loads.
 CustomRulesProvider = Callable[[FrozenSnapshot], Awaitable[list[dict[str, str]]]]
@@ -197,7 +197,7 @@ def _finding(index: int, c: Any) -> dict[str, Any]:
         "confidence": c.confidence,
         "suggestion": c.suggestion,
         "source_pass": c.source_pass,
-        # Validated registry citations land with implementation contract. Never guessed here.
+        # Validated registry citations are not wired in yet. Never guessed here.
         "registry_ids": [],
     }
 

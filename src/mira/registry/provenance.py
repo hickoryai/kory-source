@@ -1,6 +1,6 @@
 """Immutable decision evidence: source revisions, quotes, attributions, anchors.
 
-Flow (implementation contract): source reads -> immutable revisions -> proposed claims,
+Flow: source reads -> immutable revisions -> proposed claims,
 attributions and anchors -> human approval events -> cited read-only answers.
 
 - A source revision is keyed by source system, type, id, and an observation

@@ -14,6 +14,9 @@ regression guard, not proof that arbitrary content is safe. Review all historica
 package versions and untagged digests before changing package visibility: making a
 package public can expose old versions. Missing access or evidence blocks publication.
 
-Keep the image PRIVATE until parent review. Implementation and PR approval do not
-permit merging, pushing release tags or images, changing package visibility,
-deployment, or publication; obtain the separately required authorization.
+Container packages stay private by default. Changing a package's visibility,
+publishing a new public image, pushing release tags or images, or deploying requires
+explicit authorization from a maintainer with that authority, recorded on the change
+and given after the audits above pass. Implementation work, code review, and PR
+approval are not that authorization, and one authorization does not carry over to a
+later version or package.

@@ -39,7 +39,7 @@ _lock = threading.Lock()
 
 
 class IndexAnchorLookup:
-    """Resolve implementation contract anchor ids to today's path through Mira's index.
+    """Resolve symbol anchor ids to today's path through Mira's index.
 
     Loads each repo's anchors once a minute instead of opening the index per anchor.
     """
@@ -124,7 +124,7 @@ async def run_jobs(interval: float = 3600.0, initial_delay: float = 60.0) -> Non
     from mira.registry.learned import import_learned_rules
 
     # Create the registry schema at startup, not on first use, so a deploy's
-    # post-service read-only probe finds real registry tables (implementation contract).
+    # post-service read-only probe finds real registry tables.
     try:
         await asyncio.to_thread(get_registry)
     except Exception as exc:

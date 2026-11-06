@@ -123,7 +123,7 @@ SCHEMA = [
     """,
     "CREATE INDEX IF NOT EXISTS registry_conflict_prompts_session "
     "ON registry_conflict_prompts (session)",
-    # Comments mirrored from a source system (implementation contract). ``parent_source_id`` is
+    # Comments mirrored from a source system. ``parent_source_id`` is
     # the source id of the object the comment sits on, so a comment can arrive
     # before its parent and still attach once the parent is imported.
     """
@@ -196,7 +196,7 @@ class RegistryDB:
         from mira.registry.migrations import ADVISORY_LOCK_KEY, migrate
 
         # Concurrent startups serialize on the schema: base tables, then the
-        # versioned migrations, in one transaction (implementation contract).
+        # versioned migrations, in one transaction.
         with self.transaction():
             if self.postgres:
                 self.execute("SELECT pg_advisory_xact_lock(?)", (ADVISORY_LOCK_KEY,))

@@ -1,7 +1,7 @@
 """The registry service: objects, relationships, lifecycle, and reads.
 
 Approval status is set by people. A merge is realization only: it never
-approves a proposal or applies a supersession (implementation contract authority policy).
+approves a proposal or applies a supersession (registry authority policy).
 Realization is derived from branch and PR events. Confidence is recomputed on
 every write and never accepted from a caller.
 
@@ -137,7 +137,7 @@ _CALLER_FIELDS = {
 _INPUT_ONLY = {"kind", "concepts", "anchors"}
 _CALLER_BASES = ("statement", "repository_analysis")
 # Unresolved conflict checks: a pending, capped, or failed check keeps a merge
-# ``merged_with_conflict`` (implementation contract: a merge never approves).
+# ``merged_with_conflict`` (a merge never approves).
 _OPEN_CHECKS = ("pending", "partial", "failed")
 _REALIZED = ("in_progress", "submitted", "merged", "merged_with_conflict")
 # Approval queue: further-realized proposals first, because a merge already happened.
@@ -167,7 +167,7 @@ AnchorLookup = Callable[[str, str], "dict | None"]
 # Reasons an import may retire an approved object, and so may later undo.
 _SOURCE_RETIRE_REASONS = ("source_retired", "source_deleted")
 # Work fields the Linear importer writes. While Linear is authoritative an edit
-# to them through the registry would be overwritten or drift (implementation contract).
+# to them through the registry would be overwritten or drift.
 _MIRRORED_WORK_FIELDS = ("title", "owner", "delivery_state")
 # Work links that mirror a Linear relation when both ends came from Linear.
 _MIRRORED_WORK_LINKS = ("parent_of", "blocks", "relates")
@@ -424,7 +424,7 @@ class Registry:
             )
 
     def _edge_corpus(self, source_id: str, target_id: str, requested: str = "") -> str:
-        """A relationship's corpus, derived from its endpoints (implementation contract).
+        """A relationship's corpus, derived from its endpoints.
 
         A link touching a protected object is protected by that object's
         corpus, whoever writes it. Links across two corpora are refused.
@@ -612,7 +612,7 @@ class Registry:
     def link_anchor(
         self, object_id: str, anchor: dict, actor: Actor, access: AccessContext | None = None
     ) -> dict:
-        """Tie an object to a symbol. ``anchor_id`` is the implementation contract symbol anchor."""
+        """Tie an object to a symbol. ``anchor_id`` is the index symbol anchor."""
         obj = self.get_visible(object_id, access)
         repo = str(anchor.get("repo") or obj["repo"] or "").strip()
         path = str(anchor.get("path") or "").strip()
@@ -890,7 +890,7 @@ class Registry:
         word overlap, so a large org rulebook does not cap every check.
         """
         # Legacy-visible claims only: judgments go back to the caller, so an
-        # imported corpus decision never becomes a candidate here (implementation contract).
+        # imported corpus decision never becomes a candidate here.
         approved = (
             "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement') "
             f"AND {_LEGACY_ONLY}"
@@ -1232,7 +1232,7 @@ class Registry:
         if not actor.is_human:
             raise Forbidden(f"only a person can {action}")
 
-    # ── durable lifecycle provenance (implementation contract) ──────────────────────
+    # ── durable lifecycle provenance ──────────────────────
 
     _APPROVAL_EVENTS = ("approved", "approved_supersede")
     _REALIZATION_EVENTS = ("realization",)
@@ -1744,7 +1744,7 @@ class Registry:
         return changed
 
     def _merge(self, obj: dict) -> None:
-        """A merge records realization only (implementation contract authority policy).
+        """A merge records realization only (registry authority policy).
 
         It never approves a proposal and never applies a proposed supersession:
         a merged PR is not evidence that a person approved the decision in it.
@@ -2019,7 +2019,7 @@ class Registry:
     def works(self, access: AccessContext | None = None) -> list[dict]:
         return self._select_visible(access, "kind = 'work' ORDER BY updated_at DESC")
 
-    # ── import (implementation contract seam) ───────────────────────────────────────
+    # ── import seam ───────────────────────────────────────
 
     def import_items(
         self,
@@ -2223,7 +2223,7 @@ class Registry:
         self._write(obj)
         return obj["sync_status"], errors
 
-    # ── mirrored comments (implementation contract) ─────────────────────────────────
+    # ── mirrored comments ─────────────────────────────────
 
     def import_comments(
         self, source_system: str, comments: list[dict], *, corpus_id: str = ""
@@ -2312,7 +2312,7 @@ class Registry:
         return [dict(zip(keys, r, strict=True)) for r in rows]
 
     def work_by_ticket(self, ticket: str, access: AccessContext | None = None) -> dict:
-        """The work object mirrored for a ticket key such as ``implementation contract``."""
+        """The work object mirrored for a ticket key such as ``ENG-123``."""
         rows = self._select_visible(
             access, "kind = 'work' AND ticket = ? AND source_system <> ''", (ticket,)
         )

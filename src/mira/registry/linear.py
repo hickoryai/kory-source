@@ -1,4 +1,4 @@
-"""Read-only Linear import into the registry (implementation contract).
+"""Read-only Linear import into the registry.
 
 Linear stays authoritative during the dual-write. This module only reads
 Linear: the client refuses any GraphQL mutation. It has three parts:
@@ -14,7 +14,7 @@ Linear: the client refuses any GraphQL mutation. It has three parts:
   are re-read at the end of each issue walk.
 
 Run with ``python -m mira.registry.linear inventory|import``. It covers every
-team the corpus access policy enumerates (implementation contract) and every state, archived
+team the corpus access policy enumerates and every state, archived
 and trashed included; ``--team KEY`` narrows it to named manifest teams. A team
 the workspace has but the manifest does not list is reported to the operator and
 never fetched or stored: a new team needs approval first. ``import`` is a dry

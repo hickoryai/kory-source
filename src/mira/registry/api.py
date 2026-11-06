@@ -3,8 +3,8 @@
 Mira's ``AuthMiddleware`` already requires a dashboard session on ``/api/*``.
 Every caller here is a person; status changes and imports need an admin.
 
-Every route derives an access context from the session's immutable account id
-(implementation contract). Admin rights grant no corpus access: imported history is visible
+Every route derives an access context from the session's immutable account id.
+Admin rights grant no corpus access: imported history is visible
 only to accounts the deployment's corpus policy lists. Everyone else gets the
 same 404 for a protected object as for a missing one.
 """
@@ -336,7 +336,7 @@ def put_evidence(body: EvidenceBody, request: Request) -> dict:
 
 @router.post("/import")
 def import_items(body: ImportBody, request: Request) -> dict:
-    """implementation contract seam: idempotent import keyed by source system, id, and version."""
+    """Import seam: idempotent import keyed by source system, id, and version."""
     reg = _reg()
     results = _call(reg.import_items, body.source_system, body.items, _actor(request, admin=True))
     return {

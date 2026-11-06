@@ -1,0 +1,41 @@
+name: Registry history audit
+
+# Read-only evidence for a visibility decision: audits every active version of
+# the container package (tagged and untagged, every platform image and
+# attestation, config, history, and layer). It never pushes, deletes, or
+# changes visibility; the token is limited to reading contents and packages.
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/registry-history-audit.yml
+      - scripts/audit_public_image.py
+      - scripts/audit_registry_history.py
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    # Fork pull requests get no package access; skip rather than fail.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Audit every active package version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE: ${{ github.event.repository.name }}
+        run: |
+          set -o pipefail
+          python3 -I scripts/audit_registry_history.py --owner "$OWNER" --package "$PACKAGE" \
+            | tee /tmp/registry-history-audit.txt
+          status=${PIPESTATUS[0]}
+          { echo '```'; cat /tmp/registry-history-audit.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

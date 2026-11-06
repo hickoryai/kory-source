@@ -1,4 +1,4 @@
-"""Bounded traversal of a decision's whole relationship history (implementation contract).
+"""Bounded traversal of a decision's whole relationship history.
 
 ``Registry.chain`` follows the first ``supersedes`` edge each way and is kept
 for the legacy view. This walks every decision relationship in both

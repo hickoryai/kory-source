@@ -1,4 +1,4 @@
-"""Authority tiers and relation-specific cycle rules (implementation contract, plan section 3).
+"""Authority tiers and relation-specific cycle rules.
 
 Tiers, strongest first, each within the same scope and applicable revision:
 

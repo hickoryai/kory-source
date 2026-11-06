@@ -24,8 +24,8 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   unset. ``KORY_CODE_SESSION_ID`` is not read.
 * ``relay=False`` sends only ``{"body", "timeout"}`` to the injected
   transport and never reads the relay URL, token, or session. The review API
-  uses it to hand each call to the requester that submitted the job
-  (implementation contract). Kory Source stores no relay for reviews.
+  uses it to hand each call to the requester that submitted the job.
+  Kory Source stores no relay for reviews.
 * ``create_llm`` does not build this provider. It returns
   ``UnconfiguredSeatProvider``, which fails every completion with
   ``seat_provider_unconfigured``. Webhook reviews and indexing call

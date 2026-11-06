@@ -90,6 +90,37 @@ def forbidden_path(name: str) -> bool:
     )
 
 
+def audit_config(config_bytes: bytes) -> list[tuple[str, str]]:
+    """Scan an image configuration, including its build history."""
+    config = json.loads(config_bytes)
+    if not isinstance(config, dict):
+        raise ValueError("image config is not an object")
+    # Public source provenance is not organization-specific configuration.
+    labels = (config.get("config") or {}).get("Labels") or {}
+    for key in ("org.opencontainers.image.source", "org.opencontainers.image.url"):
+        if labels.get(key) == "https://github.com/hickoryai/kory-source":
+            labels[key] = "https://github.com/example/public-project"
+    return [("image-config-and-history", reason) for reason in scan(json.dumps(config).encode())]
+
+
+def audit_layer(stream) -> list[tuple[str, str]]:
+    """Scan every member of one (optionally compressed) layer tar stream."""
+    findings = []
+    with tarfile.open(fileobj=stream, mode="r|*") as layer:
+        for member in layer:
+            for reason in scan(member.name.encode()):
+                findings.append((member.name, reason))
+            if forbidden_path(member.name):
+                findings.append((member.name, "forbidden-path"))
+            if member.issym() or member.islnk():
+                for reason in scan(member.linkname.encode()):
+                    findings.append((member.name, reason))
+            if member.isfile():
+                for reason in scan_stream(layer.extractfile(member), member.name):
+                    findings.append((member.name, reason))
+    return findings
+
+
 def audit_image(path: Path) -> list[tuple[str, str]]:
     findings = []
     with tarfile.open(path) as archive:
@@ -98,31 +129,13 @@ def audit_image(path: Path) -> list[tuple[str, str]]:
             raise ValueError("empty image manifest")
         for entry in manifest:
             config_bytes = archive.extractfile(entry["Config"]).read()
-            config = json.loads(config_bytes)
             print("image-config-sha256:", hashlib.sha256(config_bytes).hexdigest())
             print("layers-to-audit:", len(entry["Layers"]))
-            # Public source provenance is not organization-specific configuration.
-            labels = config.get("config", {}).get("Labels") or {}
-            for key in ("org.opencontainers.image.source", "org.opencontainers.image.url"):
-                if labels.get(key) == "https://github.com/hickoryai/kory-source":
-                    labels[key] = "https://github.com/example/public-project"
-            for reason in scan(json.dumps(config).encode()):
-                findings.append(("image-config-and-history", reason))
+            findings += audit_config(config_bytes)
             if not entry["Layers"]:
                 raise ValueError("missing layers")
             for layer_name in entry["Layers"]:
-                with tarfile.open(fileobj=archive.extractfile(layer_name), mode="r|*") as layer:
-                    for member in layer:
-                        for reason in scan(member.name.encode()):
-                            findings.append((member.name, reason))
-                        if forbidden_path(member.name):
-                            findings.append((member.name, "forbidden-path"))
-                        if member.issym() or member.islnk():
-                            for reason in scan(member.linkname.encode()):
-                                findings.append((member.name, reason))
-                        if member.isfile():
-                            for reason in scan_stream(layer.extractfile(member), member.name):
-                                findings.append((member.name, reason))
+                findings += audit_layer(archive.extractfile(layer_name))
     return findings
 
 

@@ -209,9 +209,12 @@ Mount configuration and credentials at runtime; do not add them to the build con
 (or `--repo owner/repo=/checkout` for local rename detection).
 
 The optional router provider uses a runtime-installed tracing adapter selected by
-`MIRA_TRACING_MODULE`. That module must export `setup_otlp_tracing` and
-`traced_llm_call`; set `LLM_OTLP_ENDPOINT` and any exporter credentials at runtime.
-Missing required tracing fails closed. `MIRA_ROUTER_ACP_ALLOW_UNTRACED=1` remains
+`MIRA_TRACING_MODULE` (an importable module name). That module must export
+`setup_otlp_tracing(endpoint=..., service_name=..., token=..., environment=...)` and
+an async `traced_llm_call`. Set `LLM_OTLP_ENDPOINT` at runtime; `token` comes from
+`CLAUDE_OTEL_SHARED_TOKEN` and `environment` from `ENVIRONMENT` when set. An unset
+endpoint, an unset or unimportable module, or a failing setup stops router calls
+(fails closed). `MIRA_ROUTER_ACP_ALLOW_UNTRACED=1` remains
 an explicit opt-out for environments that do not require tracing.
 
 Before distributing an image, run `python3 scripts/audit_public_image.py --source .`
@@ -227,4 +230,9 @@ Audit wheel archives (`--wheel`) and generated UI directories (`--frontend`) too
 Export the effective context with `docker build --target build-context
 --output type=local,dest=/tmp/public-context .` and inspect it with
 `--context /tmp/public-context`; CI and both release paths run this check.
-Review historical registry versions before making a package public.
+Before changing a package's visibility, audit its published history too:
+`.github/workflows/registry-history-audit.yml` (read-only, `packages: read`) runs
+`scripts/audit_registry_history.py` over every active tagged and untagged version,
+including every platform image and attestation manifest, config, and layer. Any
+finding, unreadable version, or incomplete listing fails the run.
+Its results are bounded pattern evidence, not proof that history is safe.

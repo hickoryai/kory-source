@@ -1,4 +1,4 @@
-"""Cited, read-only answers to source-history questions (implementation contract).
+"""Cited, read-only answers to source-history questions.
 
 The central question: "Does PR #X override any prior decisions?"
 

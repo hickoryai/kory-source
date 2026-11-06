@@ -1,4 +1,4 @@
-"""Resumable, idempotent, read-only import runs (implementation contract).
+"""Resumable, idempotent, read-only import runs.
 
 An ``ImportRun`` is the audit record of one walk over one source stream:
 importer and extractor identity and version, the frozen scope manifest, a
