@@ -55,6 +55,15 @@ Most AI reviewers are SaaS: your diffs (and often the full surrounding code) lea
   - **Review-health page**: stale/waiting PRs, a reviewer-responsiveness leaderboard, throughput trends, and rubber-stamp detection (approvals with no substantive review) — plus per-contributor analytics with a year-long heatmap and Mira's review-quality signal.
   - **Coming soon, change-frequency heatmaps**: surface the files that bug fixes keep landing on so you can target review attention.
 
+**Kory Source: "Does PR #X override any prior decisions?"** The registry keeps the original
+evidence behind each decision (exact quotes, source revisions, author, invoker and approver
+with unknowns marked) and answers that question with citations, read-only, for approved
+corpus readers: the dashboard's *Registry → Ask the source* tab, `POST /api/registry/questions`,
+`GET /api/registry/prs/{owner}/{repo}/{number}/decisions`, or the MCP tools
+`explain_pr_decisions` and `ask_source_question`. See
+[docs/source-questions.md](docs/source-questions.md) and
+[docs/decision-provenance.md](docs/decision-provenance.md).
+
 If your engineering team needs answers like *"which of our repos are exposed to this CVE?"* or *"what's the blast radius of changing this function?"*, those questions stop being multi-day investigations and start being one-click dashboard pages.
 
 ## Benchmark

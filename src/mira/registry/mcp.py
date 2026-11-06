@@ -3,6 +3,11 @@
 Stateless JSON-RPC: each POST carries a bearer registry JWT and gets a JSON
 response (the spec allows ``application/json`` instead of an SSE stream). No
 server-initiated messages, so GET returns 405.
+
+Corpus access (HAI-12825) is decided here on every call from the verified
+token's ``sub`` against the deployment policy. ``kind``, ``model`` and the
+``kory.source`` capability the gateway checked grant nothing by themselves;
+this server is the final gate for wrapped and direct calls alike.
 """
 
 from __future__ import annotations
@@ -14,6 +19,7 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
+from mira.registry.access import AccessDenied, context_for_actor
 from mira.registry.auth import AuthError, actor_from_header
 from mira.registry.model import Actor, RegistryError
 
@@ -127,6 +133,37 @@ TOOLS = [
         [],
     ),
     _tool(
+        "ask_source_question",
+        "Read-only, cited answer about decision history: 'Does PR #12 override any prior "
+        "decisions?', or the history behind a path or symbol. Cites the original source, "
+        "exact quotes, and who authored, invoked and approved each decision, with unknowns "
+        "marked. Returns needs_context instead of guessing a repository. Never imports, "
+        "approves or writes. Needs approved complete-corpus access.",
+        {
+            "question": _STR,
+            "repo": {"type": "string", "description": "owner/name"},
+            "pr_number": {"type": "integer"},
+            "paths": _STRS,
+            "symbols": _STRS,
+            "as_of_commit": _STR,
+        },
+        ["question"],
+    ),
+    _tool(
+        "explain_pr_decisions",
+        "Does this PR override any prior decisions? Freezes base/head, resolves old and new "
+        "anchors, walks every supersedes/corrects/conflict/compatible link, and returns a "
+        "per-decision verdict (confirmed_supersession, proposed_supersession, conflict, "
+        "compatible, no_supported_override_found, insufficient_evidence) with citations. "
+        "Pass expected_head_sha to detect a head that moved. Read-only.",
+        {
+            "repo": {"type": "string", "description": "owner/name"},
+            "pr_number": {"type": "integer"},
+            "expected_head_sha": _STR,
+        },
+        ["repo", "pr_number"],
+    ),
+    _tool(
         "resolve_conflict",
         "A person answers a conflict on one proposal. keep rejects the new object "
         "(reason conflicts_with_approved). supersede approves it and supersedes the "
@@ -214,6 +251,29 @@ async def call_tool(name: str, args: dict, actor: Actor) -> Any:
 
     reg = get_registry()
     assert reg is not None
+    # Re-derived per call from current policy, so a removed member's old token stops working.
+    access = context_for_actor(actor)
+    if name == "ask_source_question":
+        from mira.registry.questions import QuestionService
+
+        return await QuestionService(reg).ask(
+            str(args.get("question") or ""),
+            access,
+            repo=args.get("repo") or None,
+            pr_number=int(args["pr_number"]) if args.get("pr_number") is not None else None,
+            paths=list(args.get("paths") or []),
+            symbols=list(args.get("symbols") or []),
+            as_of_commit=args.get("as_of_commit") or None,
+        )
+    if name == "explain_pr_decisions":
+        from mira.registry.questions import QuestionService
+
+        return await QuestionService(reg).explain_pr_decisions(
+            str(args["repo"]),
+            int(args["pr_number"]),
+            access,
+            expected_head_sha=args.get("expected_head_sha") or None,
+        )
     if name == "put_decision":
         return await reg.put_object(args, actor)
     if name == "search_decisions":
@@ -226,39 +286,41 @@ async def call_tool(name: str, args: dict, actor: Actor) -> Any:
             symbol=args.get("symbol") or None,
             statuses=args.get("status") or None,
             limit=int(args.get("limit") or 20),
+            access=access,
         )
     if name == "supersede_decision":
-        return reg.supersede(args["new_id"], args["old_id"], actor)
+        return reg.supersede(args["new_id"], args["old_id"], actor, access)
     if name == "get_decision_chain":
-        return reg.chain(args["id"])
+        return reg.chain(args["id"], access)
     if name == "link_anchor":
         anchor = {k: v for k, v in args.items() if k != "id"}
-        return reg.link_anchor(args["id"], anchor, actor)
+        return reg.link_anchor(args["id"], anchor, actor, access)
     if name == "get_context":
         if args.get("work_id"):
-            return reg.work_context(args["work_id"])
+            return reg.work_context(args["work_id"], access)
         if args.get("ticket"):
-            return reg.work_context(reg.work_by_ticket(str(args["ticket"]))["id"])
+            return reg.work_context(reg.work_by_ticket(str(args["ticket"]), access)["id"], access)
         return reg.context_for_paths(
             str(args.get("repo") or ""),
             args.get("paths") or [],
             symbols=args.get("symbols") or [],
             concepts=args.get("concepts") or [],
+            access=access,
         )
     if name == "resolve_conflict":
-        return reg.resolve_conflict(args["id"], str(args.get("choice") or ""), actor)
+        return reg.resolve_conflict(args["id"], str(args.get("choice") or ""), actor, access)
     if name == "session_conflicts":
-        return reg.session_conflicts(str(args.get("session") or ""))
+        return reg.session_conflicts(str(args.get("session") or ""), access)
     if name == "conflict_prompt_counts":
         return reg.conflict_prompt_counts()
     if name == "put_work":
         if args.get("id"):
-            return reg.update_work(args["id"], args, actor)
+            return reg.update_work(args["id"], args, actor, access)
         return await reg.put_work(args, actor)
     if name == "link_work":
-        return reg.link_work(args["work_id"], args["target_id"], str(args["type"]), actor)
+        return reg.link_work(args["work_id"], args["target_id"], str(args["type"]), actor, access)
     if name == "put_evidence":
-        return reg.put_evidence(args, actor)
+        return reg.put_evidence(args, actor, access)
     raise RegistryError(f"unknown tool {name}")
 
 
@@ -300,8 +362,13 @@ async def handle_message(msg: Any, actor: Actor) -> dict | None:
             return _error(msg_id, -32602, f"unknown tool {name}")
         try:
             value = await call_tool(name, params.get("arguments") or {}, actor)
-        except (RegistryError, KeyError) as exc:
-            text = str(exc) if isinstance(exc, RegistryError) else f"missing argument {exc}"
+        except (RegistryError, KeyError, ValueError) as exc:
+            if isinstance(exc, AccessDenied):
+                text = "not found"  # uniform: says nothing about what exists
+            elif isinstance(exc, RegistryError):
+                text = str(exc)
+            else:
+                text = f"invalid or missing argument {exc}"
             return _result(msg_id, {"content": [{"type": "text", "text": text}], "isError": True})
         payload = value if isinstance(value, dict) else {"items": value}
         return _result(

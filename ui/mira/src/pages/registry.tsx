@@ -14,6 +14,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import {
   registryApi,
+  type Attribution,
+  type Citation,
+  type DecisionEvidence,
+  type HistoryGraph,
+  type QuestionAnswer,
   type NewWork,
   type RegistryObject,
   type RegistryRelationship,
@@ -134,9 +139,9 @@ export function RegistryPage() {
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">Registry</h1>
         <p className="text-sm text-muted-foreground">
-          Work, decisions, rules, constraints, and requirements. Agents propose. A person
-          approves, or a clean merge of an agent proposal does. Only approved objects reach a
-          review.
+          Work, decisions, rules, constraints, and requirements. Agents propose. Only a person
+          approves; a merge records realization, never approval. Only approved objects reach a
+          review. Imported history is visible only to approved corpus readers.
         </p>
       </div>
       {actionError && <p className="text-sm text-destructive">{actionError}</p>}
@@ -148,7 +153,12 @@ export function RegistryPage() {
           <TabsTrigger value="concepts">Concepts</TabsTrigger>
           <TabsTrigger value="anchors">Anchors</TabsTrigger>
           <TabsTrigger value="expired">Expired</TabsTrigger>
+          <TabsTrigger value="questions">Ask the source</TabsTrigger>
         </TabsList>
+
+        <TabsContent value="questions">
+          <QuestionPanel onOpen={setOpenId} />
+        </TabsContent>
 
         <TabsContent value="queue">
           <Card>
@@ -344,9 +354,11 @@ function ObjectPanel({ objectId, onOpen }: { objectId: string; onOpen: (id: stri
             )}
           </>
         )}
+        <EvidenceSection objectId={objectId} />
+        <HistorySection objectId={objectId} onOpen={onOpen} />
         {chain.data && chain.data.length > 1 && (
           <div className="space-y-2">
-            <p className="font-medium">Supersession chain (oldest first)</p>
+            <p className="font-medium">Supersession chain, first edge only (legacy view)</p>
             {chain.data.map((c) => (
               <div key={c.id}>
                 <button
@@ -581,5 +593,281 @@ function WorkPanel({
         </CardContent>
       </Card>
     </div>
+  )
+}
+
+// ── HAI-12825: evidence, attribution, history, questions ─────────────────
+
+function Field({ label, value, unknown }: { label: string; value: unknown; unknown?: boolean }) {
+  if (unknown || value === null || value === undefined || value === "") {
+    return (
+      <span className="text-muted-foreground">
+        {label}: <em>unknown</em>
+      </span>
+    )
+  }
+  return (
+    <span>
+      {label}: <span className="font-mono">{String(value)}</span>
+    </span>
+  )
+}
+
+function AttributionRow({ a }: { a: Attribution }) {
+  const unknown = new Set(a.unknown_fields ?? Object.entries(a.field_states ?? {}).filter(([, s]) => s.state === "unknown").map(([k]) => k))
+  const inferred = new Set(a.inferred_fields ?? Object.entries(a.field_states ?? {}).filter(([, s]) => s.state === "inferred").map(([k]) => k))
+  const mark = (k: string) => (inferred.has(k) ? " (inferred)" : "")
+  return (
+    <div className="rounded border p-2 text-xs">
+      <p className="font-medium">
+        {a.role.replace("_", " ")} · {a.actor_kind}
+        {mark("actor_kind")}
+      </p>
+      <p className="flex flex-wrap gap-x-3">
+        <Field label="identity" value={a.original_identity} unknown={unknown.has("original_identity")} />
+        <Field label="bot" value={a.original_bot} unknown={unknown.has("original_bot")} />
+        <Field label="provider" value={a.original_provider} unknown={unknown.has("original_provider")} />
+        <Field label="model" value={a.original_model} unknown={unknown.has("original_model")} />
+        <Field label="client" value={a.original_client} unknown={unknown.has("original_client")} />
+        <Field label="environment" value={a.original_environment} unknown={unknown.has("original_environment")} />
+      </p>
+      <p className="flex flex-wrap gap-x-3 text-muted-foreground">
+        normalized:
+        <Field label="provider" value={a.provider_family} unknown={unknown.has("provider_family")} />
+        <Field label="family" value={a.model_family} unknown={unknown.has("model_family")} />
+        <Field label="version" value={a.model_version} unknown={unknown.has("model_version")} />
+        <Field label="interface" value={a.client_interface} unknown={unknown.has("client_interface")} />
+        <Field label="session" value={a.source_session_id} unknown={unknown.has("source_session_id")} />
+        <Field label="run" value={a.source_run_id} unknown={unknown.has("source_run_id")} />
+      </p>
+      {a.reason && <p className="text-muted-foreground">{a.reason}</p>}
+    </div>
+  )
+}
+
+function CitationView({ citation }: { citation: Citation | DecisionEvidence }) {
+  const attribution = "attribution" in citation ? citation.attribution : citation.attributions.filter((a) => a.role !== "importer" && a.role !== "extractor")
+  const provenance = "provenance" in citation ? citation.provenance : citation.attributions.filter((a) => a.role === "importer" || a.role === "extractor")
+  return (
+    <div className="space-y-2">
+      {citation.legacy && (
+        <p className="text-xs text-muted-foreground">
+          Legacy row: no preserved source quote. Approval evidence is unknown.
+        </p>
+      )}
+      {citation.quotes.map((q) => {
+        const rev = citation.revisions.find((r) => r.evidence_id === q.evidence_id)
+        return (
+          <blockquote key={`${q.evidence_id}:${q.quote_start ?? q.quote}`} className="border-l-2 pl-2 text-xs">
+            “{q.quote}”
+            <span className="block text-muted-foreground">
+              {q.evidence_role ?? q.role} · {rev?.source_type}{" "}
+              {rev?.source_url && (
+                <a className="underline" href={rev.source_url} target="_blank" rel="noreferrer">
+                  source
+                </a>
+              )}{" "}
+              · <span className="font-mono">{q.evidence_id}</span>
+              {rev?.head_sha ? ` · head ${rev.head_sha.slice(0, 12)}` : ""}
+              {rev?.commit_sha ? ` · commit ${rev.commit_sha.slice(0, 12)}` : ""}
+            </span>
+          </blockquote>
+        )
+      })}
+      {attribution.map((a) => (
+        <AttributionRow key={`${a.role}:${a.evidence_id}:${a.original_identity}`} a={a} />
+      ))}
+      {provenance.length > 0 && (
+        <details className="text-xs">
+          <summary>Importer and extractor</summary>
+          {provenance.map((a) => (
+            <AttributionRow key={`${a.role}:${a.evidence_id}`} a={a} />
+          ))}
+        </details>
+      )}
+      {citation.anchors.map((a) => (
+        <p key={`${a.observed_commit}:${a.path}:${a.line_start}`} className="font-mono text-xs">
+          {a.path}
+          {a.qualified_name ? ` ${a.qualified_name}` : ""}
+          {a.heading ? ` § ${a.heading}` : ""} @ {a.observed_commit.slice(0, 12)} · {a.resolution_status}
+          {a.resolved_path && a.resolved_path !== a.path ? ` → ${a.resolved_path}` : ""}
+        </p>
+      ))}
+    </div>
+  )
+}
+
+function EvidenceSection({ objectId }: { objectId: string }) {
+  const { data, error } = useAsync(() => registryApi.evidence(objectId), [objectId])
+  if (error || !data) return null
+  return (
+    <div className="space-y-2">
+      <p className="font-medium">Evidence and attribution</p>
+      <CitationView citation={data} />
+      {data.versions.map((v) => (
+        <p key={v.revision} className="text-xs text-muted-foreground">
+          v{v.revision} · {v.approval_status} · {v.authority_tier.replaceAll("_", " ")}
+          {v.authority_reasons.length ? ` — ${v.authority_reasons.join("; ")}` : ""}
+        </p>
+      ))}
+    </div>
+  )
+}
+
+function HistoryGraphView({ graph, onOpen }: { graph: HistoryGraph; onOpen: (id: string) => void }) {
+  return (
+    <div className="space-y-1 text-xs">
+      {graph.history_order.map((n) => (
+        <button key={n} className="block text-left hover:underline" onClick={() => onOpen(n)}>
+          {graph.heads.includes(n) ? "● " : "○ "}
+          {n} · {graph.nodes[n].status} · {graph.nodes[n].title}
+        </button>
+      ))}
+      {graph.edges.map((e) => (
+        <p key={e.id} className="font-mono text-muted-foreground">
+          {e.source_id} {e.symmetric ? "↔" : "→"} {e.target_id} {e.type} ({e.status})
+          {e.relation ? ` ${e.relation}` : ""}
+        </p>
+      ))}
+      {!graph.complete && (
+        <p className="text-muted-foreground">
+          Incomplete: {[...graph.truncated, graph.hidden_links ? `${graph.hidden_links} hidden links` : ""].filter(Boolean).join("; ")}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function HistorySection({ objectId, onOpen }: { objectId: string; onOpen: (id: string) => void }) {
+  const { data } = useAsync(() => registryApi.history(objectId), [objectId])
+  if (!data || data.edges.length === 0) return null
+  return (
+    <div className="space-y-2">
+      <p className="font-medium">Decision history (every edge, ancestry order oldest first)</p>
+      <HistoryGraphView graph={data} onOpen={onOpen} />
+    </div>
+  )
+}
+
+function AnswerView({ answer, onOpen }: { answer: QuestionAnswer; onOpen: (id: string) => void }) {
+  if (answer.kind === "needs_context") {
+    return <p className="text-sm">Needs: {answer.needs}</p>
+  }
+  return (
+    <div className="space-y-3 text-sm">
+      <p>
+        <Badge variant={answer.verdict === "confirmed_supersession" ? "destructive" : "outline"}>
+          {answer.verdict.replaceAll("_", " ")}
+        </Badge>
+        {answer.pr?.head_sha && (
+          <span className="ml-2 font-mono text-xs">
+            base {answer.pr.base_sha?.slice(0, 12)} · head {answer.pr.head_sha.slice(0, 12)}
+          </span>
+        )}
+      </p>
+      {answer.narrative?.map((n, i) => (
+        <p key={i}>
+          {n.text}
+          {n.evidence.length > 0 && <span className="font-mono text-xs text-muted-foreground"> [{n.evidence.join(", ")}]</span>}
+        </p>
+      ))}
+      {answer.findings?.map((f) => (
+        <Card key={f.decision.id}>
+          <CardHeader>
+            <CardTitle className="text-sm">
+              <button className="hover:underline" onClick={() => onOpen(f.decision.id)}>
+                {f.decision.title}
+              </button>
+            </CardTitle>
+            <CardDescription>
+              {f.verdict.replaceAll("_", " ")} · {f.why_considered} · {f.decision.status} ·{" "}
+              {f.decision.authority_tier?.replaceAll("_", " ") || "legacy"}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {f.reasons.map((r) => (
+              <p key={r} className="text-xs">
+                {r}
+              </p>
+            ))}
+            {answer.citations?.[f.decision.id] && <CitationView citation={answer.citations[f.decision.id]} />}
+          </CardContent>
+        </Card>
+      ))}
+      {answer.graph && answer.kind === "decision_history" && <HistoryGraphView graph={answer.graph} onOpen={onOpen} />}
+    </div>
+  )
+}
+
+function QuestionPanel({ onOpen }: { onOpen: (id: string) => void }) {
+  const [repo, setRepo] = useState("")
+  const [number, setNumber] = useState("")
+  const [question, setQuestion] = useState("")
+  const [answer, setAnswer] = useState<QuestionAnswer | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const coverage = useAsync(() => registryApi.coverage(), [])
+
+  async function go(fn: () => Promise<QuestionAnswer>) {
+    setBusy(true)
+    setError(null)
+    try {
+      setAnswer(await fn())
+    } catch (e) {
+      setAnswer(null)
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Does PR #X override any prior decisions?</CardTitle>
+        <CardDescription>
+          Read-only. Freezes the PR at its head, follows every decision relationship, and cites the
+          original source. Nothing is imported, approved, or posted.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex flex-wrap gap-2">
+          <Input className="w-64" placeholder="owner/repo" value={repo} onChange={(e) => setRepo(e.target.value)} />
+          <Input className="w-28" placeholder="PR number" value={number} onChange={(e) => setNumber(e.target.value)} />
+          <Button
+            size="sm"
+            disabled={busy || !repo.includes("/") || !/^\d+$/.test(number)}
+            onClick={() => go(() => registryApi.prDecisions(repo.trim(), Number(number)))}
+          >
+            Check PR
+          </Button>
+        </div>
+        <Textarea
+          placeholder="Or ask: why does src/app/auth.py login keep sessions seven days?"
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+        />
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || !question.trim()}
+          onClick={() => go(() => registryApi.ask({ question: question.trim(), repo: repo.trim() || undefined }))}
+        >
+          Ask
+        </Button>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        {answer && <AnswerView answer={answer} onOpen={onOpen} />}
+        {coverage.data && coverage.data.length > 0 && (
+          <details className="text-xs">
+            <summary>Import coverage ({coverage.data.length} runs)</summary>
+            {coverage.data.map((r) => (
+              <p key={r.run_id} className="font-mono">
+                {r.stream} · {r.status} · {Object.entries(r.coverage).map(([k, v]) => `${k}=${v ?? "unknown"}`).join(" ")}
+              </p>
+            ))}
+          </details>
+        )}
+      </CardContent>
+    </Card>
   )
 }
