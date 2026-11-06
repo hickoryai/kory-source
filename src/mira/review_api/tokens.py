@@ -7,7 +7,7 @@ service. The deployment holds only SHA-256 digests, in
 
     [{"principal": "example-client", "kind": "engineer",
       "sha256": "<hex digest of the raw token>",
-      "repos": ["example/repository", "example/repository"]}]
+      "repos": ["example/repository", "example/*"]}]
 
 ``kind`` is ``engineer`` or ``relay``. A bearer token reaches only
 ``/api/reviews`` routes; it never grants dashboard or admin access.
