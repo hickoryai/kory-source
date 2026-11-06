@@ -6,10 +6,13 @@
 !README.md
 !LICENSE
 !src/
+src/*
 !src/mira/
 !src/mira/**
 !ui/
+ui/*
 !ui/mira/
+ui/mira/*
 !ui/mira/package.json
 !ui/mira/package-lock.json
 !ui/mira/index.html
