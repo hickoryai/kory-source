@@ -119,6 +119,98 @@ class TestGrepRepo:
         assert out.startswith("[invalid regex")
 
 
+class TestGrepRepoCoverage:
+    """A search stopped by the file cap must not read as proof of absence, and
+    `path_glob` must honour `{a,b}` and zero-directory `**/`."""
+
+    @staticmethod
+    def _big_tree() -> dict[str, str]:
+        # 40 unrelated files sort before the service that defines the symbol.
+        src = {f"app/api/endpoint_{i:02d}.py": "pass\n" for i in range(40)}
+        src["app/services/payments.py"] = "from app.services.validate import check\n"
+        src["app/services/validate.py"] = "def check(addr):\n    return addr\n"
+        return src
+
+    @pytest.mark.asyncio
+    async def test_capped_miss_is_reported_incomplete_not_absent(self):
+        src = self._big_tree()
+        ex = _executor(src, sorted(src))
+        out = await ex.execute("grep_repo", {"pattern": "def check"})
+        assert "INCOMPLETE" in out and "not evidence of absence" in out
+        assert "out of 42 candidates" in out
+
+    @pytest.mark.asyncio
+    async def test_complete_scan_keeps_the_plain_no_match_message(self):
+        src = {"a.py": "x\n", "b.py": "y\n"}
+        ex = _executor(src, sorted(src))
+        out = await ex.execute("grep_repo", {"pattern": "zzz"})
+        assert out == "[no content matches for `zzz` (scanned 2 files)]"
+
+    @pytest.mark.asyncio
+    async def test_skipped_binaries_do_not_make_a_scan_incomplete(self):
+        src = {"a.py": "x\n", **{f"img/{i:02d}.png": "" for i in range(30)}}
+        ex = _executor(src, sorted(src))
+        out = await ex.execute("grep_repo", {"pattern": "zzz"})
+        assert "INCOMPLETE" not in out
+
+    @pytest.mark.asyncio
+    async def test_brace_glob_matches_each_alternative(self):
+        src = {"web/a.ts": "needle\n", "srv/b.py": "needle\n", "doc/c.md": "needle\n"}
+        ex = _executor(src, sorted(src))
+        out = await ex.execute("grep_repo", {"pattern": "needle", "path_glob": "**/*.{py,ts}"})
+        assert "web/a.ts:1" in out and "srv/b.py:1" in out
+        assert "doc/c.md" not in out
+
+    @pytest.mark.asyncio
+    async def test_double_star_matches_zero_directories(self):
+        src = {"app/x.py": "needle\n"}
+        ex = _executor(src, sorted(src))
+        out = await ex.execute("grep_repo", {"pattern": "needle", "path_glob": "app/**/*.py"})
+        assert "app/x.py:1" in out
+
+    @pytest.mark.asyncio
+    async def test_brace_glob_also_applies_to_path_search(self):
+        ex = _executor({}, ["a/x.ts", "a/y.py", "a/z.md"])
+        out = await ex.execute(
+            "grep_repo", {"pattern": "a/", "path_glob": "**/*.{ts,py}", "path_only": True}
+        )
+        assert "a/x.ts" in out and "a/y.py" in out and "a/z.md" not in out
+
+    @pytest.mark.asyncio
+    async def test_mixed_double_star_segments_each_match_zero_or_more(self):
+        tree = ["a/b/x.py", "a/b/c/x.py", "a/z/b/x.py", "a/z/b/c/x.py", "a/x.py"]
+        src = dict.fromkeys(tree, "needle\n")
+        ex = _executor(src, tree)
+        out = await ex.execute("grep_repo", {"pattern": "needle", "path_glob": "a/**/b/**/x.py"})
+        for p in ("a/b/x.py", "a/b/c/x.py", "a/z/b/x.py", "a/z/b/c/x.py"):
+            assert f"{p}:1" in out
+        assert "a/x.py:1" not in out  # `b/` itself is required
+
+    @pytest.mark.asyncio
+    async def test_excessive_brace_alternatives_are_refused_not_enumerated(self):
+        ex = _executor({"a.py": "needle\n"}, ["a.py"])
+        glob = "{a,b}" * 40  # 2**40 patterns if enumerated
+        out = await ex.execute("grep_repo", {"pattern": "needle", "path_glob": glob})
+        assert out.startswith("[invalid path_glob")
+        out = await ex.execute(
+            "grep_repo", {"pattern": "needle", "path_glob": glob, "path_only": True}
+        )
+        assert out.startswith("[invalid path_glob")
+
+    @pytest.mark.asyncio
+    async def test_excessive_double_star_segments_are_refused(self):
+        ex = _executor({"a.py": "needle\n"}, ["a.py"])
+        out = await ex.execute("grep_repo", {"pattern": "needle", "path_glob": "**/" * 40 + "*.py"})
+        assert out.startswith("[invalid path_glob")
+
+    @pytest.mark.asyncio
+    async def test_brace_glob_at_the_cap_still_matches(self):
+        alts = ",".join(f"m{i}" for i in range(64))
+        ex = _executor({"m63.py": "needle\n"}, ["m63.py"])
+        out = await ex.execute("grep_repo", {"pattern": "needle", "path_glob": f"{{{alts}}}.py"})
+        assert "m63.py:1" in out
+
+
 class TestExecutorBudget:
     @pytest.mark.asyncio
     async def test_unknown_tool_returns_error(self):
