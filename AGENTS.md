@@ -14,9 +14,10 @@ regression guard, not proof that arbitrary content is safe. Review all historica
 package versions and untagged digests before changing package visibility: making a
 package public can expose old versions. Missing access or evidence blocks publication.
 
-Container packages stay private by default. Changing a package's visibility,
-publishing a new public image, pushing release tags or images, or deploying requires
-explicit authorization from a maintainer with that authority, recorded on the change
-and given after the audits above pass. Implementation work, code review, and PR
-approval are not that authorization, and one authorization does not carry over to a
-later version or package.
+Kory Source is meant to be distributed publicly. Publish an image, push a release
+tag, or change a package's visibility only after the audits above pass for that exact
+artifact and the package's full history, and a maintainer with publishing authority
+has approved that specific action on the record (for example, on the release PR or
+tag). Approving an implementation or PR does not by itself authorize publication.
+Publication does not depend on any particular agent, session, or reviewer chain.
+Until a package's history passes review, keep that package private.

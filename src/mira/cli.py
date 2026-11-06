@@ -553,7 +553,9 @@ def _split_repo_spec(spec: str) -> tuple[str, str, str | None]:
     "--repo",
     "repo_specs",
     multiple=True,
-    help="owner/repo, or owner/repo=/path/to/checkout so git can detect renames",
+    envvar="MIRA_INDEX_REPOS",
+    help="owner/repo, or owner/repo=/path/to/checkout so git can detect renames. "
+    "Repeatable; MIRA_INDEX_REPOS (whitespace-separated) supplies them at runtime.",
 )
 @click.option(
     "--symbols-only/--with-llm",
@@ -563,8 +565,8 @@ def _split_repo_spec(spec: str) -> tuple[str, str, str | None]:
 def index_repos(repo_specs: tuple[str, ...], symbols_only: bool) -> None:
     """Index repositories into the code graph.
 
-    Pass --repo owner/repo or --repo owner/repo=/checkout explicitly.
-    Configure database access and credentials at runtime.
+    Pass --repo owner/repo or --repo owner/repo=/checkout explicitly, or set
+    MIRA_INDEX_REPOS. Configure database access and credentials at runtime.
     """
     import asyncio
     import os
@@ -576,7 +578,9 @@ def index_repos(repo_specs: tuple[str, ...], symbols_only: bool) -> None:
     from mira.index.store import IndexStore
 
     if not repo_specs:
-        raise click.UsageError("Pass at least one --repo owner/repo explicitly")
+        raise click.UsageError(
+            "Pass at least one --repo owner/repo explicitly, or set MIRA_INDEX_REPOS"
+        )
     specs = list(repo_specs)
     for spec in specs:
         owner, repo, checkout = _split_repo_spec(spec)

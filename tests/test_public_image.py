@@ -78,6 +78,30 @@ def test_indexing_requires_explicit_repository():
     assert "Pass at least one --repo" in result.output
 
 
+def test_runtime_index_repos_reach_the_indexer(monkeypatch):
+    """A deployment's old default list is one runtime variable, not a code default."""
+    import mira.cli
+
+    seen = []
+    monkeypatch.setattr(mira.cli, "_split_repo_spec", lambda spec: seen.append(spec) or 1 / 0)
+    env = {"MIRA_INDEX_REPOS": "example/one example/two=/srv/two"}
+    result = CliRunner().invoke(main, ["index-repos"], env=env)
+    assert seen == ["example/one"]  # first spec reached the indexer loop
+    assert result.exit_code != 2
+    seen.clear()
+    CliRunner().invoke(main, ["index-repos", "--repo", "example/cli"], env=env)
+    assert seen == ["example/cli"]  # an explicit --repo overrides the variable
+
+
+def test_index_repo_variable_splits_on_whitespace(monkeypatch):
+    import click
+
+    command = main.commands["index-repos"]
+    option = next(p for p in command.params if p.name == "repo_specs")
+    monkeypatch.setenv("MIRA_INDEX_REPOS", "a/b  c/d=/x\n e/f")
+    assert list(option.value_from_envvar(click.Context(command))) == ["a/b", "c/d=/x", "e/f"]
+
+
 def test_tracing_adapter_is_runtime_configuration(monkeypatch):
     import pytest
 
@@ -97,6 +121,42 @@ def test_tracing_adapter_is_runtime_configuration(monkeypatch):
     )
     monkeypatch.setenv("MIRA_TRACING_MODULE", "example_tracing")
     assert _import_tracing() == (setup, traced)
+
+
+def test_router_tracing_calls_adapter_with_the_documented_keywords(monkeypatch):
+    """An adapter matching the README contract (keyword-only setup) is accepted."""
+    import asyncio
+    import sys
+    from types import SimpleNamespace
+
+    import mira.llm.router_acp as router
+
+    calls = {}
+
+    def setup_otlp_tracing(*, endpoint, service_name, token=None, environment=None, headers=None):
+        calls.update(endpoint=endpoint, service_name=service_name, token=token, env=environment)
+
+    async def traced_llm_call(fn, **kwargs):
+        return fn()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "example_tracing",
+        SimpleNamespace(setup_otlp_tracing=setup_otlp_tracing, traced_llm_call=traced_llm_call),
+    )
+    monkeypatch.setattr(router, "_tracing_ready", False)
+    monkeypatch.setenv("MIRA_TRACING_MODULE", "example_tracing")
+    monkeypatch.setenv("LLM_OTLP_ENDPOINT", "https://otlp.example.com")
+    monkeypatch.setenv("CLAUDE_OTEL_SHARED_TOKEN", "synthetic")
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    traced = router._shared_tracer()
+    assert asyncio.run(traced(lambda: 7, name="x")) == 7
+    assert calls == {
+        "endpoint": "https://otlp.example.com",
+        "service_name": "kory-source",
+        "token": "synthetic",
+        "env": "test",
+    }
 
 
 def test_exported_context_rejects_unexpected_inputs(tmp_path):

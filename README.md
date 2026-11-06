@@ -206,7 +206,9 @@ Apache 2.0. See [LICENSE](LICENSE).
 The image includes no organization repository selection or deployment configuration.
 Mount configuration and credentials at runtime; do not add them to the build context.
 `mira index-repos` requires one or more explicit `--repo owner/repo` arguments
-(or `--repo owner/repo=/checkout` for local rename detection).
+(or `--repo owner/repo=/checkout` for local rename detection). A deployment that
+relied on a built-in list sets `MIRA_INDEX_REPOS="owner/one owner/two"` instead;
+an explicit `--repo` overrides it. Without either, the command exits with a usage error.
 
 The optional router provider uses a runtime-installed tracing adapter selected by
 `MIRA_TRACING_MODULE` (an importable module name). That module must export
