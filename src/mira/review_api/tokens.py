@@ -5,9 +5,9 @@ service. The deployment holds only SHA-256 digests, in
 ``MIRA_REVIEW_API_TOKENS`` (JSON) or the file named by
 ``MIRA_REVIEW_API_TOKENS_FILE``::
 
-    [{"principal": "zane-laptop", "kind": "engineer",
+    [{"principal": "example-client", "kind": "engineer",
       "sha256": "<hex digest of the raw token>",
-      "repos": ["hickoryai/kory-source", "hickoryai/*"]}]
+      "repos": ["example/repository", "example/repository"]}]
 
 ``kind`` is ``engineer`` or ``relay``. A bearer token reaches only
 ``/api/reviews`` routes; it never grants dashboard or admin access.

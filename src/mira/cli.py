@@ -563,14 +563,8 @@ def _split_repo_spec(spec: str) -> tuple[str, str, str | None]:
 def index_repos(repo_specs: tuple[str, ...], symbols_only: bool) -> None:
     """Index repositories into the code graph.
 
-    Cloud Run runs this command. Set DATABASE_URL to the Cloud SQL instance.
-    Login is IAM only: run the Cloud SQL Auth Proxy with --auto-iam-authn and
-    use a URL with no password. The service account is kory-source-{env}.
-    A workstation indexer uses the kory-source-indexer-{env} account the same
-    way, and passes owner/repo=/checkout so git can detect renames.
-
-    With no --repo, the command indexes hickory-ai, goose, router-acp, and
-    kory-source from GitHub. Rename detection runs only for a checkout path.
+    Pass --repo owner/repo or --repo owner/repo=/checkout explicitly.
+    Configure database access and credentials at runtime.
     """
     import asyncio
     import os
@@ -578,10 +572,12 @@ def index_repos(repo_specs: tuple[str, ...], symbols_only: bool) -> None:
     from pathlib import Path
 
     from mira.index.indexer import index_repo
-    from mira.index.local import DEFAULT_INDEX_REPOS, index_checkout
+    from mira.index.local import index_checkout
     from mira.index.store import IndexStore
 
-    specs = list(repo_specs) or list(DEFAULT_INDEX_REPOS)
+    if not repo_specs:
+        raise click.UsageError("Pass at least one --repo owner/repo explicitly")
+    specs = list(repo_specs)
     for spec in specs:
         owner, repo, checkout = _split_repo_spec(spec)
         store = IndexStore.open(owner, repo)

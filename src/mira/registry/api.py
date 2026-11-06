@@ -4,7 +4,7 @@ Mira's ``AuthMiddleware`` already requires a dashboard session on ``/api/*``.
 Every caller here is a person; status changes and imports need an admin.
 
 Every route derives an access context from the session's immutable account id
-(HAI-12825). Admin rights grant no corpus access: imported history is visible
+(implementation contract). Admin rights grant no corpus access: imported history is visible
 only to accounts the deployment's corpus policy lists. Everyone else gets the
 same 404 for a protected object as for a missing one.
 """
@@ -267,7 +267,7 @@ def resolve(object_id: str, body: ResolveBody, request: Request) -> dict:
 def session_conflicts(session: str, request: Request) -> dict:
     """Does this session still hold a conflict that blocks push?
 
-    The hickory-ai push hook calls this, or the MCP tool of the same name,
+    A configured push hook calls this, or the MCP tool of the same name,
     before ``git push`` / ``gh pr create``. Defer lets the session continue
     editing, but push and PR creation stay blocked until someone answers
     keep or supersede. Another session's answer does not clear it. See
@@ -336,7 +336,7 @@ def put_evidence(body: EvidenceBody, request: Request) -> dict:
 
 @router.post("/import")
 def import_items(body: ImportBody, request: Request) -> dict:
-    """HAI-11606 seam: idempotent import keyed by source system, id, and version."""
+    """implementation contract seam: idempotent import keyed by source system, id, and version."""
     reg = _reg()
     results = _call(reg.import_items, body.source_system, body.items, _actor(request, admin=True))
     return {

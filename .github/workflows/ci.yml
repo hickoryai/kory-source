@@ -97,8 +97,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Audit build inputs
+        run: |
+          python3 scripts/audit_public_image.py --source .
+          docker build --target build-context --output type=local,dest=/tmp/public-context .
+          python3 scripts/audit_public_image.py --context /tmp/public-context
+
       - name: Build image
         run: docker build -t mira:ci .
+
+      - name: Audit image configuration, history, and all layers
+        run: |
+          docker save mira:ci -o /tmp/candidate.tar
+          python3 scripts/audit_public_image.py --image /tmp/candidate.tar
 
       # Image ENTRYPOINT is `mira serve`, so anything after the image name
       # is appended as args to `serve`. Override the entrypoint for tests

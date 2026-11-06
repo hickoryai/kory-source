@@ -84,7 +84,7 @@ def seat_judge(llm: Any) -> Judge:
 
 
 def requester_judge() -> Judge:
-    """Judge on the running review job's requester seats (HAI-12330).
+    """Judge on the running review job's requester seats (implementation contract).
 
     Router-acp calls have no stored relay, so outside a review-API job there
     is no seat and the judge raises ``seat_provider_unconfigured``. The

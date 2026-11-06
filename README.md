@@ -200,3 +200,29 @@ mypy src/mira/ --ignore-missing-imports
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
+
+### Runtime organization configuration
+
+The image includes no organization repository selection or deployment configuration.
+Mount configuration and credentials at runtime; do not add them to the build context.
+`mira index-repos` requires one or more explicit `--repo owner/repo` arguments
+(or `--repo owner/repo=/checkout` for local rename detection).
+
+The optional router provider uses a runtime-installed tracing adapter selected by
+`MIRA_TRACING_MODULE`. That module must export `setup_otlp_tracing` and
+`traced_llm_call`; set `LLM_OTLP_ENDPOINT` and any exporter credentials at runtime.
+Missing required tracing fails closed. `MIRA_ROUTER_ACP_ALLOW_UNTRACED=1` remains
+an explicit opt-out for environments that do not require tracing.
+
+Before distributing an image, run `python3 scripts/audit_public_image.py --source .`
+and audit its Docker-save archive with `--image /path/to/image.tar`. The audit
+checks known organization markers, internal ticket IDs, credential patterns,
+configuration/history and every layer, including subsequently deleted files.
+It prints categories and hashed locators, never matching contents. It preserves
+copyright attribution and the public repository provenance labels. This bounded
+check supplements manual content review; it does not certify arbitrary data safe.
+Audit wheel archives (`--wheel`) and generated UI directories (`--frontend`) too.
+Export the effective context with `docker build --target build-context
+--output type=local,dest=/tmp/public-context .` and inspect it with
+`--context /tmp/public-context`; CI and both release paths run this check.
+Review historical registry versions before making a package public.

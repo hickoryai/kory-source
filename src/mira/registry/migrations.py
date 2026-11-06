@@ -1,4 +1,4 @@
-"""Versioned, additive registry migrations (HAI-12825).
+"""Versioned, additive registry migrations (implementation contract).
 
 ``db.SCHEMA`` stays the idempotent base. Everything added after it lives in
 ``registry/migrations/NNN_name.sql`` and is applied once, in order, inside one

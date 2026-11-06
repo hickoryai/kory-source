@@ -1,7 +1,4 @@
-"""Authority tiers and relation-specific cycle rules (HAI-12825, plan section 3).
-
-Ratified by a human on 2026-11-05 (HAI-12825 revision 2 approval receipt
-https://linear.app/hickoryai/issue/HAI-12825#comment-f35a8621).
+"""Authority tiers and relation-specific cycle rules (implementation contract, plan section 3).
 
 Tiers, strongest first, each within the same scope and applicable revision:
 

@@ -1,6 +1,6 @@
 """Read-only git history import: Markdown, code comments/docstrings, commit messages.
 
-HAI-12825. From a local checkout of a manifest repository, at a frozen commit:
+implementation contract. From a local checkout of a manifest repository, at a frozen commit:
 
 - every Markdown file's revisions along its history (bounded by
   ``max_commits``), so a passage that was later rewritten or deleted is kept;

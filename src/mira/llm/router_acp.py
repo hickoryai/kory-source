@@ -25,7 +25,7 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
 * ``relay=False`` sends only ``{"body", "timeout"}`` to the injected
   transport and never reads the relay URL, token, or session. The review API
   uses it to hand each call to the requester that submitted the job
-  (HAI-12330). Kory Source stores no relay for reviews.
+  (implementation contract). Kory Source stores no relay for reviews.
 * ``create_llm`` does not build this provider. It returns
   ``UnconfiguredSeatProvider``, which fails every completion with
   ``seat_provider_unconfigured``. Webhook reviews and indexing call
@@ -39,7 +39,7 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   many jobs share ``call_log``. A reply the provider cannot parse is reported
   as a ``bad_response`` entry after the ``ok`` transport entry.
 
-Every logical call goes through ``hickory_common.llm_tracing.traced_llm_call``.
+Every logical call goes through the runtime-configured tracing adapter.
 An unset ``LLM_OTLP_ENDPOINT``, a missing tracer, or a failed exporter raises
 ``router_acp_tracing_unavailable``. ``MIRA_ROUTER_ACP_ALLOW_UNTRACED=1`` is the
 only untraced opt-out. Tests inject ``tracer`` and ``transport``.
@@ -103,9 +103,13 @@ class RouterTransportError(Exception):
 
 
 def _import_tracing() -> tuple[Callable[..., None], Callable[..., Awaitable[Any]]]:
-    from hickory_common.llm_tracing import setup_otlp_tracing, traced_llm_call
+    from importlib import import_module
 
-    return setup_otlp_tracing, traced_llm_call
+    module_name = os.environ.get("MIRA_TRACING_MODULE", "").strip()
+    if not module_name:
+        raise ImportError("MIRA_TRACING_MODULE is unset")
+    module = import_module(module_name)
+    return module.setup_otlp_tracing, module.traced_llm_call
 
 
 def _note_span(requested: str, actual: str | None = None) -> None:
@@ -117,7 +121,7 @@ def _note_span(requested: str, actual: str | None = None) -> None:
     try:
         span.set_attribute("gen_ai.request.model", actual or requested)
         span.set_attribute(
-            "hickory.metadata",
+            "mira.metadata",
             json.dumps({"requested_model": requested, "actual_model": actual or ""}),
         )
     except Exception:
@@ -141,7 +145,7 @@ def _shared_tracer() -> Callable[..., Awaitable[Any]]:
     except ImportError as exc:
         raise LLMError(
             "router_acp_tracing_unavailable",
-            detail="hickory_common.llm_tracing is not installed",
+            detail="runtime tracing adapter is unavailable",
         ) from exc
     if not _tracing_ready:
         try:

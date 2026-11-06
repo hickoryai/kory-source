@@ -4,7 +4,7 @@ Only approved objects reach a review: the block and the tool both filter on
 ``status = 'approved'``. Proposals stay out of review context entirely.
 
 Review output is posted on the PR, so both paths read with no corpus access
-context (HAI-12825): imported history from GitHub and Linear never enters a
+context (implementation contract): imported history from GitHub and Linear never enters a
 review prompt, a tool result, or a PR comment. ``REVIEW_ACCESS`` is that
 context; tests assert it stays empty.
 """

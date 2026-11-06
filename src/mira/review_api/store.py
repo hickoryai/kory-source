@@ -12,7 +12,7 @@ a job whose lease lapses becomes ``interrupted`` and is never re-run,
 because its model calls may already have been paid for.
 
 Each model call a running job makes is a ``review_api_work`` row that the
-submitting client answers (HAI-12330). Work is ``pending`` until it is
+submitting client answers (implementation contract). Work is ``pending`` until it is
 ``answered``, ``failed``, or ``expired``. Every transition out of
 ``pending`` is one conditional ``UPDATE``, so an answer, a timeout, and an
 expiry cannot both win. The row is the source of truth: any instance that

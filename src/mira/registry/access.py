@@ -1,4 +1,4 @@
-"""The complete-corpus access boundary (HAI-12825, plan section 5a).
+"""The complete-corpus access boundary (implementation contract, plan section 5a).
 
 Imported history from GitHub and every Linear team, private teams included, is
 readable by ONE explicitly approved audience and nobody else. Engineering role,

@@ -1,4 +1,4 @@
-"""Resumable, idempotent, read-only import runs (HAI-12825).
+"""Resumable, idempotent, read-only import runs (implementation contract).
 
 An ``ImportRun`` is the audit record of one walk over one source stream:
 importer and extractor identity and version, the frozen scope manifest, a
