@@ -119,9 +119,16 @@ def set_registry(registry: Registry | None) -> None:
 
 
 async def run_jobs(interval: float = 3600.0, initial_delay: float = 60.0) -> None:
-    """Hourly: expire stale agent proposals, age confidence, mirror learned rules."""
+    """Create the registry at startup; then hourly: expire stale agent proposals,
+    age confidence, mirror learned rules."""
     from mira.registry.learned import import_learned_rules
 
+    # Create the registry schema at startup, not on first use, so a deploy's
+    # post-service read-only probe finds real registry tables (HAI-12825).
+    try:
+        await asyncio.to_thread(get_registry)
+    except Exception as exc:
+        logger.warning("Registry schema creation at startup failed: %s", exc)
     await asyncio.sleep(initial_delay)
     while True:
         try:

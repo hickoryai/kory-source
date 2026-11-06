@@ -228,9 +228,16 @@ def linked_tickets(title: str, body: str) -> list[str]:
 
 
 def _mirror(registry: Any, ticket: str) -> dict | None:
-    """The mirrored Linear work for ``ticket``, or None. Reads only."""
+    """The mirrored Linear work for ``ticket``, or None. Reads only.
+
+    The finding is posted on the PR, so the reviewer reads only sources the
+    corpus policy explicitly lists in ``legacy_reviewer_sources``. Without
+    that, imported ticket text never reaches a PR comment (HAI-12825).
+    """
+    from mira.registry.access import reviewer_context
+
     try:
-        work = registry.work_by_ticket(ticket)
+        work = registry.work_by_ticket(ticket, reviewer_context())
     except Exception as exc:
         logger.debug("No readable Linear mirror for %s: %s", ticket, exc)
         return None

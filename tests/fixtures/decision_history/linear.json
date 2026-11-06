@@ -1,0 +1,5 @@
+{
+  "issue": {"key": "HAI-12825", "description": "We decided every attribution links to evidence."},
+  "bot_comment": {"body": "Decision: merges are realization only.", "botActor": {"id": "bot-1", "name": "Kory", "type": "ai", "subType": "agent", "userDisplayName": "Zane Claes"}},
+  "secret_team_issue": {"key": "SECRET-1", "team": {"id": "team-SECRET", "key": "SECRET"}, "description": "We decided something private."}
+}

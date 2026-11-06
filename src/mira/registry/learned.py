@@ -75,19 +75,27 @@ def import_learned_rules(
                 SOURCE_SYSTEM, [item], actor, status="approved", basis="review_learning"
             )
             totals[res["outcome"]] = totals.get(res["outcome"], 0) + 1
-            obj = registry.get(res["object_id"]) if "object_id" in res else None
-            if obj and obj["status"] == "retired" and obj["status_reason"] == "source_removed":
-                obj.update(status="approved", status_reason="", sync_status="synced")
-                registry._write(obj)
+            if "object_id" in res:
+                with registry._object_lock(res["object_id"]):
+                    obj = registry.get(res["object_id"])  # current row, under the lock
+                    if obj["status"] == "retired" and obj["status_reason"] == "source_removed":
+                        obj.update(status="approved", status_reason="", sync_status="synced")
+                        registry._write(obj)
         prefix = f"{platform}/{owner}/{repo}/"
         for obj in registry._select(
             "source_system = ? AND source_id LIKE ? AND status = 'approved'",
             (SOURCE_SYSTEM, prefix + "%"),
         ):
             if obj["source_id"] not in seen:
-                obj.update(
-                    status="retired", status_reason="source_removed", sync_status="source_removed"
-                )
-                registry._write(obj)
+                with registry._object_lock(obj["id"]):
+                    fresh = registry.get(obj["id"])
+                    if fresh["status"] != "approved":
+                        continue
+                    fresh.update(
+                        status="retired",
+                        status_reason="source_removed",
+                        sync_status="source_removed",
+                    )
+                    registry._write(fresh)
                 totals["retired"] += 1
     return totals

@@ -1,0 +1,10 @@
+{
+  "github": {
+    "pr11_candidates": ["Import every team, not only HAI.", "Keep Linear authoritative."],
+    "pr11_decision_author": {"actor_kind": "bot", "original_model": "Claude Opus 5.5", "provider_family": "anthropic", "model_family": "opus", "model_version": "5.5", "original_client": "Claude Code", "client_interface": null},
+    "pr11_invoker": "zclaes@hickory.ai",
+    "pr13_author_model": null,
+    "statuses": ["proposed"]
+  },
+  "git": {"markdown_decisions": ["Registry rows carry a corpus id.", "Merges are realization only."], "code_decision": "Decision: sessions last seven days.", "code_symbol": "login", "renamed_to": "src/app/session.py"}
+}

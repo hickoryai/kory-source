@@ -1,0 +1,15 @@
+{
+  "reject": [
+    {"name": "supersedes-only cycle", "edges": [["A", "B", "supersedes"], ["B", "C", "supersedes"]], "insert": ["C", "A", "supersedes"]},
+    {"name": "corrects-only cycle", "edges": [["A", "B", "corrects"]], "insert": ["B", "A", "corrects"]},
+    {"name": "mixed supersedes/corrects cycle", "edges": [["A", "B", "supersedes"], ["B", "C", "corrects"]], "insert": ["C", "A", "supersedes"]},
+    {"name": "self ancestry", "edges": [], "insert": ["A", "A", "corrects"]}
+  ],
+  "accept": [
+    {"name": "reciprocal compatibility", "edges": [["A", "B", "compatible_with"]], "insert": ["B", "A", "compatible_with"], "pairs": 1},
+    {"name": "reciprocal conflict", "edges": [["A", "B", "conflicts_with"]], "insert": ["B", "A", "conflicts_with"], "pairs": 1},
+    {"name": "mixed semantic cycle", "edges": [["A", "B", "supersedes"], ["B", "C", "compatible_with"]], "insert": ["C", "A", "conflicts_with"]},
+    {"name": "ancestry diamond", "edges": [["D", "B", "supersedes"], ["D", "C", "corrects"], ["B", "A", "supersedes"]], "insert": ["C", "A", "supersedes"]},
+    {"name": "disconnected branches", "edges": [["A", "B", "supersedes"], ["C", "D", "supersedes"]], "insert": ["E", "D", "corrects"]}
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "schema": "kory-source-corpus-policy/1",
+  "corpus_id": "hickory-complete-history",
+  "policy_version": "test-1",
+  "enabled": true,
+  "approval": {
+    "reference": "https://linear.example/HAI-12825#comment-test",
+    "approved_by": "linear-user:data-owner",
+    "approved_at": "2026-11-05T00:00:00Z",
+    "expires_at": "2099-01-01T00:00:00Z"
+  },
+  "repositories": [
+    {"id": "R_kory_source", "full_name": "hickoryai/kory-source"},
+    {"id": "R_hickory_ai", "full_name": "hickoryai/hickory-ai"}
+  ],
+  "linear_teams": [
+    {"id": "team-HAI", "key": "HAI"},
+    {"id": "team-OPS", "key": "OPS"}
+  ],
+  "readers": [
+    {"namespace": "registry-jwt", "id": "reader-uuid-1", "approval_reference": "test"},
+    {"namespace": "dashboard-account", "id": "7", "approval_reference": "test"}
+  ],
+  "import_operators": [
+    {"namespace": "operator", "id": "importer@test.iam"}
+  ],
+  "legacy_reviewer_sources": []
+}

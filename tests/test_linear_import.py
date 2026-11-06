@@ -20,6 +20,7 @@ from mira.registry import linear as lin
 from mira.registry.db import RegistryDB
 from mira.registry.linear import LinearClient, LinearError, LinearImporter
 from mira.registry.service import Registry
+from tests import registry_policy as rp
 
 HUMAN = Actor("human", "zane")
 AGENT = Actor("agent", "claude-session-1", "claude-opus-5-5")
@@ -61,7 +62,7 @@ class FakeLinear:
             "updatedAt": iso(t),
             "archivedAt": None,
             "trashed": False,
-            "team": {"key": key.split("-")[0]},
+            "team": {"id": f"team-{key.split('-')[0]}", "key": key.split("-")[0]},
             "state": {"type": fields.pop("state", "unstarted")},
             "assignee": None,
             "project": None,
@@ -207,8 +208,17 @@ def small_pages(monkeypatch):
     monkeypatch.setattr(lin, "PAGE_SIZE", 2)
 
 
-def importer(reg, client, clock) -> LinearImporter:
-    return LinearImporter(reg, client, ["HAI"], clock=clock)
+@pytest.fixture(autouse=True)
+def corpus_policy():
+    """HAI and OPS are the approved manifest teams (HAI-12825)."""
+    with rp.policy():
+        yield
+
+
+def importer(reg, client, clock, teams=("HAI",)) -> LinearImporter:
+    return LinearImporter(
+        reg, client, list(teams) if teams is not None else None, access=rp.operator(), clock=clock
+    )
 
 
 def snapshot(reg: Registry) -> dict:
@@ -360,13 +370,18 @@ def test_import_creates_work_links_and_comments(reg, client, fake, clock):
     assert out["comments"]["totals"]["created"] == 2
     assert out["sync_status"] == {"synced": 4}
 
-    ctx = reg.work_context(reg.work_by_ticket("HAI-2")["id"])
+    ctx = reg.work_context(reg.work_by_ticket("HAI-2", rp.reader())["id"], rp.reader())
     assert ctx["dependencies"]["parent"]["ticket"] == "HAI-1"
     assert [o["ticket"] for o in ctx["dependencies"]["blocked_by"]] == ["HAI-3"]
     assert ctx["work"]["delivery_state"] == "active"
     assert [c["body"] for c in ctx["comments"]] == ["Plan: do the thing", "Binding terms"]
     # "similar" is not a registry relationship.
-    assert reg.work_context(reg.work_by_ticket("HAI-3")["id"])["dependencies"]["relates"] == []
+    assert (
+        reg.work_context(reg.work_by_ticket("HAI-3", rp.reader())["id"], rp.reader())[
+            "dependencies"
+        ]["relates"]
+        == []
+    )
 
 
 def test_walks_ask_linear_only_for_the_team(reg, client, fake, clock):
@@ -378,42 +393,64 @@ def test_walks_ask_linear_only_for_the_team(reg, client, fake, clock):
     assert filters and all(f["and"][0] == {"issue": lin._team_filter(["HAI"])} for f in filters)
 
 
-def test_default_scope_is_every_team(reg, client, fake, clock):
+def test_default_scope_is_every_manifest_team(reg, client, fake, clock):
     seed(fake)
     fake.issue("HAI-6", t=T0 - 15, state="duplicate", archivedAt=iso(T0 - 15))
-    out = LinearImporter(reg, client, clock=clock).run(apply=True)
+    out = LinearImporter(reg, client, access=rp.operator(), clock=clock).run(apply=True)
     assert out["issues"]["totals"]["created"] == 6
     assert out["comments"]["totals"]["created"] == 3
-    assert reg.work_by_ticket("OPS-1")["delivery_state"] == "planned"
-    assert reg.work_by_ticket("HAI-6")["delivery_state"] == "archived"
+    assert reg.work_by_ticket("OPS-1", rp.reader())["delivery_state"] == "planned"
+    assert reg.work_by_ticket("HAI-6", rp.reader())["delivery_state"] == "archived"
+    # HAI-12825: the default is the approved manifest, never an unfiltered workspace walk.
     walks = [r for r in fake.requests if "RegistryIssues" in r["query"]]
-    assert walks and all("team" not in json.dumps(r["variables"]["filter"]) for r in walks)
+    manifest = lin._team_filter(["HAI", "OPS"])
+    assert walks and all(
+        r["variables"]["filter"] == manifest or r["variables"]["filter"]["and"][0] == manifest
+        for r in walks
+    )
     assert all("includeArchived: true" in q for q in lin.QUERIES)
 
 
-def test_cli_defaults_to_every_team(monkeypatch):
+def test_cli_defaults_to_every_manifest_team(monkeypatch):
     seen: list = []
+    monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
     monkeypatch.setattr(lin.LinearClient, "from_env", classmethod(lambda cls: None))
-    monkeypatch.setattr(lin, "inventory", lambda client, teams: seen.append(teams) or {})
+    monkeypatch.setattr(lin, "inventory", lambda client, teams, access: seen.append(teams) or {})
     lin.main(["inventory"])
     lin.main(["inventory", "--team", "HAI"])
     assert seen == [None, ["HAI"]]
 
 
+def test_cli_refuses_before_any_linear_call_without_an_approved_operator(monkeypatch):
+    monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", "someone-else@test.iam")
+    called: list = []
+    monkeypatch.setattr(lin.LinearClient, "from_env", classmethod(lambda cls: called.append(1)))
+    with pytest.raises(lin.AccessDenied):
+        lin.main(["inventory"])
+    assert called == []
+
+
 def test_several_teams_filter_with_or(reg, client, fake, clock):
     seed(fake)
-    out = LinearImporter(reg, client, ["HAI", "OPS"], clock=clock).run(apply=True)
+    out = LinearImporter(reg, client, ["HAI", "OPS"], access=rp.operator(), clock=clock).run(
+        apply=True
+    )
     assert out["issues"]["totals"]["created"] == 5
     assert out["comments"]["totals"]["created"] == 3
 
 
-async def test_get_context_takes_a_ticket_key(reg, client, fake, clock):
+async def test_get_context_by_ticket_is_denied_without_corpus_membership(reg, client, fake, clock):
     from mira.registry.mcp import call_tool
 
     seed(fake)
     importer(reg, client, clock).run(apply=True)
-    ctx = await call_tool("get_context", {"ticket": "HAI-2"}, AGENT)
-    assert ctx["work"]["ticket"] == "HAI-2"
+    # HAI-12825: an agent token that is not an approved corpus reader sees no
+    # imported ticket, with the same answer as a ticket that was never imported.
+    with pytest.raises(RegistryError, match="no imported work for ticket HAI-2"):
+        await call_tool("get_context", {"ticket": "HAI-2"}, AGENT)
+    with pytest.raises(RegistryError, match="no imported work for ticket HAI-404"):
+        await call_tool("get_context", {"ticket": "HAI-404"}, AGENT)
+    ctx = reg.work_context(reg.work_by_ticket("HAI-2", rp.reader())["id"], rp.reader())
     assert len(ctx["comments"]) == 2
 
 
@@ -453,7 +490,7 @@ def test_incremental_walk_reads_from_the_watermark(reg, client, fake, clock):
     assert out["issues"]["totals"] == {"read": 4, "updated": 1, "unchanged": 3}
     issues_filter = fake.requests[0]["variables"]["filter"]["and"][1]
     assert lin.to_epoch(issues_filter["updatedAt"]["gte"]) == T0 - lin.WATERMARK_OVERLAP
-    assert reg.work_by_ticket("HAI-4")["title"] == "Renamed"
+    assert reg.work_by_ticket("HAI-4", rp.reader())["title"] == "Renamed"
 
 
 def test_restart_after_a_crash_resumes_and_matches_a_clean_run(tmp_path, client, fake, clock):
@@ -488,7 +525,7 @@ def test_rejected_cursor_restarts_the_walk(reg, client, fake, clock):
     )
     out = imp.run(apply=True)
     assert out["issues"]["totals"]["walk_restarted"] == 1
-    assert len(reg.works()) == 4
+    assert len(reg.works(rp.reader())) == 4
 
 
 def test_retries_running_out_on_a_resumed_walk_keep_the_cursor(reg, client, fake, clock):
@@ -505,7 +542,7 @@ def test_retries_running_out_on_a_resumed_walk_keep_the_cursor(reg, client, fake
     # Not a rejection, so no restart from the top: every attempt resumed at c2.
     assert {r["variables"]["after"] for r in fake.requests} == {"c2"}
     assert imp.state("issues")["after_cursor"] == "c2"
-    assert reg.works() == []
+    assert reg.works(rp.reader()) == []
 
 
 def test_crash_between_object_and_links_is_retried(reg, client, fake, clock, monkeypatch):
@@ -518,15 +555,16 @@ def test_crash_between_object_and_links_is_retried(reg, client, fake, clock, mon
     monkeypatch.setattr(Registry, "_import_links", boom)
     with pytest.raises(RuntimeError):
         importer(reg, client, clock).run(apply=True)
-    child = reg.work_by_ticket("HAI-2")
+    child = reg.work_by_ticket("HAI-2", rp.reader())
     # Written without its links, so it is not marked synced.
     assert child["sync_status"] == "pending_links"
 
     monkeypatch.setattr(Registry, "_import_links", real)
     importer(reg, client, clock).run(apply=True)
-    ctx = reg.work_context(child["id"])
+    ctx = reg.work_context(child["id"], rp.reader())
     assert ctx["dependencies"]["parent"]["ticket"] == "HAI-1"
-    assert reg.sync_status("linear") == {"synced": 4}
+    assert reg.sync_status("linear", rp.reader()) == {"synced": 4}
+    assert reg.sync_status("linear") == {}
 
 
 def test_child_read_before_its_parent_gets_its_parent_link(reg, client, fake, clock):
@@ -535,15 +573,15 @@ def test_child_read_before_its_parent_gets_its_parent_link(reg, client, fake, cl
     fake.issue("HAI-9", t=T0 - 4500)
     fake.issue("HAI-1", t=T0 - 4000, title="Epic")
     out = importer(reg, client, clock).run(apply=True)
-    child = reg.work_by_ticket("HAI-2")
+    child = reg.work_by_ticket("HAI-2", rp.reader())
     assert child["sync_status"] == "synced"
-    assert reg.work_context(child["id"])["dependencies"]["parent"]["ticket"] == "HAI-1"
+    assert reg.work_context(child["id"], rp.reader())["dependencies"]["parent"]["ticket"] == "HAI-1"
     assert out["issues"]["retried"] == {"read": 1, "resolved": 1}
 
 
 def test_concurrent_insert_of_the_same_ticket_keeps_one_row(reg, monkeypatch):
     item = {"source_id": "uuid-HAI-1", "source_version": 5, "kind": "work", "title": "A"}
-    reg.import_items("linear", [item], HUMAN)
+    reg.import_items("linear", [item], HUMAN, corpus=rp.CORPUS_TAG)
     real = Registry.by_source
     calls = {"n": 0}
 
@@ -553,9 +591,9 @@ def test_concurrent_insert_of_the_same_ticket_keeps_one_row(reg, monkeypatch):
         return None if calls["n"] == 1 else real(self, system, source_id)
 
     monkeypatch.setattr(Registry, "by_source", racing)
-    [res] = reg.import_items("linear", [item], HUMAN)
+    [res] = reg.import_items("linear", [item], HUMAN, corpus=rp.CORPUS_TAG)
     assert res["outcome"] == "unchanged"
-    assert len(reg.works()) == 1
+    assert len(reg.works(rp.reader())) == 1
 
 
 def test_comment_insert_lost_to_a_concurrent_importer_reports_the_winner(reg, monkeypatch):
@@ -565,7 +603,7 @@ def test_comment_insert_lost_to_a_concurrent_importer_reports_the_winner(reg, mo
         "source_version": 5,
         "body": "A",
     }
-    reg.import_comments("linear", [comment])
+    reg.import_comments("linear", [comment], corpus_id=rp.CORPUS)
     real = reg.db.execute
     calls = {"n": 0}
 
@@ -578,16 +616,18 @@ def test_comment_insert_lost_to_a_concurrent_importer_reports_the_winner(reg, mo
         return real(sql, params)
 
     monkeypatch.setattr(reg.db, "execute", racing)
-    [res] = reg.import_comments("linear", [comment])
+    [res] = reg.import_comments("linear", [comment], corpus_id=rp.CORPUS)
     assert res["outcome"] == "unchanged"
     assert reg.db.execute("SELECT COUNT(*) FROM registry_comments") == [(1,)]
 
 
 def test_duplicate_deliveries_of_an_issue_in_one_batch(reg):
     item = {"source_id": "uuid-HAI-1", "source_version": 5, "kind": "work", "title": "A"}
-    out = reg.import_items("linear", [item, dict(item), {**item, "source_version": 4}], HUMAN)
+    out = reg.import_items(
+        "linear", [item, dict(item), {**item, "source_version": 4}], HUMAN, corpus=rp.CORPUS_TAG
+    )
     assert [r["outcome"] for r in out] == ["created", "unchanged", "stale"]
-    assert len(reg.works()) == 1
+    assert len(reg.works(rp.reader())) == 1
 
 
 def test_archive_and_trash_round_trip(reg, client, fake, clock):
@@ -598,31 +638,33 @@ def test_archive_and_trash_round_trip(reg, client, fake, clock):
     clock.now = T0 + 100
     fake.issue("HAI-4", t=T0 + 90, state="completed", archivedAt=iso(T0 + 90))
     imp.run(apply=True)
-    assert reg.work_by_ticket("HAI-4")["delivery_state"] == "archived"
+    assert reg.work_by_ticket("HAI-4", rp.reader())["delivery_state"] == "archived"
 
     clock.now = T0 + 200
     fake.issue("HAI-4", t=T0 + 190, state="completed")
     imp.run(apply=True)
-    assert reg.work_by_ticket("HAI-4")["delivery_state"] == "shipped"
+    assert reg.work_by_ticket("HAI-4", rp.reader())["delivery_state"] == "shipped"
 
     clock.now = T0 + 300
     fake.issue("HAI-4", t=T0 + 290, state="completed", trashed=True)
     imp.run(apply=True)
-    work = reg.work_by_ticket("HAI-4")
+    work = reg.work_by_ticket("HAI-4", rp.reader())
     assert (work["status"], work["status_reason"]) == ("retired", "source_deleted")
 
     clock.now = T0 + 400
     fake.issue("HAI-4", t=T0 + 390, state="completed")
     imp.run(apply=True)
-    work = reg.work_by_ticket("HAI-4")
+    work = reg.work_by_ticket("HAI-4", rp.reader())
     assert (work["status"], work["status_reason"]) == ("approved", "")
 
 
 def test_a_person_retiring_work_is_not_undone_by_import(reg):
     item = {"source_id": "uuid-HAI-1", "source_version": 1, "kind": "work", "title": "A"}
-    [res] = reg.import_items("linear", [item], HUMAN)
-    reg.retire(res["object_id"], HUMAN)
-    reg.import_items("linear", [{**item, "source_version": 2, "status": "approved"}], HUMAN)
+    [res] = reg.import_items("linear", [item], HUMAN, corpus=rp.CORPUS_TAG)
+    reg.retire(res["object_id"], HUMAN, rp.reader())
+    reg.import_items(
+        "linear", [{**item, "source_version": 2, "status": "approved"}], HUMAN, corpus=rp.CORPUS_TAG
+    )
     assert reg.get(res["object_id"])["status"] == "retired"
 
 
@@ -632,9 +674,12 @@ def test_reparenting_moves_the_parent_link(reg, client, fake, clock):
     clock.now = T0 + 100
     fake.issue("HAI-2", t=T0 + 90, parent={"id": "uuid-HAI-4"}, state="started")
     importer(reg, client, clock).run(apply=True)
-    ctx = reg.work_context(reg.work_by_ticket("HAI-2")["id"])
+    ctx = reg.work_context(reg.work_by_ticket("HAI-2", rp.reader())["id"], rp.reader())
     assert ctx["dependencies"]["parent"]["ticket"] == "HAI-4"
-    assert reg.work_context(reg.work_by_ticket("HAI-1")["id"])["children"] == []
+    assert (
+        reg.work_context(reg.work_by_ticket("HAI-1", rp.reader())["id"], rp.reader())["children"]
+        == []
+    )
 
 
 def test_comment_versions_and_archive(reg, client, fake, clock):
@@ -646,7 +691,7 @@ def test_comment_versions_and_archive(reg, client, fake, clock):
         "cm-2", "HAI-2", "Binding terms", t=T0 - 25, updatedAt=iso(T0 + 60), archivedAt=iso(T0 + 60)
     )
     importer(reg, client, clock).run(apply=True)
-    ctx = reg.work_context(reg.work_by_ticket("HAI-2")["id"])
+    ctx = reg.work_context(reg.work_by_ticket("HAI-2", rp.reader())["id"], rp.reader())
     assert [c["body"] for c in ctx["comments"]] == ["Plan v2"]
     stale = reg.import_comments(
         "linear",
@@ -658,6 +703,7 @@ def test_comment_versions_and_archive(reg, client, fake, clock):
                 "body": "old",
             }
         ],
+        corpus_id=rp.CORPUS,
     )
     assert stale[0]["outcome"] == "stale"
 
@@ -673,6 +719,7 @@ def test_a_comment_before_its_issue_attaches_later(reg):
                 "body": "early",
             }
         ],
+        corpus_id=rp.CORPUS,
     )
     reg.import_items(
         "linear",
@@ -686,8 +733,9 @@ def test_a_comment_before_its_issue_attaches_later(reg):
             }
         ],
         HUMAN,
+        corpus=rp.CORPUS_TAG,
     )
-    ctx = reg.work_context(reg.work_by_ticket("HAI-9")["id"])
+    ctx = reg.work_context(reg.work_by_ticket("HAI-9", rp.reader())["id"], rp.reader())
     assert [c["body"] for c in ctx["comments"]] == ["early"]
 
 
@@ -697,13 +745,15 @@ def test_a_comment_before_its_issue_attaches_later(reg):
 async def test_registry_edits_of_linear_fields_are_refused(reg, client, fake, clock):
     seed(fake)
     importer(reg, client, clock).run(apply=True)
-    work = reg.work_by_ticket("HAI-2")
+    work = reg.work_by_ticket("HAI-2", rp.reader())
     with pytest.raises(RegistryError, match="Linear is authoritative for title"):
-        reg.update_work(work["id"], {"title": "Agent rename"}, AGENT)
+        reg.update_work(work["id"], {"title": "Agent rename"}, AGENT, rp.reader())
     with pytest.raises(RegistryError, match="delivery_state"):
-        reg.update_work(work["id"], {"delivery_state": "shipped"}, HUMAN)
+        reg.update_work(work["id"], {"delivery_state": "shipped"}, HUMAN, rp.reader())
     # Registry-only fields, and an unchanged mirrored value, are allowed.
-    updated = reg.update_work(work["id"], {"plan": "1. import", "title": work["title"]}, AGENT)
+    updated = reg.update_work(
+        work["id"], {"plan": "1. import", "title": work["title"]}, AGENT, rp.reader()
+    )
     assert updated["plan"] == "1. import"
     # ...and survive the next import of a newer Linear version.
     clock.now = T0 + 100
@@ -716,9 +766,9 @@ async def test_registry_edits_of_linear_fields_are_refused(reg, client, fake, cl
 async def test_links_between_linear_tickets_are_refused(reg, client, fake, clock):
     seed(fake)
     importer(reg, client, clock).run(apply=True)
-    a, b = reg.work_by_ticket("HAI-4"), reg.work_by_ticket("HAI-1")
+    a, b = reg.work_by_ticket("HAI-4", rp.reader()), reg.work_by_ticket("HAI-1", rp.reader())
     with pytest.raises(RegistryError, match="link them in Linear"):
-        reg.link_work(a["id"], b["id"], "blocks", AGENT)
+        reg.link_work(a["id"], b["id"], "blocks", AGENT, rp.reader())
     out = await reg.put_object(
         {
             "kind": "decision",
@@ -731,8 +781,10 @@ async def test_links_between_linear_tickets_are_refused(reg, client, fake, clock
         AGENT,
     )
     # A registry decision recorded against a Linear ticket has no Linear twin.
-    reg.link_work(a["id"], out["object"]["id"], "records", AGENT)
-    assert [d["id"] for d in reg.work_context(a["id"])["decisions"]] == [out["object"]["id"]]
+    reg.link_work(a["id"], out["object"]["id"], "records", AGENT, rp.reader())
+    assert [d["id"] for d in reg.work_context(a["id"], rp.reader())["decisions"]] == [
+        out["object"]["id"]
+    ]
 
 
 # ── inventory ───────────────────────────────────────────────────────────
@@ -747,19 +799,22 @@ def seed_inventory(fake: FakeLinear) -> None:
     fake.document("doc-3", None, t=T0 - 10, project={"id": "proj-1"})
 
 
-def test_inventory_counts_the_whole_workspace(client, fake):
+def test_inventory_counts_every_manifest_team(client, fake):
     seed_inventory(fake)
-    out = lin.inventory(client)
+    out = lin.inventory(client, access=rp.operator())
     assert [t["key"] for t in out["teams"]] == ["HAI", "OPS"]
+    assert out["unapproved_teams"] == []
     assert out["issues"]["total"] == 6
     assert (out["issues"]["team:HAI"], out["issues"]["team:OPS"]) == (5, 1)
     assert (out["issues"]["archived"], out["issues"]["trashed"]) == (1, 1)
-    assert out["comments"] == {"on_issues": 3, "archived": 0, "not_on_issue": 1}
+    # Comments are read only on manifest-team issues, so none off an issue is seen.
+    assert out["comments"] == {"on_issues": 3, "archived": 0}
+    # Only documents on manifest-team issues are counted; doc-3 sits on a project.
     assert out["documents"] == {
-        "total": 3,
+        "total": 2,
         "archived": 1,
         "on_issue": 2,
-        "on_project": 1,
+        "on_project": 0,
         "on_initiative": 0,
     }
     assert out["documents_linked_to_issues"] == ["HAI-2: HAI-2 design", "OPS-1: doc-2"]
@@ -767,20 +822,19 @@ def test_inventory_counts_the_whole_workspace(client, fake):
     joined = "\n".join(out["exceptions"])
     assert "projects: 1 referenced" in joined
     assert "of type 'similar'" in joined
-    assert "documents: 3 (2 linked to an issue)" in joined
-    assert "comments: 1 on documents, projects or updates" in joined
-    assert "team filter" not in joined
+    assert "documents: 2 (2 linked to an issue)" in joined
+    assert "not attached to an issue of a manifest team" in joined
 
 
 def test_inventory_narrowed_to_a_team(client, fake):
     seed_inventory(fake)
-    out = lin.inventory(client, ["HAI"])
+    out = lin.inventory(client, ["HAI"], access=rp.operator())
     assert [t["key"] for t in out["teams"]] == ["HAI"]
     assert out["issues"]["total"] == 5
     assert out["comments"] == {"on_issues": 2, "archived": 0}
     assert out["documents"]["total"] == 1
     assert out["documents_linked_to_issues"] == ["HAI-2: HAI-2 design"]
-    assert "team filter: documents and comments" in "\n".join(out["exceptions"])
+    assert "not attached to an issue of a manifest team" in "\n".join(out["exceptions"])
 
 
 # ── schema ──────────────────────────────────────────────────────────────
@@ -828,12 +882,12 @@ def test_sent_filters_are_valid_linear_inputs(linear_schema, reg, client, fake, 
         ],
         HUMAN,
     )
-    lin.inventory(client)
-    lin.inventory(client, ["HAI", "OPS"])
-    LinearImporter(reg, client, clock=clock).run(apply=True)
-    LinearImporter(reg, client, ["HAI"], clock=clock).run(apply=True)
+    lin.inventory(client, access=rp.operator())
+    lin.inventory(client, ["HAI", "OPS"], access=rp.operator())
+    LinearImporter(reg, client, access=rp.operator(), clock=clock).run(apply=True)
+    LinearImporter(reg, client, ["HAI"], access=rp.operator(), clock=clock).run(apply=True)
     clock.now += 3600
-    LinearImporter(reg, client, ["HAI"], clock=clock).run(apply=True)
+    LinearImporter(reg, client, ["HAI"], access=rp.operator(), clock=clock).run(apply=True)
     sent = {json.dumps(r, sort_keys=True): r for r in fake.requests}.values()
     assert {
         next(n for n in ("Issues", "Comments", "Teams", "Documents") if n in r["query"])
@@ -862,7 +916,7 @@ def test_transaction_rolls_back_on_error(reg):
             "linear", [{"source_id": "uuid-HAI-1", "source_version": 1, "kind": "work"}], HUMAN
         )
         raise RuntimeError("abort")
-    assert reg.works() == []
+    assert reg.works(rp.reader()) == []
 
 
 # ── Postgres (opt-in) ───────────────────────────────────────────────────
@@ -877,16 +931,7 @@ pg_only = pytest.mark.skipif(not PG_URL, reason="REGISTRY_TEST_POSTGRES_URL not 
 def pg_regs(clock):
     regs = [Registry(RegistryDB(url=PG_URL), clock=clock) for _ in range(2)]
     yield regs
-    for table in (
-        "registry_objects",
-        "registry_relationships",
-        "registry_anchors",
-        "registry_conflict_answers",
-        "registry_conflict_prompts",
-        "registry_comments",
-        "registry_sync_state",
-    ):
-        regs[0].db.execute(f"DROP TABLE IF EXISTS {table}")
+    rp.drop_registry_tables(regs[0].db)
     for r in regs:
         r.db.close()
 
@@ -899,7 +944,9 @@ def test_postgres_concurrent_importers_keep_one_row(pg_regs):
 
     def run(reg: Registry) -> None:
         barrier.wait()
-        outcomes.extend(r["outcome"] for r in reg.import_items("linear", [item], HUMAN))
+        outcomes.extend(
+            r["outcome"] for r in reg.import_items("linear", [item], HUMAN, corpus=rp.CORPUS_TAG)
+        )
 
     threads = [threading.Thread(target=run, args=(r,)) for r in pg_regs]
     for t in threads:
@@ -907,7 +954,7 @@ def test_postgres_concurrent_importers_keep_one_row(pg_regs):
     for t in threads:
         t.join()
     assert sorted(outcomes) == ["created", "unchanged"]
-    assert len(pg_regs[0].works()) == 1
+    assert len(pg_regs[0].works(rp.reader())) == 1
 
 
 @pg_only
@@ -921,3 +968,81 @@ def test_postgres_transaction_rolls_back(pg_regs):
         )
         raise RuntimeError("abort")
     assert reg.by_source("linear", "uuid-HAI-2") is None
+
+
+# ── provenance (HAI-12825) ──────────────────────────────────────────────
+
+
+def _revisions(reg, source_type: str) -> list[tuple]:
+    return reg.db.execute(
+        "SELECT source_id, original_text, corpus_id FROM registry_source_revisions "
+        "WHERE source_type = ? ORDER BY source_updated_at",
+        (source_type,),
+    )
+
+
+def test_descriptions_and_comments_keep_immutable_revisions(reg, client, fake, clock):
+    fake.issue("HAI-1", t=T0 - 50, description="We decided v1.")
+    fake.comment(
+        "cm-bot",
+        "HAI-1",
+        "Decision: merges are realization only.",
+        t=T0 - 40,
+        user=None,
+        botActor={
+            "id": "b1",
+            "name": "Kory",
+            "type": "ai",
+            "subType": "agent",
+            "userDisplayName": "Zane Claes",
+        },
+    )
+    importer(reg, client, clock).run(apply=True)
+    clock.now = T0 + 100
+    fake.issue("HAI-1", t=T0 + 90, description="We decided v2.")
+    importer(reg, client, clock).run(apply=True)
+    texts = [r[1] for r in _revisions(reg, "linear_issue_description")]
+    assert texts == ["We decided v1.", "We decided v2."]  # the edit did not erase v1
+    assert {r[2] for r in _revisions(reg, "linear_issue_description")} == {rp.CORPUS}
+    roles = dict(
+        reg.db.execute(
+            "SELECT role, original_identity FROM registry_attributions a JOIN "
+            "registry_source_revisions r ON r.evidence_id = a.evidence_id "
+            "WHERE r.source_type = 'linear_comment' AND a.role IN ('invoking_actor', 'importer')"
+        )
+    )
+    assert roles["invoking_actor"] == "Zane Claes"
+    assert roles["importer"] == f"operator:{rp.OPERATOR}"
+    bot = reg.db.execute(
+        "SELECT actor_kind, original_bot, model_family FROM registry_attributions a JOIN "
+        "registry_source_revisions r ON r.evidence_id = a.evidence_id "
+        "WHERE r.source_type = 'linear_comment' AND a.role = 'source_account'"
+    )
+    assert bot == [("bot", "Kory", None)]
+    runs = reg.db.execute("SELECT stream, status FROM registry_import_runs ORDER BY started_at")
+    assert ("issues", "complete") in runs and ("comments", "complete") in runs
+
+
+def test_a_team_outside_the_manifest_is_never_fetched_or_stored(reg, client, fake, clock):
+    seed(fake)
+    secret = fake.issue("SECRET-1", t=T0 - 5, description="We decided something private.")
+    fake.comment("cm-s", "SECRET-1", "private comment", t=T0 - 4)
+    assert secret["team"]["id"] == "team-SECRET"
+    out = LinearImporter(reg, client, access=rp.operator(), clock=clock).run(apply=True)
+    assert out["issues"]["totals"]["created"] == 5
+    sent = json.dumps([r["variables"] for r in fake.requests])
+    assert "SECRET" not in sent  # the walk filter names manifest teams only
+    stored = json.dumps(reg.db.execute("SELECT original_text FROM registry_source_revisions"))
+    assert "private" not in stored
+    assert reg.by_source("linear", "uuid-SECRET-1") is None
+    with pytest.raises(lin.AccessDenied):
+        LinearImporter(reg, client, ["SECRET"], access=rp.operator(), clock=clock).run(apply=True)
+    inv = lin.inventory(client, access=rp.operator())
+    assert inv["unapproved_teams"] == [{"id": "team-SECRET", "key": "SECRET"}]
+
+
+def test_a_node_whose_team_id_mismatches_its_key_is_dropped(reg, client, fake, clock):
+    fake.issue("HAI-1", t=T0 - 5, team={"id": "team-IMPOSTER", "key": "HAI"})
+    out = importer(reg, client, clock).run(apply=True)
+    assert out["issues"]["totals"]["excluded_outside_manifest"] == 1
+    assert reg.by_source("linear", "uuid-HAI-1") is None

@@ -188,10 +188,34 @@ class RegistryDB:
         else:
             assert path is not None
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-        for stmt in SCHEMA:
-            self.execute(stmt)
+            self._conn = sqlite3.connect(
+                path, check_same_thread=False, isolation_level=None, timeout=30.0
+            )
+            self._conn.execute("PRAGMA busy_timeout=30000")
+            self._enable_wal()
+        from mira.registry.migrations import ADVISORY_LOCK_KEY, migrate
+
+        # Concurrent startups serialize on the schema: base tables, then the
+        # versioned migrations, in one transaction (HAI-12825).
+        with self.transaction():
+            if self.postgres:
+                self.execute("SELECT pg_advisory_xact_lock(?)", (ADVISORY_LOCK_KEY,))
+            for stmt in SCHEMA:
+                self.execute(stmt)
+            migrate(self)
+
+    def _enable_wal(self) -> None:
+        """Switching to WAL can fail fast while another opener holds the file; retry."""
+        import time
+
+        for attempt in range(50):
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) or attempt == 49:
+                    raise
+                time.sleep(0.05)
 
     def _sql(self, sql: str) -> str:
         return sql.replace("?", "%s") if self.postgres else sql

@@ -7,7 +7,7 @@ hook.
 
 An answer is stored on the proposal's session. A second session does not
 inherit it. `defer` lets the session continue editing and leaves the
-proposal `proposed`, so a later merge still will not auto-approve it. Push
+proposal `proposed`. A merge never approves a proposal (HAI-12825). Push
 and PR creation stay blocked until someone answers `keep` or `supersede`.
 
 ## Assumption
