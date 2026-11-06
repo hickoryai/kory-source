@@ -5,7 +5,7 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
 * ``RouterAcpProvider`` implements ``LLMProviderProtocol``.
 * ``complete``, ``complete_with_tools``, ``review``, and ``walkthrough``
   return a string.
-* ``complete_agentic`` is a JSON tool-call adapter (HAI-12817). Each hop is
+* ``complete_agentic`` is a JSON tool-call adapter. Each hop is
   one ordinary completion: the prompt carries the tool schemas and the whole
   call/result history, and the seat answers with exactly one
   ``{"tool": name, "arguments": {...}}`` object. The provider checks the name
