@@ -97,9 +97,7 @@ def test_clean_tagged_and_untagged_versions_pass():
 def test_untagged_platform_image_with_deleted_private_file_fails_without_leaking_it():
     reg = FakeRegistry()
     secret = b"synthetic HAI-999999 fixture"
-    image = reg.image(
-        [_layer({"app/notes.txt": secret}), _layer({"app/.wh.notes.txt": b""})]
-    )
+    image = reg.image([_layer({"app/notes.txt": secret}), _layer({"app/.wh.notes.txt": b""})])
     attestation = reg.image(
         [b'{"predicate": "generic"}'], layer_type="application/vnd.in-toto+json"
     )
