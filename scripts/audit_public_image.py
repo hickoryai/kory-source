@@ -18,14 +18,39 @@ from pathlib import Path, PurePosixPath
 PATTERNS = {
     "organization-reference": re.compile(rb"hickory", re.I),
     "internal-ticket": re.compile(rb"\bHAI-\d+\b"),
-    "private-key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    "private-key": re.compile(
+        rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=\r\n]{64,}"
+    ),
     "credential": re.compile(
         rb"(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|AKIA[A-Z0-9]{16})"
     ),
 }
 
 
+# Public AWS SDK documentation constants, not a wildcard for example-like keys.
+AWS_DOCUMENTATION_KEYS = (
+    b"AKIA111111111EXAMPLE",
+    b"AKIA222222222EXAMPLE",
+    b"AKIAI44QH8DHBEXAMPLE",
+    b"AKIAIOSFODNN7EXAMPLE",
+)
+
+# Reviewed npm @openai/codex-linux-x64 0.145.0 upstream bytes. The binary
+# contains the unrelated Hickory DNS library and concatenated token-prefix
+# literals. Only these categories for this exact path AND hash are exempt;
+# changing one byte, version, or architecture requires a new upstream review.
+UPSTREAM_FINDINGS = {
+    "usr/local/lib/node_modules/@openai/codex/node_modules/@openai/"
+    "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex": (
+        "a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14",
+        frozenset({"organization-reference", "credential"}),
+    ),
+}
+
+
 def scan(data: bytes) -> set[str]:
+    for example in AWS_DOCUMENTATION_KEYS:
+        data = data.replace(example, b"AWS_DOCUMENTATION_EXAMPLE")
     # Preserve legal attribution, but never exempt credentials on those lines.
     nonlegal = re.sub(
         rb"(?im)^[ \t#/*]*copyright[ \t]+(?:\(c\)[ \t]+)?"
@@ -40,12 +65,17 @@ def scan(data: bytes) -> set[str]:
     }
 
 
-def scan_stream(stream) -> set[str]:
+def scan_stream(stream, name: str = "") -> set[str]:
     found = set()
+    digest = hashlib.sha256()
     tail = b""
     while chunk := stream.read(1024 * 1024):
+        digest.update(chunk)
         found.update(scan(tail + chunk))
         tail = chunk[-4096:]
+    expected, allowed = UPSTREAM_FINDINGS.get(name, ("", frozenset()))
+    if digest.hexdigest() == expected:
+        found.difference_update(allowed)
     return found
 
 
@@ -67,7 +97,10 @@ def audit_image(path: Path) -> list[tuple[str, str]]:
         if not manifest:
             raise ValueError("empty image manifest")
         for entry in manifest:
-            config = json.load(archive.extractfile(entry["Config"]))
+            config_bytes = archive.extractfile(entry["Config"]).read()
+            config = json.loads(config_bytes)
+            print("image-config-sha256:", hashlib.sha256(config_bytes).hexdigest())
+            print("layers-to-audit:", len(entry["Layers"]))
             # Public source provenance is not organization-specific configuration.
             labels = config.get("config", {}).get("Labels") or {}
             for key in ("org.opencontainers.image.source", "org.opencontainers.image.url"):
@@ -88,7 +121,7 @@ def audit_image(path: Path) -> list[tuple[str, str]]:
                             for reason in scan(member.linkname.encode()):
                                 findings.append((member.name, reason))
                         if member.isfile():
-                            for reason in scan_stream(layer.extractfile(member)):
+                            for reason in scan_stream(layer.extractfile(member), member.name):
                                 findings.append((member.name, reason))
     return findings
 

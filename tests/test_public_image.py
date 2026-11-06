@@ -63,7 +63,7 @@ def test_clean_image_passes(tmp_path):
 
 def test_legal_attribution_preserved_but_not_credentials():
     assert not scan(b"Copyright Hickory AI")
-    assert "private-key" in scan(b"Copyright -----BEGIN PRIVATE KEY-----")
+    assert "private-key" in scan(b"Copyright -----BEGIN PRIVATE KEY-----\n" + b"A" * 64)
     assert "organization-reference" in scan(b"DEFAULT_ORG=hickory")
     assert "organization-reference" in scan(b'{"copyright": "example", "org": "hickory"}')
 
@@ -120,3 +120,31 @@ def test_wheel_checks_metadata_and_unexpected_members(tmp_path):
         wheel.writestr("deployment.yaml", "generic")
     assert ("example.dist-info/METADATA", "internal-ticket") in audit_wheel(path)
     assert ("deployment.yaml", "unexpected-wheel-member") in audit_wheel(path)
+
+
+def test_key_header_constant_is_not_a_key():
+    assert "private-key" not in scan(b'HEADER = "-----BEGIN PRIVATE KEY-----"')
+    assert "private-key" in scan(b"-----BEGIN PRIVATE KEY-----\n" + b"A" * 64)
+
+
+def test_upstream_exception_requires_exact_path_and_bytes(monkeypatch):
+    import hashlib
+
+    from scripts import audit_public_image as audit
+
+    data = b"hickory DNS library"
+    monkeypatch.setattr(
+        audit,
+        "UPSTREAM_FINDINGS",
+        {
+            "vendor/binary": (
+                hashlib.sha256(data).hexdigest(),
+                frozenset({"organization-reference"}),
+            ),
+        },
+    )
+    assert not audit.scan_stream(io.BytesIO(data), "vendor/binary")
+    assert "organization-reference" in audit.scan_stream(
+        io.BytesIO(data + b"changed"), "vendor/binary"
+    )
+    assert "organization-reference" in audit.scan_stream(io.BytesIO(data), "other/binary")

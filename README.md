@@ -219,7 +219,9 @@ and audit its Docker-save archive with `--image /path/to/image.tar`. The audit
 checks known organization markers, internal ticket IDs, credential patterns,
 configuration/history and every layer, including subsequently deleted files.
 It prints categories and hashed locators, never matching contents. It preserves
-copyright attribution and the public repository provenance labels. This bounded
+copyright attribution and the public repository provenance labels. Known AWS
+documentation keys and a reviewed upstream Codex binary (exact path and SHA-256)
+have narrow exceptions; a changed binary requires a fresh upstream review. This bounded
 check supplements manual content review; it does not certify arbitrary data safe.
 Audit wheel archives (`--wheel`) and generated UI directories (`--frontend`) too.
 Export the effective context with `docker build --target build-context
