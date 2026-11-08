@@ -1607,3 +1607,27 @@ def test_cli_run_refuses_a_review_timeout_the_relay_would_cut():
         timeout=120,
     )
     assert out.returncode != 0 and "exceeds the loopback relay cap" in out.stderr
+
+
+@pytest.mark.parametrize(
+    ("raw", "cap"),
+    [
+        (None, 900),
+        ("", 900),
+        ("1800", 1800),
+        (" 1800 ", 1800),
+        ("+1800", 900),
+        ("01800", 900),
+        ("1800.0", 900),
+        ("-5", 900),
+        ("0", 900),
+        ("7200", 3600),
+    ],
+)
+def test_relay_cap_is_parsed_like_the_relay(monkeypatch, raw, cap):
+    rp = _run_parity_module()
+    if raw is None:
+        monkeypatch.delenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", raw)
+    assert rp._relay_cap_seconds() == cap

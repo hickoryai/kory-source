@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -54,6 +55,7 @@ RERUN = (
 # loopback relay started with a cap at least that long.
 RELAY_DEFAULT_CAP_SECONDS = 900
 RELAY_CAP_ENV = "KORY_COMPLETION_TIMEOUT_CAP_SECONDS"
+RELAY_CAP_LIMIT_SECONDS = 3600
 PREFLIGHT_PROMPT = (
     "Preflight check for a benchmark run. Reply with exactly this JSON object and "
     'nothing else: {"preflight": "ok"}'
@@ -156,11 +158,15 @@ def _start_loopback(token: str) -> tuple[subprocess.Popen | None, object | None]
 
 
 def _relay_cap_seconds() -> int:
+    """The cap the loopback relay will apply, parsed exactly as the relay parses it.
+
+    A positive integer without sign or leading zero, clamped to 3600; anything
+    else leaves the relay at its 900 s default.
+    """
     raw = os.environ.get(RELAY_CAP_ENV, "").strip()
-    try:
-        return int(raw) if raw else RELAY_DEFAULT_CAP_SECONDS
-    except ValueError:
+    if not re.fullmatch(r"[1-9][0-9]*", raw):
         return RELAY_DEFAULT_CAP_SECONDS
+    return min(int(raw), RELAY_CAP_LIMIT_SECONDS)
 
 
 def _check_review_timeout(seconds: int) -> None:
