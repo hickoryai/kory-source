@@ -929,7 +929,7 @@ def _scripted_reviewer(models: list[str], **cfg):
 
     async def transport(request):
         sent.append(request)
-        return {"text": '{"comments": []}', "actual_model": models[len(sent) - 1]}
+        return {"text": '{"comments": [], "summary": ""}', "actual_model": models[len(sent) - 1]}
 
     async def no_sleep(_):
         return None
@@ -953,7 +953,10 @@ async def test_excluded_reviewer_reply_is_a_failed_call_and_retried(monkeypatch,
     llm = meter.guard(parity_runner.exclude_reviewer_families(llm, {"xai"}))
     token = attribution_key.set("review|t")
     try:
-        assert await llm.review([{"role": "user", "content": "diff"}]) == '{"comments": []}'
+        assert (
+            await llm.review([{"role": "user", "content": "diff"}])
+            == '{"comments": [], "summary": ""}'
+        )
     finally:
         attribution_key.reset(token)
     log = [(e["state"], e["actual_model"], e["attempts"]) for e in RouterAcpProvider.call_log]
@@ -1004,7 +1007,7 @@ async def test_run_parity_never_scores_a_judge_family_reviewer_reply(monkeypatch
             return judge
 
         async def transport(request):
-            return {"text": '{"comments": []}', "actual_model": next(replies)}
+            return {"text": '{"comments": [], "summary": ""}', "actual_model": next(replies)}
 
         return RouterAcpProvider(cfg, transport=transport)
 

@@ -45,9 +45,13 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   many jobs share ``call_log``. A reply the provider cannot parse is reported
   as a ``bad_response`` entry after the ``ok`` transport entry.
 * A final structured answer (``complete_with_tools``, ``review``,
-  ``walkthrough``, and an agentic ``submit_*`` call) must be the JSON object
-  alone, optionally in one json fence. Prose around it is a plan or a
-  narration, not a completed answer, and is ``bad_response``. Such a reply
+  ``walkthrough``, and an agentic ``submit_*`` call) is the JSON object that
+  ends the reply, bare or in a closing json fence, and it must carry the
+  submission schema's required fields with the declared types. Text before
+  it is narration from the same turn (the relay returns every message of the
+  turn). A reply with no closing object (a plan), with text after the object
+  (the seat had not finished), or whose object is not a submission is
+  ``bad_response``. Such a reply
   gets ``repair_turns`` (one) more completion that quotes the rejected reply
   and asks for the final JSON. Its call-log entries carry ``"turn": "repair"``.
   A repair that is still unusable raises, so the caller sees the failure.
@@ -291,10 +295,13 @@ class RouterAcpProvider:
             self._record_bad_response()
             raise
 
-    def _final_answer(self, raw: str) -> str:
-        if self.strict_final_answer:
-            return _only_json_object(raw)
-        return self._extract_json_object(raw)
+    def _final_answer(self, raw: str, schema: dict | None = None) -> str:
+        if not self.strict_final_answer:
+            return self._extract_json_object(raw)
+        answer = _closing_json_object(raw)
+        if schema is not None:
+            _check_arguments("final answer", json.loads(answer), schema)
+        return answer
 
     def _repair_prompt(self, prompt: str, rejected: str, reason: LLMError) -> str:
         quoted = rejected.strip()[:_REJECTED_QUOTE_CHARS]
@@ -309,7 +316,7 @@ class RouterAcpProvider:
             + "\n".join("> " + line for line in quoted.splitlines())
         )
 
-    async def _final_json(self, prompt: str) -> str:
+    async def _final_json(self, prompt: str, schema: dict | None = None) -> str:
         """One final structured answer, with at most ``repair_turns`` repairs.
 
         Every unusable reply is logged as ``bad_response``. The last one raises.
@@ -321,7 +328,7 @@ class RouterAcpProvider:
                 raw, usage = await self._generate(current)
                 self._account(current, raw, usage)
                 try:
-                    return self._final_answer(raw)
+                    return self._final_answer(raw, schema)
                 except LLMError as exc:
                     self._record_bad_response()
                     if turn >= self.repair_turns:
@@ -589,7 +596,8 @@ class RouterAcpProvider:
         tools: list[dict],
         temperature: float | None = None,
     ) -> str:
-        return await self._final_json(self._tool_prompt(messages, tools))
+        schema = (tools[0].get("function") or {}).get("parameters") if tools else None
+        return await self._final_json(self._tool_prompt(messages, tools), schema)
 
     async def complete_agentic(
         self,
@@ -612,8 +620,8 @@ class RouterAcpProvider:
         try:
             name, arguments = _parse_tool_call(self._extract_json_object(raw), specs)
             if name.startswith("submit_"):
-                # A submission is the final answer: prose around it is a plan.
-                _parse_tool_call(self._final_answer(raw), specs)
+                # A submission is the final answer: it must close the reply.
+                name, arguments = _parse_tool_call(self._final_answer(raw), specs)
         except LLMError as exc:
             self._record_bad_response()
             logger.info("router agentic reply unusable: %s", exc)
@@ -691,28 +699,48 @@ _JSON_TYPES: dict[str, tuple[type, ...]] = {
 }
 
 
-def _only_json_object(text: str) -> str:
-    """The reply when it is one JSON object, alone or in a single fence.
+def _closing_json_object(text: str) -> str:
+    """The JSON object that ends the reply, bare or in a closing json fence.
 
-    Any other text means the seat narrated or planned instead of answering.
+    Narration before it is allowed: the relay returns every message of the
+    seat's turn. No closing object means a plan; text after it means the seat
+    had not finished. Both raise ``router_acp_bad_response``.
     """
     candidate = text.strip()
     if not candidate:
         raise LLMError("router_acp_empty_response", detail="empty completion")
-    if candidate.startswith("```") and candidate.endswith("```") and candidate.count("```") == 2:
-        candidate = candidate[3:-3].strip()
-        if candidate.startswith("json"):
-            candidate = candidate[4:].strip()
-    try:
-        parsed = json.loads(candidate)
-    except Exception:
-        parsed = None
-    if not isinstance(parsed, dict):
-        raise LLMError(
-            "router_acp_bad_response",
-            detail="reply is not only a JSON object: " + text.strip()[:400],
-        )
-    return candidate
+    if candidate.endswith("```"):
+        opening = candidate.rfind("```", 0, len(candidate) - 3)
+        if opening != -1:
+            block = candidate[opening + 3 : -3].strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            candidate = block
+    decoder = json.JSONDecoder()
+    index = candidate.find("{")
+    while index != -1:
+        try:
+            parsed, end = decoder.raw_decode(candidate, index)
+        except ValueError:
+            parsed, end = None, -1
+        if isinstance(parsed, dict) and not candidate[end:].strip():
+            return candidate[index:end]
+        index = candidate.find("{", index + 1)
+    raise LLMError(
+        "router_acp_bad_response",
+        detail="reply does not end with the final JSON object: " + text.strip()[:400],
+    )
+
+
+def _check_arguments(name: str, arguments: dict, schema: dict) -> None:
+    for key in schema.get("required") or []:
+        if key not in arguments:
+            raise LLMError("router_acp_bad_response", detail=f"{name}: missing {key}")
+    properties = schema.get("properties") or {}
+    for key, value in arguments.items():
+        expected = (properties.get(key) or {}).get("type")
+        if expected is not None and not _type_ok(value, expected):
+            raise LLMError("router_acp_bad_response", detail=f"{name}: {key} is not {expected}")
 
 
 def _tool_specs(tools: list[dict]) -> dict[str, dict]:
@@ -773,15 +801,7 @@ def _parse_tool_call(text: str, specs: dict[str, dict]) -> tuple[str, dict]:
             raise LLMError("router_acp_bad_response", detail=f"{name}: arguments not JSON") from exc
     if not isinstance(arguments, dict):
         raise LLMError("router_acp_bad_response", detail=f"{name}: arguments not an object")
-    schema = specs[name]["parameters"]
-    for key in schema.get("required") or []:
-        if key not in arguments:
-            raise LLMError("router_acp_bad_response", detail=f"{name}: missing {key}")
-    properties = schema.get("properties") or {}
-    for key, value in arguments.items():
-        expected = (properties.get(key) or {}).get("type")
-        if expected is not None and not _type_ok(value, expected):
-            raise LLMError("router_acp_bad_response", detail=f"{name}: {key} is not {expected}")
+    _check_arguments(name, arguments, specs[name]["parameters"])
     return name, arguments
 
 

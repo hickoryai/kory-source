@@ -531,17 +531,32 @@ async def test_plan_only_final_review_is_rejected_after_one_repair():
     assert provider.call_log[0]["actual_model"] == "grok@x/grok-4.7"
 
 
+_NARRATION = (
+    "The rest of the diff was cut off. I'll read that section and submit the review from it."
+)
+_FINDING = {
+    "comments": [{"path": "a.py", "line": 3, "severity": "warning", "title": "t", "body": "b"}],
+    "summary": "One defect.",
+}
+
+
 @pytest.mark.parametrize(
     "first",
     [
+        # A plan with no closing answer.
+        _PLAN,
+        # An answer followed by more plan: the seat had not finished.
+        _DONE + "\nI'll keep reviewing the remaining files before filing.",
+        "```json\n" + _DONE + "\n```\nThen I'll grep for the consumer.",
+        # A plan that ends in a lookup, not a submission.
+        _PLAN + "\n" + json.dumps({"tool": "read_file", "arguments": {"path": "a.py"}}),
+        # A plan that ends in an object missing required submission fields.
         _PLAN + "\n" + json.dumps({"comments": []}),
-        "Next I will check the callers.\n```json\n" + json.dumps({"comments": []}) + "\n```",
-        json.dumps({"comments": []}) + "\nI'll keep reviewing the remaining files before filing.",
-        '```json\n{"comments": []}\n```\nThen I\'ll grep for the consumer.',
+        _PLAN + "\n" + json.dumps({"comments": "none", "summary": "s"}),
     ],
 )
-async def test_plan_wrapped_empty_review_is_not_accepted_as_completed(first):
-    # The JSON inside a plan is not the answer; only the repaired reply counts.
+async def test_a_plan_is_never_accepted_as_a_completed_review(first):
+    # Only the repaired reply counts; the rejected one is logged.
     transport, prompts, _ = _scripted([first, _DONE])
     provider = _provider(transport)
 
@@ -552,8 +567,26 @@ async def test_plan_wrapped_empty_review_is_not_accepted_as_completed(first):
     assert [e["state"] for e in provider.call_log] == ["ok", "bad_response", "ok"]
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # The relay returns the whole turn: narration, then the finished review.
+        _NARRATION + json.dumps(_FINDING),
+        _NARRATION + "\n```json\n" + json.dumps(_FINDING) + "\n```",
+        # A JSON-looking fragment inside the narration does not hide the closing answer.
+        'I checked {"tool": "grep_repo"} first.\n' + json.dumps(_FINDING),
+    ],
+)
+async def test_narration_then_a_finished_review_is_the_review(reply):
+    transport, prompts, _ = _scripted([reply])
+    provider = _provider(transport)
+    assert json.loads(await provider.review([{"role": "user", "content": "d"}])) == _FINDING
+    assert len(prompts) == 1
+    assert [e["state"] for e in provider.call_log] == ["ok"]
+
+
 async def test_plan_wrapped_repair_still_fails_visibly():
-    wrapped = _PLAN + "\n" + json.dumps({"comments": []})
+    wrapped = _DONE + "\nI'll keep reviewing the remaining files before filing."
     transport, prompts, _ = _scripted([wrapped, wrapped])
     provider = _provider(transport)
     with pytest.raises(LLMError):
@@ -584,7 +617,7 @@ async def test_review_prompt_says_the_seat_has_no_tools_of_its_own():
 async def test_agentic_submit_inside_a_plan_is_not_a_submission():
     from mira.core.passes import agentic_review_loop
 
-    planned_submit = _PLAN + "\n" + _call("submit_review", comments=[])
+    planned_submit = _call("submit_review", **_REVIEW) + "\nI'll review the rest of the diff next."
     transport, prompts, _ = _scripted([planned_submit])
     provider = _provider(transport)
     executor = _RecordingExecutor()
@@ -643,3 +676,15 @@ async def test_configured_timeout_is_sent_with_each_request():
     await provider.review([{"role": "user", "content": "d"}])
     assert requests[0]["body"]["timeout_seconds"] == 1800
     assert requests[0]["timeout"] == 1800
+
+
+async def test_agentic_narrated_submission_is_accepted():
+    from mira.core.passes import agentic_review_loop
+
+    transport, prompts, _ = _scripted([_NARRATION + _call("submit_review", **_REVIEW)])
+    provider = _provider(transport)
+    assert (
+        json.loads(await agentic_review_loop(provider, list(_SYSTEM), _RecordingExecutor()))
+        == _REVIEW
+    )
+    assert len(prompts) == 1 and [e["state"] for e in provider.call_log] == ["ok"]
