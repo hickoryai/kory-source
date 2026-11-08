@@ -29,7 +29,7 @@ from typing import Any
 
 from mira.config import FilterConfig, LLMConfig, MiraConfig, ReviewConfig
 from mira.core.engine import ReviewEngine
-from mira.llm.router_acp import UNPINNED_MODELS
+from mira.llm.router_acp import UNPINNED_MODELS, RouterTransportError
 
 from .parity_judge import GREPTILE, KORY, judge_unit, rescore_unit
 from .parity_snapshot import (
@@ -119,8 +119,16 @@ class SeatMeter:
                     raise SeatBudgetExhausted(f"run_stopped: {self.fatal}")
                 raise SeatBudgetExhausted(f"seat_budget_exhausted: {self.used}/{self.budget} used")
             self.used += 1
-            payload = await inner(request)
             requested = str(((request.get("body") or {}).get("model")) or "")
+            try:
+                payload = await inner(request)
+            except RouterTransportError as exc:
+                # The relay refused a pinned request another model answered. That
+                # is the same fallback as a 200 reply from the wrong model.
+                actual = str((exc.body or {}).get("actual_model") or "unknown")
+                if exc.kind == "model_mismatch" and not self.fatal:
+                    self.fatal = f"pinned model {requested} served by {actual}"
+                raise
             actual = (
                 str((payload or {}).get("actual_model") or "") if isinstance(payload, dict) else ""
             )
@@ -584,6 +592,11 @@ def make_judge_llm(config: LLMConfig) -> Any:
     from mira.llm.router_acp import RouterAcpProvider
 
     class JudgeRouterProvider(RouterAcpProvider):
+        # The judge keeps the extraction and single attempt every earlier run used,
+        # so verdicts stay comparable. A judge parse failure stays a judge error.
+        strict_final_answer = False
+        repair_turns = 0
+
         def _messages_prompt(self, messages: list[dict]) -> str:
             return "\n".join([*_JUDGE_FRAME, *(str(m.get("content", "")) for m in messages)])
 
@@ -941,6 +954,12 @@ def _seat_usage(records: list[dict]) -> dict:
                 1 for c in calls if c.get("state") not in (None, "ok", "success", "completed")
             ),
             "actual_models": dict(Counter(str(c.get("actual_model") or "unknown") for c in calls)),
+            # Replies the provider could not use (plans, prose, invalid JSON), and
+            # the transport calls spent on the one repair turn after a final answer.
+            "unusable_replies": sum(1 for c in calls if c.get("state") == "bad_response"),
+            "repair_calls": sum(
+                1 for c in calls if c.get("turn") == "repair" and c.get("state") != "bad_response"
+            ),
         }
 
     return {"review": _block(review_calls), "judge": _block(judge_calls)}
@@ -1176,6 +1195,11 @@ def render_markdown(summary: dict) -> str:
             f"- Git: `{inputs.get('git_sha')}`. Shuffle seed: {summary['judge'].get('seed')}.",
             f"- Command: `{inputs.get('rerun_command')}`",
         ]
+        for check in inputs.get("preflight") or []:
+            lines.append(
+                f"- Preflight {check.get('role')}: requested `{check.get('requested_model')}`, "
+                f"reported `{check.get('reported_model')}`, state {check.get('state')}."
+            )
     judge = summary["judge"]
     lines += [
         "",
@@ -1184,7 +1208,7 @@ def render_markdown(summary: dict) -> str:
         f"- Reviewer: actual models {summary['seat_usage']['review']['actual_models']}; families {judge['reviewer_families']}.",
         f"- Judge: requested `{(judge.get('config') or {}).get('model')}`; actual models {summary['seat_usage']['judge']['actual_models']}; families {judge['families']}.",
         f"- Reviewer/judge family overlap: {judge.get('family_overlap') or 'none'}. Judge is blind: {judge.get('blind')}.",
-        "- `unknown` is an unusable reply (no model reported); it is never scored.",
+        "- `unknown` is a reply the harness could not use, or a call that failed before a model was reported; it is never scored.",
         "",
         "## Uncertainty",
         "",
@@ -1256,6 +1280,7 @@ def render_markdown(summary: dict) -> str:
         "## Seat usage",
         "",
         f"- review: {usage['review']['logical_calls']} calls, {usage['review']['seat_sessions']} seat sessions, models {usage['review']['actual_models']}",
+        f"- review unusable replies: {usage['review'].get('unusable_replies', 'n/a')}; repair-turn calls: {usage['review'].get('repair_calls', 'n/a')}",
         f"- judge: {usage['judge']['logical_calls']} calls, {usage['judge']['seat_sessions']} seat sessions, models {usage['judge']['actual_models']}",
     ]
     meter = summary.get("seat_meter") or {}

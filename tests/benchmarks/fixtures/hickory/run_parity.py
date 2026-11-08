@@ -4,6 +4,8 @@
 Subcommands (the rerun interface HAI-11608 depends on; keep it stable):
 
     plan     units, call estimate, and seat budget. No network, no model.
+    preflight  one tiny completion per requested reviewer and judge model;
+             fails unless each reports exactly the requested model.
     run      review, judge, write <out>.json (artifact) and <out>.md (report).
     rescore  rebuild the report from a stored artifact. No network, no model.
     export   write a manifest for a merged-PR window from GitHub.
@@ -46,8 +48,13 @@ RERUN = (
     "uv run python tests/benchmarks/fixtures/hickory/run_parity.py run "
     "--manifest {manifest} --split {split} --runs {runs} --arms {arms} "
     "--reviewer-model {reviewer} --judge-provider {judge_provider} --judge-model {judge} "
-    "--seed {seed} --seat-budget {budget} --out {out}"
+    "--seed {seed} --seat-budget {budget}{calls} --out {out}"
 )
+PREFLIGHT_PROMPT = (
+    "Preflight check for a benchmark run. Reply with exactly this JSON object and "
+    'nothing else: {"preflight": "ok"}'
+)
+PREFLIGHT_FAILED = 6
 
 
 def _sha256(path: Path) -> str:
@@ -78,6 +85,14 @@ def _review_calls_per_unit() -> float:
         return 3.5
 
 
+def _per_review(args: argparse.Namespace) -> tuple[float, str]:
+    measured = float(getattr(args, "calls_per_review", 0) or 0)
+    if measured > 0:
+        return measured, f"{measured:.2f} seat calls per review from --calls-per-review"
+    per_review = _review_calls_per_unit()
+    return per_review, f"{per_review:.2f} seat calls per review from {PRIOR_SEAT_RUN.name}"
+
+
 def _plan(args: argparse.Namespace) -> dict:
     from benchmarks.parity_snapshot import load_units
 
@@ -92,7 +107,7 @@ def _plan(args: argparse.Namespace) -> dict:
     scored = [u for u in units if u.greptile_reviewed]
     arms = args.arms.split(",")
     reviews = len(scored) * args.runs * len(arms)
-    per_review = _review_calls_per_unit()
+    per_review, basis = _per_review(args)
     return {
         "manifest": str(args.manifest),
         "manifest_sha256": _sha256(Path(args.manifest)),
@@ -107,7 +122,7 @@ def _plan(args: argparse.Namespace) -> dict:
         "reviews": reviews,
         "judge_calls": reviews,
         "estimated_seat_sessions": round(reviews * per_review + reviews),
-        "estimate_basis": f"{per_review:.2f} seat calls per review from {PRIOR_SEAT_RUN.name}, plus 1 judge call",
+        "estimate_basis": f"{basis}, plus 1 judge call",
         "unit_ids": [u.unit_id for u in units],
     }
 
@@ -157,6 +172,80 @@ def _llm(provider: str, model: str, url: str, token: str, priority: str):
     )
 
 
+async def _preflight_one(role: str, cfg, provider: object) -> dict:
+    """One tiny pinned completion; the requested and reported model must match."""
+    from mira.exceptions import LLMError
+    from mira.llm.router_acp import call_observer
+
+    requested = cfg.model
+    seen: list[dict] = []
+    token = call_observer.set(seen.append)
+    state, detail = "ok", ""
+    try:
+        reply = await provider.complete([{"role": "user", "content": PREFLIGHT_PROMPT}])
+        if json.loads(reply) != {"preflight": "ok"}:
+            state, detail = "wrong_reply", reply[:200]
+    except LLMError as exc:
+        state, detail = exc.code, str(exc)[:300]
+    finally:
+        call_observer.reset(token)
+    transport = [e for e in seen if e.get("state") != "bad_response"]
+    reported = str((transport[-1] if transport else {}).get("actual_model") or "unknown")
+    if state == "ok" and reported != requested:
+        state = "model_mismatch"
+    return {
+        "role": role,
+        "requested_model": requested,
+        "reported_model": reported,
+        "state": state,
+        "detail": detail,
+        "calls": len(transport),
+    }
+
+
+def _preflight(reviewer_cfg, judge_cfg) -> list[dict]:
+    """Reviewer and judge each answer one tiny prompt before any review runs.
+
+    The judge goes through the same provider class the run uses. Nothing is
+    retried or substituted: a judge or reviewer that does not report exactly the
+    requested model fails the preflight.
+    """
+    from benchmarks.parity_runner import make_judge_llm
+    from mira.llm.router_acp import RouterAcpProvider
+
+    async def _all() -> list[dict]:
+        checks = [await _preflight_one("reviewer", reviewer_cfg, RouterAcpProvider(reviewer_cfg))]
+        if judge_cfg.provider in {"router-acp", "router_acp"}:
+            checks.append(await _preflight_one("judge", judge_cfg, make_judge_llm(judge_cfg)))
+        else:
+            checks.append(
+                {
+                    "role": "judge",
+                    "requested_model": judge_cfg.model,
+                    "reported_model": "not checked",
+                    "state": f"not_router_acp:{judge_cfg.provider}",
+                    "detail": "",
+                    "calls": 0,
+                }
+            )
+        return checks
+
+    return asyncio.run(_all())
+
+
+def _preflight_ok(checks: list[dict]) -> bool:
+    return all(c["state"] == "ok" or c["state"].startswith("not_router_acp") for c in checks)
+
+
+def _print_preflight(checks: list[dict]) -> None:
+    for c in checks:
+        print(
+            f"preflight {c['role']}: requested {c['requested_model']} reported "
+            f"{c['reported_model']} state {c['state']} {c['detail']}".rstrip(),
+            file=sys.stderr,
+        )
+
+
 def _write(out: Path, artifact: dict) -> None:
     from benchmarks.parity_runner import render_markdown, summarize
 
@@ -204,9 +293,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         for u in load_units(json.loads(Path(args.manifest).read_text()), args.split)
         if u.unit_id in set(plan["unit_ids"])
     ]
+    reviewer_llm = _llm("router-acp", args.reviewer_model, url, token, "review")
+    judge_llm = _llm(args.judge_provider, args.judge_model, url, token, "review")
     cfg = ParityConfig(
-        reviewer_llm=_llm("router-acp", args.reviewer_model, url, token, "review"),
-        judge_llm=_llm(args.judge_provider, args.judge_model, url, token, "review"),
+        reviewer_llm=reviewer_llm,
+        judge_llm=judge_llm,
         runs=args.runs,
         arms=tuple(args.arms.split(",")),
         seed=args.seed,
@@ -233,11 +324,21 @@ def cmd_run(args: argparse.Namespace) -> int:
             judge=args.judge_model,
             seed=args.seed,
             budget=args.seat_budget,
+            calls=f" --calls-per-review {args.calls_per_review}" if args.calls_per_review else "",
             out=args.out,
         ),
     }
     proc, log = _start_loopback(token)
     try:
+        checks = _preflight(reviewer_llm, judge_llm)
+        _print_preflight(checks)
+        inputs["preflight"] = checks
+        if not _preflight_ok(checks):
+            out = Path(args.out).with_suffix(".preflight.json")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(checks, indent=1) + "\n")
+            print(f"preflight failed; no review ran. Details: {out}", file=sys.stderr)
+            return PREFLIGHT_FAILED
         artifact = asyncio.run(run_parity(units, cfg, os.environ["GITHUB_TOKEN"], inputs=inputs))
     finally:
         if proc is not None:
@@ -254,6 +355,37 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"run stopped, not scorable: {fatal}", file=sys.stderr)
         return 5
     return 0
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    if not args.judge_model or args.judge_model in ("auto", "default"):
+        raise SystemExit("--judge-model must pin one model so verdicts are reproducible")
+    _isolate_index("")
+    if not os.environ.get("LLM_OTLP_ENDPOINT"):
+        os.environ["MIRA_ROUTER_ACP_ALLOW_UNTRACED"] = "1"
+    url = os.environ.get("MIRA_ROUTER_ACP_URL", f"http://127.0.0.1:{LOOPBACK_PORT}")
+    if ":8790" in url:
+        raise SystemExit("refusing the serving relay port; use the loopback entry")
+    token = os.environ.get("MIRA_ROUTER_ACP_TOKEN") or os.urandom(16).hex()
+    proc, log = _start_loopback(token)
+    try:
+        checks = _preflight(
+            _llm("router-acp", args.reviewer_model, url, token, "review"),
+            _llm(args.judge_provider, args.judge_model, url, token, "review"),
+        )
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if log is not None:
+            log.close()
+    print(json.dumps(checks, indent=1))
+    if args.out:
+        Path(args.out).write_text(json.dumps(checks, indent=1) + "\n")
+    return 0 if _preflight_ok(checks) else PREFLIGHT_FAILED
 
 
 def cmd_rescore(args: argparse.Namespace) -> int:
@@ -301,6 +433,12 @@ def _selection(p: argparse.ArgumentParser) -> None:
     p.add_argument("--arms", default="registry_on,registry_off")
     p.add_argument("--limit", type=int, default=0, help="first N units only (smoke)")
     p.add_argument("--only", default="", help="unit id or PR URL substrings, comma = OR")
+    p.add_argument(
+        "--calls-per-review",
+        type=float,
+        default=0.0,
+        help="measured seat calls per review for the estimate (default: the prior seat run)",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -312,6 +450,13 @@ def main(argv: list[str] | None = None) -> int:
     plan = sub.add_parser("plan")
     _selection(plan)
     plan.set_defaults(fn=cmd_plan)
+
+    pre = sub.add_parser("preflight")
+    pre.add_argument("--reviewer-model", default="auto")
+    pre.add_argument("--judge-provider", default="router-acp", choices=["router-acp", "codex-cli"])
+    pre.add_argument("--judge-model", default="")
+    pre.add_argument("--out", default="", help="also write the checks as JSON here")
+    pre.set_defaults(fn=cmd_preflight)
 
     run = sub.add_parser("run")
     _selection(run)

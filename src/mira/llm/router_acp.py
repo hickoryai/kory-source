@@ -44,6 +44,13 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   sets it around one job so each job sees only its own completions, however
   many jobs share ``call_log``. A reply the provider cannot parse is reported
   as a ``bad_response`` entry after the ``ok`` transport entry.
+* A final structured answer (``complete_with_tools``, ``review``,
+  ``walkthrough``, and an agentic ``submit_*`` call) must be the JSON object
+  alone, optionally in one json fence. Prose around it is a plan or a
+  narration, not a completed answer, and is ``bad_response``. Such a reply
+  gets ``repair_turns`` (one) more completion that quotes the rejected reply
+  and asks for the final JSON. Its call-log entries carry ``"turn": "repair"``.
+  A repair that is still unusable raises, so the caller sees the failure.
 
 Every logical call goes through the runtime-configured tracing adapter.
 An unset ``LLM_OTLP_ENDPOINT``, a missing tracer, or a failed exporter raises
@@ -94,6 +101,8 @@ call_observer: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
     "mira_router_acp_call_observer", default=None
 )
 job_llm: ContextVar[Any] = ContextVar("mira_router_acp_job_llm", default=None)
+_turn: ContextVar[str] = ContextVar("mira_router_acp_turn", default="")
+_REJECTED_QUOTE_CHARS = 1_500
 _tracing_ready = False
 
 
@@ -188,6 +197,11 @@ class RouterAcpProvider:
     supports_temperature: bool = False
     supports_max_tokens: bool = False
     call_log: ClassVar[deque[dict[str, Any]]] = deque(maxlen=_CALL_LOG_LIMIT)
+    # A final answer must be only its JSON object. Subclasses with their own
+    # frame (the benchmark judge) may keep the lenient extraction.
+    strict_final_answer: ClassVar[bool] = True
+    # Extra completions after an unusable final answer. Each is one seat call.
+    repair_turns: ClassVar[int] = 1
 
     def __init__(
         self,
@@ -255,22 +269,69 @@ class RouterAcpProvider:
             "priority": self._priority(),
             "attribution": attribution_key.get(),
         }
+        if _turn.get():
+            entry["turn"] = _turn.get()
         self.call_log.append(entry)
         observer = call_observer.get()
         if observer is not None:
             observer(dict(entry))
 
+    def _record_bad_response(self) -> None:
+        self._record(
+            state="bad_response",
+            requested=self._requested_model(),
+            actual="unknown",
+            attempts=1,
+        )
+
     def _checked_json(self, raw: str) -> str:
         try:
             return self._extract_json_object(raw)
         except LLMError:
-            self._record(
-                state="bad_response",
-                requested=self._requested_model(),
-                actual="unknown",
-                attempts=1,
-            )
+            self._record_bad_response()
             raise
+
+    def _final_answer(self, raw: str) -> str:
+        if self.strict_final_answer:
+            return _only_json_object(raw)
+        return self._extract_json_object(raw)
+
+    def _repair_prompt(self, prompt: str, rejected: str, reason: LLMError) -> str:
+        quoted = rejected.strip()[:_REJECTED_QUOTE_CHARS]
+        return (
+            prompt
+            + "\n\n## Your previous reply was rejected\n"
+            + f"Reason: {str(reason)[:300]}\n"
+            + "It was not a completed answer. Mira cannot act on a plan, a narration, "
+            + "or text around the JSON. Do not describe what you will do. Finish the task "
+            + "from the information above and reply with the final JSON object only.\n"
+            + "Rejected reply (quoted, truncated):\n"
+            + "\n".join("> " + line for line in quoted.splitlines())
+        )
+
+    async def _final_json(self, prompt: str) -> str:
+        """One final structured answer, with at most ``repair_turns`` repairs.
+
+        Every unusable reply is logged as ``bad_response``. The last one raises.
+        """
+        current = prompt
+        for turn in range(self.repair_turns + 1):
+            token = _turn.set("repair") if turn else None
+            try:
+                raw, usage = await self._generate(current)
+                self._account(current, raw, usage)
+                try:
+                    return self._final_answer(raw)
+                except LLMError as exc:
+                    self._record_bad_response()
+                    if turn >= self.repair_turns:
+                        raise
+                    logger.info("router final answer unusable, asking once more: %s", exc)
+                    current = self._repair_prompt(prompt, raw, exc)
+            finally:
+                if token is not None:
+                    _turn.reset(token)
+        raise AssertionError("unreachable")
 
     def _fail(
         self,
@@ -439,7 +500,8 @@ class RouterAcpProvider:
         parts = [
             "You are running as Mira's model backend through a router-acp seat.",
             "Follow the Mira review instructions exactly.",
-            "Return only the requested final answer.",
+            "Everything you need is in this message. Do not use any tools, files, or commands of your own.",
+            "Return only the requested final answer, not a plan or a description of what you will do.",
             "",
             "## Mira messages",
         ]
@@ -527,11 +589,7 @@ class RouterAcpProvider:
         tools: list[dict],
         temperature: float | None = None,
     ) -> str:
-        prompt = self._tool_prompt(messages, tools)
-        raw, usage = await self._generate(prompt)
-        result = self._checked_json(raw)
-        self._account(prompt, result, usage)
-        return result
+        return await self._final_json(self._tool_prompt(messages, tools))
 
     async def complete_agentic(
         self,
@@ -553,13 +611,11 @@ class RouterAcpProvider:
         self._account(prompt, raw, usage)
         try:
             name, arguments = _parse_tool_call(self._extract_json_object(raw), specs)
+            if name.startswith("submit_"):
+                # A submission is the final answer: prose around it is a plan.
+                _parse_tool_call(self._final_answer(raw), specs)
         except LLMError as exc:
-            self._record(
-                state="bad_response",
-                requested=self._requested_model(),
-                actual="unknown",
-                attempts=1,
-            )
+            self._record_bad_response()
             logger.info("router agentic reply unusable: %s", exc)
             return {"role": "assistant", "content": "", "tool_calls": []}
         call_id = f"router_call_{_prior_tool_calls(messages) + 1}"
@@ -633,6 +689,30 @@ _JSON_TYPES: dict[str, tuple[type, ...]] = {
     "array": (list,),
     "object": (dict,),
 }
+
+
+def _only_json_object(text: str) -> str:
+    """The reply when it is one JSON object, alone or in a single fence.
+
+    Any other text means the seat narrated or planned instead of answering.
+    """
+    candidate = text.strip()
+    if not candidate:
+        raise LLMError("router_acp_empty_response", detail="empty completion")
+    if candidate.startswith("```") and candidate.endswith("```") and candidate.count("```") == 2:
+        candidate = candidate[3:-3].strip()
+        if candidate.startswith("json"):
+            candidate = candidate[4:].strip()
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise LLMError(
+            "router_acp_bad_response",
+            detail="reply is not only a JSON object: " + text.strip()[:400],
+        )
+    return candidate
 
 
 def _tool_specs(tools: list[dict]) -> dict[str, dict]:

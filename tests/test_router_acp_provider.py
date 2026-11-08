@@ -498,3 +498,140 @@ async def test_review_uses_the_stock_submit_schema():
     provider.complete_with_tools = complete_with_tools
     assert await provider.review([{"role": "user", "content": "diff"}]) == "{}"
     assert seen["tools"][0]["function"]["name"] == "submit_review"
+
+
+# ------------------------------------- plan-only answers are not reviews (HAI-12817)
+
+_PLAN = (
+    "I'll review the rest of the diff and the review-tool schema before filing comments."
+    "The workspace doesn't contain these files. I'll look for the head-branch sources next."
+)
+_DONE = json.dumps({"comments": [], "summary": "No defects in this diff."})
+
+
+async def test_plan_only_final_review_is_rejected_after_one_repair():
+    transport, prompts, _ = _scripted([_PLAN, _PLAN], model="grok@x/grok-4.7")
+    provider = _provider(transport, model="grok@x/grok-4.7")
+
+    with pytest.raises(LLMError) as raised:
+        await provider.review([{"role": "user", "content": "the diff"}])
+
+    assert raised.value.code == "router_acp_bad_response"
+    assert len(prompts) == 2
+    assert "Your previous reply was rejected" in prompts[1]
+    assert "> I'll review the rest of the diff" in prompts[1]
+    states = [(e["state"], e.get("turn", "")) for e in provider.call_log]
+    assert states == [
+        ("ok", ""),
+        ("bad_response", ""),
+        ("ok", "repair"),
+        ("bad_response", "repair"),
+    ]
+    # The transport entries keep the model the relay reported.
+    assert provider.call_log[0]["actual_model"] == "grok@x/grok-4.7"
+
+
+@pytest.mark.parametrize(
+    "first",
+    [
+        _PLAN + "\n" + json.dumps({"comments": []}),
+        "Next I will check the callers.\n```json\n" + json.dumps({"comments": []}) + "\n```",
+        json.dumps({"comments": []}) + "\nI'll keep reviewing the remaining files before filing.",
+        '```json\n{"comments": []}\n```\nThen I\'ll grep for the consumer.',
+    ],
+)
+async def test_plan_wrapped_empty_review_is_not_accepted_as_completed(first):
+    # The JSON inside a plan is not the answer; only the repaired reply counts.
+    transport, prompts, _ = _scripted([first, _DONE])
+    provider = _provider(transport)
+
+    result = await provider.review([{"role": "user", "content": "the diff"}])
+
+    assert json.loads(result) == json.loads(_DONE)
+    assert len(prompts) == 2
+    assert [e["state"] for e in provider.call_log] == ["ok", "bad_response", "ok"]
+
+
+async def test_plan_wrapped_repair_still_fails_visibly():
+    wrapped = _PLAN + "\n" + json.dumps({"comments": []})
+    transport, prompts, _ = _scripted([wrapped, wrapped])
+    provider = _provider(transport)
+    with pytest.raises(LLMError):
+        await provider.review([{"role": "user", "content": "the diff"}])
+    assert len(prompts) == 2
+
+
+@pytest.mark.parametrize("reply", [_DONE, "```json\n" + _DONE + "\n```", "\n  " + _DONE + "\n"])
+async def test_a_bare_final_answer_needs_no_repair(reply):
+    transport, prompts, _ = _scripted([reply])
+    provider = _provider(transport)
+    assert json.loads(await provider.review([{"role": "user", "content": "d"}])) == json.loads(
+        _DONE
+    )
+    assert len(prompts) == 1
+    assert [e["state"] for e in provider.call_log] == ["ok"]
+    assert "turn" not in provider.call_log[0]
+
+
+async def test_review_prompt_says_the_seat_has_no_tools_of_its_own():
+    transport, prompts, _ = _scripted([_DONE])
+    provider = _provider(transport)
+    await provider.review([{"role": "user", "content": "d"}])
+    assert "Do not use any tools, files, or commands of your own." in prompts[0]
+    assert "not a plan" in prompts[0]
+
+
+async def test_agentic_submit_inside_a_plan_is_not_a_submission():
+    from mira.core.passes import agentic_review_loop
+
+    planned_submit = _PLAN + "\n" + _call("submit_review", comments=[])
+    transport, prompts, _ = _scripted([planned_submit])
+    provider = _provider(transport)
+    executor = _RecordingExecutor()
+
+    assert await agentic_review_loop(provider, list(_SYSTEM), executor) == ""
+    assert executor.calls == []
+    assert len(prompts) == 1
+    assert [e["state"] for e in provider.call_log] == ["ok", "bad_response"]
+
+
+async def test_agentic_lookup_with_narration_still_runs():
+    # Only a submission must stand alone; a lookup is not a final answer.
+    from mira.core.passes import agentic_review_loop
+
+    narrated = "Checking the consumer first.\n" + _call("read_file", path="a.py")
+    transport, _prompts, _ = _scripted([narrated, _call("submit_review", **_REVIEW)])
+    provider = _provider(transport)
+    executor = _RecordingExecutor()
+    assert json.loads(await agentic_review_loop(provider, list(_SYSTEM), executor)) == _REVIEW
+    assert executor.calls == [("read_file", {"path": "a.py"})]
+
+
+async def test_plan_only_agentic_review_then_plan_only_forced_review_fails():
+    # The failed Grok trial's shape: every hop and the forced review are plans.
+    from mira.core.passes import agentic_review_loop
+
+    transport, prompts, _ = _scripted([_PLAN])
+    provider = _provider(transport)
+    assert await agentic_review_loop(provider, list(_SYSTEM), _RecordingExecutor()) == ""
+    with pytest.raises(LLMError) as raised:
+        await provider.review(list(_SYSTEM))
+    assert raised.value.code == "router_acp_bad_response"
+    assert len(prompts) == 3
+    assert [e["state"] for e in provider.call_log].count("bad_response") == 3
+
+
+async def test_repair_turn_does_not_hide_a_pinned_model_mismatch():
+    calls = {"n": 0}
+
+    async def transport(request):
+        calls["n"] += 1
+        model = "grok@x/grok-4.7" if calls["n"] == 1 else "claude@y/fable"
+        return {"text": _PLAN, "actual_model": model}
+
+    provider = _provider(transport, model="grok@x/grok-4.7", router_acp_max_retries=0)
+    with pytest.raises(NonRetriableLLMError) as raised:
+        await provider.review([{"role": "user", "content": "d"}])
+    assert raised.value.code == "router_acp_model_mismatch"
+    assert provider.call_log[-1]["state"] == "model_mismatch"
+    assert provider.call_log[-1]["turn"] == "repair"

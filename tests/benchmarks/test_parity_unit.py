@@ -1406,3 +1406,162 @@ async def test_capture_hooks_are_the_ones_the_real_engine_calls(
     assert plain[0], "fixture should produce at least one comment"
     kinds = [r["kind"] for r in _capture_lines(tmp_path / "c.jsonl")]
     assert "noise_filter" in kinds and "critique_input" in kinds and "critique_output" in kinds
+
+
+# --- HAI-12817 completed-evaluation guards ---------------------------------------
+
+
+async def test_relay_refused_pin_mismatch_stops_the_whole_run():
+    # The Grok trial: every judge call came back 409 model_mismatch and the run kept paying.
+    from mira.llm.router_acp import RouterTransportError
+
+    sent = []
+
+    async def transport(request):
+        sent.append(request)
+        raise RouterTransportError(
+            "pinned model was not used",
+            kind="model_mismatch",
+            body={"actual_model": "claude@z/claude-fable-5-1"},
+        )
+
+    meter = parity_runner.SeatMeter(0)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    pinned = {"body": {"model": "codex/gpt-6-astra"}}
+    with pytest.raises(RouterTransportError):
+        await llm._transport(pinned)
+    assert meter.fatal == "pinned model codex/gpt-6-astra served by claude@z/claude-fable-5-1"
+    with pytest.raises(parity_runner.SeatBudgetExhausted, match="run_stopped"):
+        await llm._transport(pinned)
+    assert len(sent) == 1
+
+
+async def test_relay_errors_other_than_a_mismatch_do_not_stop_the_run():
+    from mira.llm.router_acp import RouterTransportError
+
+    async def transport(request):
+        raise RouterTransportError("timed out", kind="timeout")
+
+    meter = parity_runner.SeatMeter(0)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    with pytest.raises(RouterTransportError):
+        await llm._transport({"body": {"model": "grok@x/grok-4.7"}})
+    assert meter.fatal == "" and meter.exhausted is False
+
+
+async def test_judge_keeps_its_lenient_single_attempt(monkeypatch):
+    # Reviewer repair turns must not change how the judge is called or parsed.
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    sent: list[dict] = []
+
+    async def transport(request):
+        sent.append(request)
+        return {"text": 'Verdicts follow.\n{"issues": []}', "actual_model": "claude@x/opus"}
+
+    llm = parity_runner.make_judge_llm(
+        LLMConfig(provider="router-acp", model="claude@x/opus", router_acp_url="http://x")
+    )
+    llm._transport = transport
+    out = await llm.complete_with_tools(
+        [{"role": "user", "content": "JUDGE BODY"}], tools=[SUBMIT_ISSUES_TOOL]
+    )
+    assert out == '{"issues": []}' and len(sent) == 1
+    assert "rejected" not in json.dumps(sent[0])
+
+
+def test_seat_usage_reports_unusable_replies_and_repair_calls():
+    calls = [
+        {"state": "ok", "actual_model": "grok@x/grok-4.7", "attempts": 1},
+        {"state": "bad_response", "actual_model": "unknown", "attempts": 1},
+        {"state": "ok", "actual_model": "grok@x/grok-4.7", "attempts": 1, "turn": "repair"},
+        {"state": "bad_response", "actual_model": "unknown", "attempts": 1, "turn": "repair"},
+    ]
+    usage = parity_runner._seat_usage([{"review": {"seat_calls": calls}, "judge": {}}])
+    assert usage["review"]["unusable_replies"] == 2
+    assert usage["review"]["repair_calls"] == 1
+    assert usage["review"]["seat_sessions"] == 2
+
+
+def _run_parity_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("run_parity_cli", HICKORY / "run_parity.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _preflight_provider(cfg: LLMConfig, reply: str, actual: str, judge: bool = False):
+    from mira.llm.router_acp import RouterAcpProvider
+
+    llm = parity_runner.make_judge_llm(cfg) if judge else RouterAcpProvider(cfg)
+
+    async def transport(request):
+        return {"text": reply, "actual_model": actual}
+
+    llm._transport = transport
+    return llm
+
+
+@pytest.mark.parametrize(
+    ("reply", "actual", "state", "reported"),
+    [
+        ('{"preflight": "ok"}', "grok@x/grok-4.7", "ok", "grok@x/grok-4.7"),
+        ('{"preflight": "ok"}', "claude@y/fable", "router_acp_model_mismatch", "claude@y/fable"),
+        (
+            "I'll check the workspace first.",
+            "grok@x/grok-4.7",
+            "router_acp_bad_response",
+            "grok@x/grok-4.7",
+        ),
+        ('{"preflight": "later"}', "grok@x/grok-4.7", "wrong_reply", "grok@x/grok-4.7"),
+    ],
+)
+async def test_preflight_reports_requested_and_reported_models(
+    monkeypatch, reply, actual, state, reported
+):
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    rp = _run_parity_module()
+    cfg = LLMConfig(
+        provider="router-acp",
+        model="grok@x/grok-4.7",
+        router_acp_url="http://x",
+        router_acp_max_retries=0,
+    )
+    check = await rp._preflight_one("reviewer", cfg, _preflight_provider(cfg, reply, actual))
+    assert check["requested_model"] == "grok@x/grok-4.7"
+    assert check["reported_model"] == reported
+    assert check["state"] == state
+    assert rp._preflight_ok([check]) is (state == "ok")
+
+
+async def test_preflight_judge_goes_through_the_judge_provider(monkeypatch):
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    rp = _run_parity_module()
+    cfg = LLMConfig(provider="router-acp", model="claude@x/opus", router_acp_url="http://x")
+    llm = _preflight_provider(cfg, '{"preflight": "ok"}', "claude@x/opus", judge=True)
+    check = await rp._preflight_one("judge", cfg, llm)
+    assert check["state"] == "ok" and check["reported_model"] == "claude@x/opus"
+
+
+def test_cli_plan_uses_a_measured_calls_per_review():
+    out = _cli(
+        "plan",
+        "--split",
+        "development",
+        "--runs",
+        "1",
+        "--arms",
+        "registry_off",
+        "--calls-per-review",
+        "12",
+    )
+    assert out.returncode == 0, out.stderr
+    plan = json.loads(out.stdout)
+    assert plan["estimated_seat_sessions"] == plan["reviews"] * 13
+    assert plan["estimate_basis"].startswith("12.00 seat calls per review from --calls-per-review")
+
+
+def test_cli_preflight_refuses_unpinned_judge():
+    out = _cli("preflight", "--judge-model", "auto")
+    assert out.returncode != 0 and "pin one model" in out.stderr
