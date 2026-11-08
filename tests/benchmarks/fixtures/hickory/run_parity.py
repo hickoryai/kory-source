@@ -48,8 +48,12 @@ RERUN = (
     "uv run python tests/benchmarks/fixtures/hickory/run_parity.py run "
     "--manifest {manifest} --split {split} --runs {runs} --arms {arms} "
     "--reviewer-model {reviewer} --judge-provider {judge_provider} --judge-model {judge} "
-    "--seed {seed} --seat-budget {budget}{calls} --out {out}"
+    "--seed {seed} --seat-budget {budget}{calls}{review_timeout} --out {out}"
 )
+# The relay's own default per-completion cap. A longer reviewer timeout needs a
+# loopback relay started with a cap at least that long.
+RELAY_DEFAULT_CAP_SECONDS = 900
+RELAY_CAP_ENV = "KORY_COMPLETION_TIMEOUT_CAP_SECONDS"
 PREFLIGHT_PROMPT = (
     "Preflight check for a benchmark run. Reply with exactly this JSON object and "
     'nothing else: {"preflight": "ok"}'
@@ -151,7 +155,34 @@ def _start_loopback(token: str) -> tuple[subprocess.Popen | None, object | None]
     return proc, log
 
 
-def _llm(provider: str, model: str, url: str, token: str, priority: str):
+def _relay_cap_seconds() -> int:
+    raw = os.environ.get(RELAY_CAP_ENV, "").strip()
+    try:
+        return int(raw) if raw else RELAY_DEFAULT_CAP_SECONDS
+    except ValueError:
+        return RELAY_DEFAULT_CAP_SECONDS
+
+
+def _check_review_timeout(seconds: int) -> None:
+    """Refuse a reviewer timeout the loopback relay would silently cut short."""
+    if seconds <= 0:
+        raise SystemExit("--review-timeout-seconds must be positive")
+    cap = _relay_cap_seconds()
+    if seconds > cap:
+        raise SystemExit(
+            f"--review-timeout-seconds {seconds} exceeds the loopback relay cap {cap}s; "
+            f"start it with {RELAY_CAP_ENV}>={seconds} (a relay that reads it), or lower the timeout"
+        )
+
+
+def _llm(
+    provider: str,
+    model: str,
+    url: str,
+    token: str,
+    priority: str,
+    timeout_seconds: int = RELAY_DEFAULT_CAP_SECONDS,
+):
     from mira.config import LLMConfig
 
     if provider in ("codex-cli", "codex"):
@@ -168,6 +199,7 @@ def _llm(provider: str, model: str, url: str, token: str, priority: str):
         router_acp_token=token,
         router_acp_priority=priority,
         router_acp_max_retries=2,
+        router_acp_timeout_seconds=timeout_seconds,
         temperature=0.0,
     )
 
@@ -269,6 +301,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise SystemExit("GITHUB_TOKEN is required; export it only for this process")
     if not args.judge_model or args.judge_model in ("auto", "default"):
         raise SystemExit("--judge-model must pin one model so verdicts are reproducible")
+    _check_review_timeout(args.review_timeout_seconds)
     registry_sha = _isolate_index(args.registry_db)
     plan = _plan(args)
     if args.seat_budget and plan["estimated_seat_sessions"] > args.seat_budget:
@@ -293,7 +326,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         for u in load_units(json.loads(Path(args.manifest).read_text()), args.split)
         if u.unit_id in set(plan["unit_ids"])
     ]
-    reviewer_llm = _llm("router-acp", args.reviewer_model, url, token, "review")
+    # Only reviewer calls get the longer timeout; the judge keeps the relay default.
+    reviewer_llm = _llm(
+        "router-acp", args.reviewer_model, url, token, "review", args.review_timeout_seconds
+    )
     judge_llm = _llm(args.judge_provider, args.judge_model, url, token, "review")
     cfg = ParityConfig(
         reviewer_llm=reviewer_llm,
@@ -314,6 +350,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True
         ).stdout.strip(),
         "traced": bool(os.environ.get("LLM_OTLP_ENDPOINT")),
+        "review_timeout_seconds": args.review_timeout_seconds,
+        "judge_timeout_seconds": judge_llm.router_acp_timeout_seconds,
+        "relay_cap_seconds": _relay_cap_seconds(),
         "rerun_command": RERUN.format(
             manifest=args.manifest,
             split=args.split,
@@ -325,6 +364,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             seed=args.seed,
             budget=args.seat_budget,
             calls=f" --calls-per-review {args.calls_per_review}" if args.calls_per_review else "",
+            review_timeout=(
+                f" --review-timeout-seconds {args.review_timeout_seconds}"
+                if args.review_timeout_seconds != RELAY_DEFAULT_CAP_SECONDS
+                else ""
+            ),
             out=args.out,
         ),
     }
@@ -360,6 +404,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def cmd_preflight(args: argparse.Namespace) -> int:
     if not args.judge_model or args.judge_model in ("auto", "default"):
         raise SystemExit("--judge-model must pin one model so verdicts are reproducible")
+    _check_review_timeout(args.review_timeout_seconds)
     _isolate_index("")
     if not os.environ.get("LLM_OTLP_ENDPOINT"):
         os.environ["MIRA_ROUTER_ACP_ALLOW_UNTRACED"] = "1"
@@ -370,7 +415,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     proc, log = _start_loopback(token)
     try:
         checks = _preflight(
-            _llm("router-acp", args.reviewer_model, url, token, "review"),
+            _llm(
+                "router-acp", args.reviewer_model, url, token, "review", args.review_timeout_seconds
+            ),
             _llm(args.judge_provider, args.judge_model, url, token, "review"),
         )
     finally:
@@ -441,6 +488,16 @@ def _selection(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _review_timeout(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--review-timeout-seconds",
+        type=int,
+        default=RELAY_DEFAULT_CAP_SECONDS,
+        help=f"per-completion timeout for reviewer calls only; above "
+        f"{RELAY_DEFAULT_CAP_SECONDS} needs {RELAY_CAP_ENV} on the loopback relay",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -456,6 +513,7 @@ def main(argv: list[str] | None = None) -> int:
     pre.add_argument("--judge-provider", default="router-acp", choices=["router-acp", "codex-cli"])
     pre.add_argument("--judge-model", default="")
     pre.add_argument("--out", default="", help="also write the checks as JSON here")
+    _review_timeout(pre)
     pre.set_defaults(fn=cmd_preflight)
 
     run = sub.add_parser("run")
@@ -463,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--reviewer-model", default="auto")
     run.add_argument("--judge-provider", default="router-acp", choices=["router-acp", "codex-cli"])
     run.add_argument("--judge-model", default="")
+    _review_timeout(run)
     run.add_argument("--allow-same-family-judge", action="store_true")
     run.add_argument("--seed", type=int, default=11607)
     run.add_argument("--concurrency", type=int, default=2)

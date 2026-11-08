@@ -1566,3 +1566,44 @@ def test_cli_plan_uses_a_measured_calls_per_review():
 def test_cli_preflight_refuses_unpinned_judge():
     out = _cli("preflight", "--judge-model", "auto")
     assert out.returncode != 0 and "pin one model" in out.stderr
+
+
+def test_review_timeout_above_the_relay_cap_is_refused(monkeypatch):
+    rp = _run_parity_module()
+    monkeypatch.delenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", raising=False)
+    rp._check_review_timeout(900)
+    with pytest.raises(SystemExit, match="exceeds the loopback relay cap 900s"):
+        rp._check_review_timeout(1800)
+    monkeypatch.setenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", "1800")
+    rp._check_review_timeout(1800)
+    with pytest.raises(SystemExit):
+        rp._check_review_timeout(0)
+
+
+def test_review_timeout_reaches_reviewer_requests_only():
+    rp = _run_parity_module()
+    reviewer = rp._llm("router-acp", "grok@x/grok-4.7", "http://127.0.0.1:1", "t", "review", 1800)
+    judge = rp._llm("router-acp", "claude@x/opus", "http://127.0.0.1:1", "t", "review")
+    assert reviewer.router_acp_timeout_seconds == 1800
+    assert judge.router_acp_timeout_seconds == 900
+
+
+def test_cli_run_refuses_a_review_timeout_the_relay_would_cut():
+    env = {k: v for k, v in os.environ.items() if k != "KORY_COMPLETION_TIMEOUT_CAP_SECONDS"}
+    out = subprocess.run(
+        [
+            sys.executable,
+            str(HICKORY / "run_parity.py"),
+            "run",
+            "--judge-model",
+            "claude@x/opus",
+            "--review-timeout-seconds",
+            "1800",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        env={**env, "GITHUB_TOKEN": "x"},
+        timeout=120,
+    )
+    assert out.returncode != 0 and "exceeds the loopback relay cap" in out.stderr

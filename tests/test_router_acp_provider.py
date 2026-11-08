@@ -635,3 +635,11 @@ async def test_repair_turn_does_not_hide_a_pinned_model_mismatch():
     assert raised.value.code == "router_acp_model_mismatch"
     assert provider.call_log[-1]["state"] == "model_mismatch"
     assert provider.call_log[-1]["turn"] == "repair"
+
+
+async def test_configured_timeout_is_sent_with_each_request():
+    transport, _prompts, requests = _scripted([_DONE])
+    provider = _provider(transport, router_acp_timeout_seconds=1800)
+    await provider.review([{"role": "user", "content": "d"}])
+    assert requests[0]["body"]["timeout_seconds"] == 1800
+    assert requests[0]["timeout"] == 1800

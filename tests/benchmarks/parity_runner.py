@@ -1196,6 +1196,12 @@ def render_markdown(summary: dict) -> str:
             f"- Git: `{inputs.get('git_sha')}`. Shuffle seed: {summary['judge'].get('seed')}.",
             f"- Command: `{inputs.get('rerun_command')}`",
         ]
+        if inputs.get("review_timeout_seconds"):
+            lines.append(
+                f"- Completion timeouts: reviewer {inputs.get('review_timeout_seconds')} s, "
+                f"judge {inputs.get('judge_timeout_seconds')} s; loopback relay cap "
+                f"{inputs.get('relay_cap_seconds')} s."
+            )
         for check in inputs.get("preflight") or []:
             lines.append(
                 f"- Preflight {check.get('role')}: requested `{check.get('requested_model')}`, "
