@@ -870,6 +870,7 @@ async def test_fatal_meter_makes_the_verdict_invalid(monkeypatch):
     md = parity_runner.render_markdown(summary)
     assert "**Verdict: invalid**" in md
     assert "run stopped, not scorable: pinned model a served by b" in md
+    assert "seat budget ran out" not in md
 
 
 def test_exhausted_budget_is_inconclusive():

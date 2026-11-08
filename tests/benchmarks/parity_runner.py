@@ -1106,7 +1106,8 @@ def summarize(artifact: dict) -> dict:
                     if arm_rows
                     else 0.0
                 ),
-                budget_exhausted=bool(meter.get("exhausted")),
+                # A pin stop also sets "exhausted"; it is reported as the stop, not the cap.
+                budget_exhausted=bool(meter.get("exhausted")) and not meter.get("fatal"),
             ),
             "per_unit": per_unit,
             "pipeline": _pipeline(arm_rows),
