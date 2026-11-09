@@ -395,3 +395,26 @@ async def test_check_conversation_needs_opened_then_kept():
         await provider.check_conversation("ping")
     assert getattr(raised.value, "code", "") == "router_acp_lost_context"
     assert forgetful.closes == [forgetful.prompts[0]["conversation_id"]]
+
+
+async def test_a_transcript_gets_one_reopen_in_total():
+    relay = _Relay(
+        [
+            _batch(_call("read_file", path="a.py")),
+            _batch(_call("read_file", path="b.py")),  # lost: discarded
+            _batch(_call("read_file", path="b.py")),  # the one reopen, whole transcript
+            _call("submit_review", **_REVIEW),  # lost again: no second reopen
+        ]
+    )
+    relay.forget_before = {2, 4}
+    provider = _provider(relay)
+    executor = _Executor()
+    assert await _loop(provider, executor=executor) == ""
+    assert len(relay.prompts) == 4 and len(executor.calls) == 2
+    assert [(e["state"], e.get("conversation")) for e in provider.call_log] == [
+        ("ok", "new"),
+        ("lost_context", "kept"),
+        ("ok", "new"),
+        ("lost_context", "kept"),
+    ]
+    assert provider._conversations == []

@@ -31,7 +31,8 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   ``opened: true`` on the first turn and ``false`` after. A later turn that
   comes back ``opened: true`` (or without the field) ran without the
   transcript: it is discarded, logged as ``lost_context`` with
-  ``session: "reopened_lost"``, and reopened once under a fresh id.
+  ``session: "reopened_lost"``, and reopened under a fresh id. A transcript
+  gets one reopen in total; a second failure on its kept turns raises.
   ``probe_conversations`` checks the relay supports it without using a seat.
 * ``supports_tool_calling`` (native tool calling) and ``supports_temperature``
   are false. Ensemble sampling stays off.
@@ -160,6 +161,7 @@ class _Conversation:
     tools: tuple[str, ...]
     sent: list  # snapshot of the transcript the seat has seen
     last_reply: float
+    reopened: bool = False  # already this transcript's one reopen
 
 
 class RouterTransportError(Exception):
@@ -853,14 +855,16 @@ class RouterAcpProvider:
         self, messages: list, specs: dict[str, dict]
     ) -> tuple[str, dict[str, Any] | None, str]:
         conv = self._kept(messages, specs)
+        reopen = False
         if conv is not None:
             prompt = self._agentic_delta_prompt(messages, len(conv.sent), specs)
             try:
                 raw, usage = await self._in_conversation(conv, "kept", prompt)
             except LLMError as exc:
                 await self._close(conv)
-                if exc.code not in _REOPEN_CODES:
+                if exc.code not in _REOPEN_CODES or conv.reopened:
                     raise
+                reopen = True
                 logger.info("kept router turn failed (%s); reopening with the transcript", exc.code)
             else:
                 conv.sent, conv.last_reply = _snapshot(messages), _monotonic()
@@ -873,6 +877,7 @@ class RouterAcpProvider:
             tools=tuple(specs),
             sent=[],
             last_reply=0.0,
+            reopened=reopen,
         )
         self._conversations.append(conv)
         prompt = self._agentic_prompt(messages, specs)
