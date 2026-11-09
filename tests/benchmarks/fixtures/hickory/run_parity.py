@@ -49,7 +49,7 @@ RERUN = (
     "uv run python tests/benchmarks/fixtures/hickory/run_parity.py run "
     "--manifest {manifest} --split {split} --runs {runs} --arms {arms} "
     "--reviewer-model {reviewer} --judge-provider {judge_provider} --judge-model {judge} "
-    "--seed {seed} --seat-budget {budget}{calls}{review_timeout} --out {out}"
+    "--seed {seed} --seat-budget {budget}{calls}{review_timeout}{conversations} --out {out}"
 )
 # The relay's own default per-completion cap. A longer reviewer timeout needs a
 # loopback relay started with a cap at least that long.
@@ -188,6 +188,7 @@ def _llm(
     token: str,
     priority: str,
     timeout_seconds: int = RELAY_DEFAULT_CAP_SECONDS,
+    conversations: bool = False,
 ):
     from mira.config import LLMConfig
 
@@ -206,6 +207,7 @@ def _llm(
         router_acp_priority=priority,
         router_acp_max_retries=2,
         router_acp_timeout_seconds=timeout_seconds,
+        router_acp_conversations=conversations,
         temperature=0.0,
     )
 
@@ -253,6 +255,8 @@ def _preflight(reviewer_cfg, judge_cfg) -> list[dict]:
 
     async def _all() -> list[dict]:
         checks = [await _preflight_one("reviewer", reviewer_cfg, RouterAcpProvider(reviewer_cfg))]
+        if reviewer_cfg.router_acp_conversations:
+            checks.append(await _conversations_check(RouterAcpProvider(reviewer_cfg)))
         if judge_cfg.provider in {"router-acp", "router_acp"}:
             checks.append(await _preflight_one("judge", judge_cfg, make_judge_llm(judge_cfg)))
         else:
@@ -269,6 +273,23 @@ def _preflight(reviewer_cfg, judge_cfg) -> list[dict]:
         return checks
 
     return asyncio.run(_all())
+
+
+async def _conversations_check(provider) -> dict:
+    """The relay must keep sessions before any reviewer sends only a delta."""
+    try:
+        kept = await provider.probe_conversations()
+        detail = "" if kept else "close probe did not answer state closed"
+    except Exception as exc:
+        kept, detail = False, str(exc)[:300]
+    return {
+        "role": "conversations",
+        "requested_model": "kept relay sessions",
+        "reported_model": "supported" if kept else "unsupported",
+        "state": "ok" if kept else "conversations_unsupported",
+        "detail": detail,
+        "calls": 0,
+    }
 
 
 def _preflight_ok(checks: list[dict]) -> bool:
@@ -334,8 +355,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     ]
     # Only reviewer calls get the longer timeout; the judge keeps the relay default.
     reviewer_llm = _llm(
-        "router-acp", args.reviewer_model, url, token, "review", args.review_timeout_seconds
+        "router-acp",
+        args.reviewer_model,
+        url,
+        token,
+        "review",
+        args.review_timeout_seconds,
+        conversations=args.conversations,
     )
+    # The judge stays one-shot: each verdict is independent.
     judge_llm = _llm(args.judge_provider, args.judge_model, url, token, "review")
     cfg = ParityConfig(
         reviewer_llm=reviewer_llm,
@@ -357,6 +385,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         ).stdout.strip(),
         "traced": bool(os.environ.get("LLM_OTLP_ENDPOINT")),
         "review_timeout_seconds": args.review_timeout_seconds,
+        "reviewer_conversations": args.conversations,
         "judge_timeout_seconds": judge_llm.router_acp_timeout_seconds,
         "relay_cap_seconds": _relay_cap_seconds(),
         "rerun_command": RERUN.format(
@@ -375,6 +404,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 if args.review_timeout_seconds != RELAY_DEFAULT_CAP_SECONDS
                 else ""
             ),
+            conversations=" --conversations" if args.conversations else "",
             out=args.out,
         ),
     }
@@ -528,6 +558,12 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--judge-provider", default="router-acp", choices=["router-acp", "codex-cli"])
     run.add_argument("--judge-model", default="")
     _review_timeout(run)
+    run.add_argument(
+        "--conversations",
+        action="store_true",
+        help="reviewer agentic steps reuse one kept relay session per transcript "
+        "(needs a relay with conversation_id; preflight checks it)",
+    )
     run.add_argument("--allow-same-family-judge", action="store_true")
     run.add_argument("--seed", type=int, default=11607)
     run.add_argument("--concurrency", type=int, default=2)

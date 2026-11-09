@@ -8,6 +8,7 @@ the heavyweight review model isn't paying for verification work.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json as _json
 import logging
 from collections.abc import Callable
@@ -91,6 +92,21 @@ async def agentic_review_loop(
             "Once you're ready, call `submit_review` with all your findings."
         )
 
+    try:
+        return await _agentic_steps(llm, convo, executor, tools)
+    finally:
+        # A provider that keeps one session per transcript closes it here.
+        end = getattr(type(llm), "end_agentic", None)
+        if inspect.iscoroutinefunction(end):
+            try:
+                await llm.end_agentic(convo)  # type: ignore[attr-defined]
+            except Exception as exc:
+                logger.warning("Agentic session close failed: %s", exc)
+
+
+async def _agentic_steps(
+    llm: LLMProviderProtocol, convo: list[dict], executor: object, tools: list[dict]
+) -> str:
     lookups = 0
     for step in range(AGENTIC_MAX_STEPS):
         try:

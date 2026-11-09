@@ -93,6 +93,14 @@ class LLMConfig(BaseModel):
     router_acp_timeout_seconds: int = Field(default=900, gt=0)
     router_acp_max_retries: int = Field(default=2, ge=0)
     router_acp_priority: Literal["review", "interactive"] = "review"
+    # Keep one relay session per agentic transcript (relay `conversation_id`):
+    # later steps send only their new messages. Off by default; a relay
+    # without kept sessions would answer a delta with no context.
+    router_acp_conversations: bool = False
+    # Reuse a kept session only if its last reply is this recent. Keep it below
+    # the relay's KORY_COMPLETION_CONVERSATION_IDLE_SECONDS (default 600): the
+    # relay silently opens a fresh session for an id it closed on idle.
+    router_acp_conversation_idle_seconds: int = Field(default=540, gt=0)
 
     @field_validator("base_url")
     @classmethod
@@ -416,6 +424,8 @@ _DEPLOYMENT_ONLY_LLM_KEYS = frozenset(
         "router_acp_timeout_seconds",
         "router_acp_max_retries",
         "router_acp_priority",
+        "router_acp_conversations",
+        "router_acp_conversation_idle_seconds",
     }
 )
 

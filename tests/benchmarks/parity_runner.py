@@ -18,6 +18,7 @@ import dataclasses
 import enum
 import hashlib
 import json
+import logging
 import math
 import os
 import statistics
@@ -49,6 +50,8 @@ from .parity_stats import (
     registry_ab,
     totals,
 )
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 # Reviewer inputs changed in HAI-12817: reads pinned to the snapshot, fixture
@@ -629,10 +632,12 @@ async def review_unit(
         "skipped_paths": [],
         "skipped_reason": "",
     }
+    llm: Any = None
     try:
+        llm = llm_factory(reviewer_cfg)
         engine = ReviewEngine(
             config=config,
-            llm=llm_factory(reviewer_cfg),
+            llm=llm,
             provider=provider_factory(github_token, unit),
             dry_run=True,
         )
@@ -656,6 +661,13 @@ async def review_unit(
     except Exception as exc:
         error = str(exc)[:500]
     finally:
+        # Kept relay sessions end with the review, whether it finished or failed.
+        close = getattr(llm, "close_conversations", None)
+        if close is not None:
+            try:
+                await close(attribution)
+            except Exception as exc:
+                logger.warning("closing kept sessions for %s failed: %s", attribution, exc)
         _block_sink.reset(sink_token)
         _as_of.reset(as_of_token)
         _reset_attribution(token)
@@ -960,6 +972,14 @@ def _seat_usage(records: list[dict]) -> dict:
             "unusable_replies": sum(1 for c in calls if c.get("state") == "bad_response"),
             "repair_calls": sum(
                 1 for c in calls if c.get("turn") == "repair" and c.get("state") != "bad_response"
+            ),
+            # Agentic steps on a kept relay session: "new" opened it, "kept" reused it.
+            "conversation_turns": dict(
+                Counter(
+                    str(c["conversation"])
+                    for c in calls
+                    if c.get("conversation") and c.get("state") != "bad_response"
+                )
             ),
         }
 
@@ -1332,6 +1352,9 @@ def render_markdown(summary: dict) -> str:
         f"- review unusable replies: {usage['review'].get('unusable_replies', 'n/a')}; repair-turn calls: {usage['review'].get('repair_calls', 'n/a')}",
         f"- judge: {usage['judge']['logical_calls']} calls, {usage['judge']['seat_sessions']} seat sessions, models {usage['judge']['actual_models']}",
     ]
+    turns = usage["review"].get("conversation_turns")
+    if turns:
+        lines.append(f"- reviewer agentic steps on kept relay sessions: {turns}")
     for label, key in (
         ("review call wall time (s)", "review_call_wall_s"),
         ("review duration (s, reviews without error)", "review_duration_s"),

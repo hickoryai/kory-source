@@ -1667,3 +1667,71 @@ def test_latency_is_absent_not_zero_without_wall_times():
         [{"review": {"seat_calls": [{"state": "ok", "attempts": 1}], "error": "x"}, "judge": {}}]
     )["latency"]
     assert latency["review_call_wall_s"] == {"n": 0, "mean": None, "median": None, "p90": None}
+
+
+async def test_review_unit_closes_kept_sessions_even_when_the_review_fails():
+    (unit,) = units_for_fixture(_fixture())
+    closed: list[str] = []
+
+    class _Seat:
+        async def close_conversations(self, attribution=None):
+            closed.append(attribution)
+
+    def broken_provider(_token, _unit):
+        raise RuntimeError("github down")
+
+    review = await parity_runner.review_unit(
+        unit,
+        "registry_off",
+        1,
+        LLMConfig(provider="router-acp", model="grok@x/grok-4.7"),
+        "token",
+        provider_factory=broken_provider,
+        llm_factory=lambda _cfg: _Seat(),
+    )
+    assert "github down" in review["error"]
+    assert closed == [f"review|registry_off|r1|{unit.unit_id}"]
+
+
+async def test_preflight_refuses_a_relay_without_kept_sessions():
+    rp = _run_parity_module()
+
+    class _Probe:
+        def __init__(self, result):
+            self.result = result
+
+        async def probe_conversations(self):
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    ok = await rp._conversations_check(_Probe(True))
+    assert ok["state"] == "ok" and rp._preflight_ok([ok])
+    for result in (False, RuntimeError("400 prompt is required")):
+        check = await rp._conversations_check(_Probe(result))
+        assert check["state"] == "conversations_unsupported" and not rp._preflight_ok([check])
+
+
+def test_reviewer_conversations_are_opt_in_and_the_judge_stays_one_shot():
+    rp = _run_parity_module()
+    assert (
+        rp._llm(
+            "router-acp", "grok@x/g", "http://127.0.0.1:1", "t", "review"
+        ).router_acp_conversations
+        is False
+    )
+    reviewer = rp._llm(
+        "router-acp", "grok@x/g", "http://127.0.0.1:1", "t", "review", conversations=True
+    )
+    assert reviewer.router_acp_conversations is True
+
+
+def test_seat_usage_counts_agentic_steps_on_kept_sessions():
+    calls = [
+        {"state": "ok", "attempts": 1, "conversation": "new"},
+        {"state": "ok", "attempts": 1, "conversation": "kept"},
+        {"state": "bad_response", "attempts": 1, "conversation": "kept"},
+        {"state": "ok", "attempts": 1},
+    ]
+    usage = parity_runner._seat_usage([{"review": {"seat_calls": calls}, "judge": {}}])
+    assert usage["review"]["conversation_turns"] == {"new": 1, "kept": 1}
