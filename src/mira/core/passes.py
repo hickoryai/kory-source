@@ -49,6 +49,12 @@ def cap_review_summary(text: str) -> str:
     return prefix + _SUMMARY_TRUNCATION_MARKER
 
 
+# One agentic review chunk: at most this many model steps and this many
+# read_file/grep_repo lookups, however the lookups are batched across steps.
+AGENTIC_MAX_STEPS = 6
+AGENTIC_MAX_LOOKUPS = 6
+
+
 async def agentic_review_loop(
     llm: LLMProviderProtocol,
     messages: list[dict],
@@ -57,10 +63,13 @@ async def agentic_review_loop(
     """Run an agentic tool-use loop until the LLM submits a review.
 
     Hands the model `read_file` and `grep_repo` alongside the terminal
-    `submit_review` tool. Caps at 6 hops to bound token spend; returns the
-    JSON args of the final `submit_review` call (same shape `llm.review`
-    returns), or "" if the loop exited without one — caller falls back to
-    a forced single-tool call.
+    `submit_review` tool. One step may request several lookups; all of them
+    run and every result returns in the next step. The loop stops after
+    ``AGENTIC_MAX_STEPS`` steps, and runs at most ``AGENTIC_MAX_LOOKUPS``
+    lookups in total: a lookup past the cap is answered "not run" so every
+    call still gets a result. Returns the JSON args of the final
+    `submit_review` call (same shape `llm.review` returns), or "" if the
+    loop exited without one — caller falls back to a forced single-tool call.
     """
     from mira.llm.agentic_tools import AGENTIC_TOOLS
 
@@ -76,16 +85,18 @@ async def agentic_review_loop(
             "filing a comment (e.g. *does the called function actually "
             "raise X?*, *is this symbol defined elsewhere?*). Don't browse — "
             "fetch what you specifically need. Skip the tools entirely if "
-            "the diff alone is enough. Once you're ready, call "
-            "`submit_review` with all your findings."
+            "the diff alone is enough. Request every lookup you need in the "
+            "same step: they all run, and all results come back together. "
+            f"You get at most {AGENTIC_MAX_LOOKUPS} lookups for this review. "
+            "Once you're ready, call `submit_review` with all your findings."
         )
 
-    max_hops = 6
-    for hop in range(max_hops):
+    lookups = 0
+    for step in range(AGENTIC_MAX_STEPS):
         try:
             msg = await llm.complete_agentic(convo, tools=tools)
         except Exception as exc:
-            logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
+            logger.warning("Agentic step %d failed: %s", step + 1, exc)
             return ""
 
         tool_calls = msg.get("tool_calls") or []
@@ -93,11 +104,16 @@ async def agentic_review_loop(
 
         if not tool_calls:
             logger.debug(
-                "Agentic loop exited at hop %d without submit_review (content=%d chars)",
-                hop + 1,
+                "Agentic loop exited at step %d without submit_review (content=%d chars)",
+                step + 1,
                 len(content),
             )
             return ""
+
+        for call in tool_calls:
+            fn = call.get("function") or {}
+            if fn.get("name") == "submit_review":
+                return fn.get("arguments") or ""
 
         convo.append(
             {
@@ -110,16 +126,19 @@ async def agentic_review_loop(
         for call in tool_calls:
             fn = call.get("function") or {}
             name = fn.get("name") or ""
-            if name == "submit_review":
-                return fn.get("arguments") or ""
-
-            raw_args = fn.get("arguments") or "{}"
-            try:
-                args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-            except Exception:
-                args = {}
-
-            tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
+            if lookups >= AGENTIC_MAX_LOOKUPS:
+                tool_result = (
+                    f"[not run: this review's {AGENTIC_MAX_LOOKUPS}-lookup cap is used up; "
+                    "submit your review now]"
+                )
+            else:
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args = {}
+                lookups += 1
+                tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
             convo.append(
                 {
                     "role": "tool",
@@ -128,7 +147,7 @@ async def agentic_review_loop(
                 }
             )
 
-    logger.debug("Agentic loop hit %d-hop cap without submit_review", max_hops)
+    logger.debug("Agentic loop hit %d-step cap without submit_review", AGENTIC_MAX_STEPS)
     return ""
 
 

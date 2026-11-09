@@ -5,13 +5,17 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
 * ``RouterAcpProvider`` implements ``LLMProviderProtocol``.
 * ``complete``, ``complete_with_tools``, ``review``, and ``walkthrough``
   return a string.
-* ``complete_agentic`` is a JSON tool-call adapter. Each hop is
+* ``complete_agentic`` is a JSON tool-call adapter. Each step is
   one ordinary completion: the prompt carries the tool schemas and the whole
-  call/result history, and the seat answers with exactly one
-  ``{"tool": name, "arguments": {...}}`` object. The provider checks the name
-  and arguments against the supplied schemas and returns an OpenAI-shaped
-  assistant message with one tool call. A reply it cannot use returns no tool
-  calls, so the engine falls back to one forced review. The seat never runs
+  call/result history. The seat answers with a batch of lookups,
+  ``{"calls": [{"tool": name, "arguments": {...}}, ...]}``, or with its
+  submission, ``{"tool": "submit_...", "arguments": {...}}``, alone. The
+  provider checks each name and its arguments against the supplied schemas and
+  returns an OpenAI-shaped assistant message with one tool call per valid
+  lookup (or the submission). Invalid batch entries are not run; the message
+  content names them, so the seat sees why in the next step. A reply with
+  nothing usable returns no tool calls, so the engine falls back to one forced
+  review. The seat never runs
   the tools: Mira's own executor answers ``read_file`` and ``grep_repo``.
 * ``supports_tool_calling`` (native tool calling) and ``supports_temperature``
   are false. Ensemble sampling stays off.
@@ -605,11 +609,14 @@ class RouterAcpProvider:
         tools: list[dict],
         temperature: float | None = None,
     ) -> dict:
-        """One agentic hop: ask the seat for one tool call, as JSON.
+        """One agentic step: ask the seat for its lookups or its submission, as JSON.
 
-        Returns ``{"role": "assistant", "content": "", "tool_calls": [call]}``,
-        or no tool calls when the reply is not one valid call. The caller's loop
-        owns hop caps, tool execution, and the forced-review fallback.
+        Returns ``{"role": "assistant", "content": note, "tool_calls": calls}``.
+        ``calls`` holds every valid lookup of a batch, or the one submission.
+        ``note`` names batch entries that were not run, so the seat sees why in
+        the next step. A reply with nothing usable returns no tool calls. The
+        caller's loop owns step and lookup caps, tool execution, and the
+        forced-review fallback.
         """
         specs = _tool_specs(tools)
         if not specs:
@@ -618,26 +625,73 @@ class RouterAcpProvider:
         raw, usage = await self._generate(prompt)
         self._account(prompt, raw, usage)
         try:
-            name, arguments = _parse_tool_call(self._extract_json_object(raw), specs)
-            if name.startswith("submit_"):
-                # A submission is the final answer: it must close the reply.
-                name, arguments = _parse_tool_call(self._final_answer(raw), specs)
+            calls, skipped = self._agentic_step(raw, specs)
         except LLMError as exc:
             self._record_bad_response()
             logger.info("router agentic reply unusable: %s", exc)
             return {"role": "assistant", "content": "", "tool_calls": []}
-        call_id = f"router_call_{_prior_tool_calls(messages) + 1}"
+        if skipped:
+            logger.info("router agentic batch: %d lookup(s) not run", len(skipped))
+        first = _prior_tool_calls(messages) + 1
         return {
             "role": "assistant",
-            "content": "",
+            "content": _skipped_note(skipped),
             "tool_calls": [
                 {
-                    "id": call_id,
+                    "id": f"router_call_{first + offset}",
                     "type": "function",
                     "function": {"name": name, "arguments": json.dumps(arguments)},
                 }
+                for offset, (name, arguments) in enumerate(calls)
             ],
         }
+
+    def _agentic_step(
+        self, raw: str, specs: dict[str, dict]
+    ) -> tuple[list[tuple[str, dict]], list[str]]:
+        """The calls in one agentic reply, and why any batch entry was not run.
+
+        A submission is ``{"tool": "submit_...", ...}`` and must close the
+        reply. Lookups are ``{"calls": [...]}`` (or one bare ``{"tool": ...}``
+        lookup); narration around them is allowed. A batch runs its valid
+        lookups; one with no valid lookup is ``bad_response``.
+        """
+        try:
+            text = _closing_json_object(raw)
+        except LLMError:
+            text = self._extract_json_object(raw)
+        obj = json.loads(text)
+        if "calls" not in obj:
+            name, arguments = _parse_tool_call(text, specs)
+            if name.startswith("submit_"):
+                # A submission is the final answer: it must close the reply.
+                name, arguments = _parse_tool_call(self._final_answer(raw), specs)
+            return [(name, arguments)], []
+        entries = obj["calls"]
+        if not isinstance(entries, list) or not entries:
+            raise LLMError("router_acp_bad_response", detail="calls is not a non-empty list")
+        calls: list[tuple[str, dict]] = []
+        skipped: list[str] = []
+        for index, entry in enumerate(entries, 1):
+            try:
+                if not isinstance(entry, dict):
+                    raise LLMError("router_acp_bad_response", detail="not an object")
+                name, arguments = _parse_tool_call(json.dumps(entry), specs)
+                if name.startswith("submit_"):
+                    raise LLMError(
+                        "router_acp_bad_response",
+                        detail=f"{name} must be sent alone, as the final answer",
+                    )
+            except LLMError as exc:
+                reason = str(exc).removeprefix(exc.safe_message + ": ")
+                skipped.append(f"entry {index}: {reason}"[:300])
+                continue
+            calls.append((name, arguments))
+        if not calls:
+            raise LLMError(
+                "router_acp_bad_response", detail="no valid lookup: " + "; ".join(skipped)[:400]
+            )
+        return calls, skipped
 
     def _agentic_prompt(self, messages: list, specs: dict[str, dict]) -> str:
         parts = [
@@ -666,11 +720,24 @@ class RouterAcpProvider:
         for name, spec in specs.items():
             parts.append(f"\n### `{name}`\n{spec.get('description') or ''}".rstrip())
             parts.append("Arguments schema:\n" + json.dumps(spec["parameters"], sort_keys=True))
+        lookups = [f"`{n}`" for n in specs if not n.startswith("submit_")]
+        submits = [f"`{n}`" for n in specs if n.startswith("submit_")]
+        parts += ["", "## Required output", "Return ONLY one JSON object, in one of these forms:"]
+        if lookups:
+            parts += [
+                f"- Lookups ({', '.join(lookups)}): "
+                + '{"calls": [{"tool": "<tool name>", "arguments": {...}}, ...]}. '
+                + "Put every lookup you need now in this one list. Mira runs them all "
+                + "and returns every result in the next request. Do not ask for one "
+                + "lookup at a time.",
+            ]
+        if submits:
+            parts += [
+                f"- Final answer ({', '.join(submits)}): "
+                + '{"tool": "<tool name>", "arguments": {...}}, alone, once the work is '
+                + "complete. Never put it in a calls list.",
+            ]
         parts += [
-            "",
-            "## Required output",
-            "Choose exactly one tool call as your next action.",
-            'Return ONLY one JSON object: {"tool": "<tool name>", "arguments": {...}}.',
             "The arguments must conform to that tool's schema.",
             "Do not wrap the JSON in markdown fences. Do not include explanatory text.",
         ]
@@ -754,6 +821,14 @@ def _tool_specs(tools: list[dict]) -> dict[str, dict]:
                 "parameters": fn.get("parameters") or {"type": "object"},
             }
     return specs
+
+
+def _skipped_note(skipped: list[str]) -> str:
+    if not skipped:
+        return ""
+    return "Mira did not run these lookups from your last calls list:\n" + "\n".join(
+        "- " + reason for reason in skipped
+    )
 
 
 def _prior_tool_calls(messages: list) -> int:

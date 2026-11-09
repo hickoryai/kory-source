@@ -346,7 +346,7 @@ async def test_unusable_agentic_reply_falls_back_to_one_forced_review(reply):
     assert [e["state"] for e in provider.call_log] == ["ok", "bad_response"]
 
 
-async def test_agentic_loop_stops_at_the_hop_cap():
+async def test_agentic_loop_stops_at_the_step_cap():
     from mira.core.passes import agentic_review_loop
 
     transport, prompts, _ = _scripted([_call("read_file", path="a.py")])
@@ -688,3 +688,223 @@ async def test_agentic_narrated_submission_is_accepted():
         == _REVIEW
     )
     assert len(prompts) == 1 and [e["state"] for e in provider.call_log] == ["ok"]
+
+
+# ---------------------------------------------- batched lookups per step (HAI-12817)
+
+
+def _batch(*entries: dict | str) -> str:
+    return json.dumps({"calls": [json.loads(e) if isinstance(e, str) else e for e in entries]})
+
+
+async def test_one_step_runs_every_lookup_in_its_batch():
+    from mira.core.passes import agentic_review_loop
+
+    transport, prompts, _ = _scripted(
+        [
+            "I need the producer and its callers.\n"
+            + _batch(_call("grep_repo", pattern="amount_cents"), _call("read_file", path="a.py")),
+            _call("submit_review", **_REVIEW),
+        ]
+    )
+    provider = _provider(transport)
+    executor = _RecordingExecutor()
+    assert json.loads(await agentic_review_loop(provider, list(_SYSTEM), executor)) == _REVIEW
+    assert executor.calls == [
+        ("grep_repo", {"pattern": "amount_cents"}),
+        ("read_file", {"path": "a.py"}),
+    ]
+    # Two completions, not three: both results return together in the next step.
+    assert len(prompts) == 2
+    for text in (
+        "Tool call `router_call_1`",
+        "Tool call `router_call_2`",
+        "RESULT-1 for grep_repo",
+        "RESULT-2 for read_file",
+    ):
+        assert text in prompts[1]
+    assert [e["state"] for e in provider.call_log] == ["ok", "ok"]
+
+
+async def test_the_prompt_asks_for_every_lookup_in_one_calls_list():
+    transport, prompts, _ = _scripted([_call("submit_review", **_REVIEW)])
+    provider = _provider(transport)
+    from mira.core.passes import agentic_review_loop
+
+    await agentic_review_loop(provider, list(_SYSTEM), _RecordingExecutor())
+    assert '{"calls": [{"tool": "<tool name>"' in prompts[0]
+    assert "Do not ask for one lookup at a time." in prompts[0]
+    assert "Never put it in a calls list." in prompts[0]
+    assert "at most 6 lookups" in prompts[0]
+
+
+async def test_the_lookup_cap_truncates_a_batch():
+    from mira.core.passes import AGENTIC_MAX_LOOKUPS, agentic_review_loop
+
+    paths = [f"f{i}.py" for i in range(AGENTIC_MAX_LOOKUPS + 2)]
+    transport, prompts, _ = _scripted(
+        [_batch(*[_call("read_file", path=p) for p in paths]), _call("submit_review", **_REVIEW)]
+    )
+    provider = _provider(transport)
+    executor = _RecordingExecutor()
+    assert json.loads(await agentic_review_loop(provider, list(_SYSTEM), executor)) == _REVIEW
+    assert [args["path"] for _, args in executor.calls] == paths[:AGENTIC_MAX_LOOKUPS]
+    # Every call still gets a result; the ones past the cap say they did not run.
+    over = [f"tool result for `router_call_{n}`" for n in (7, 8)]
+    for marker in over:
+        section = prompts[1].split(marker, 1)[1].split("### Message", 1)[0]
+        assert "not run" in section and "lookup cap" in section
+
+
+async def test_the_lookup_cap_spans_steps():
+    from mira.core.passes import agentic_review_loop
+
+    four = _batch(*[_call("grep_repo", pattern=f"p{i}") for i in range(4)])
+    transport, prompts, _ = _scripted([four, four, _call("submit_review", **_REVIEW)])
+    provider = _provider(transport)
+    executor = _RecordingExecutor()
+    assert json.loads(await agentic_review_loop(provider, list(_SYSTEM), executor)) == _REVIEW
+    assert len(executor.calls) == 6 and len(prompts) == 3
+    assert prompts[2].count("lookup cap is used up") == 2
+
+
+async def test_mixed_valid_and_invalid_lookups_run_only_the_valid_ones():
+    from mira.core.passes import agentic_review_loop
+
+    mixed = _batch(
+        _call("read_file", path="a.py"),
+        _call("run_shell", cmd="cat /etc/passwd"),
+        _call("read_file"),
+        _call("grep_repo", pattern="x", path_only="yes"),
+        _call("submit_review", **_REVIEW),
+        "[1]",
+        _call("grep_repo", pattern="amount"),
+    )
+    transport, prompts, _ = _scripted([mixed, _call("submit_review", **_REVIEW)])
+    provider = _provider(transport)
+    executor = _RecordingExecutor()
+    assert json.loads(await agentic_review_loop(provider, list(_SYSTEM), executor)) == _REVIEW
+    assert executor.calls == [("read_file", {"path": "a.py"}), ("grep_repo", {"pattern": "amount"})]
+    # A usable batch is not a bad response; the next step names what was skipped.
+    assert [e["state"] for e in provider.call_log] == ["ok", "ok"]
+    note = prompts[1]
+    assert "Mira did not run these lookups" in note
+    for reason in (
+        "entry 2: unknown tool 'run_shell'",
+        "entry 3: read_file: missing path",
+        "entry 4: grep_repo: path_only is not",
+        "entry 5: submit_review must be sent alone",
+        "entry 6: not an object",
+    ):
+        assert reason in note
+    assert "Tool call `router_call_1`" in note and "Tool call `router_call_2`" in note
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        json.dumps({"calls": []}),
+        json.dumps({"calls": {"tool": "read_file", "arguments": {"path": "a.py"}}}),
+        _batch(_call("run_shell", cmd="ls"), _call("read_file")),
+        # A submission inside a batch is not a completed review.
+        _batch(_call("submit_review", **_REVIEW)),
+        "Plan: grep for amount_cents, then read billing/consumer.py, then submit the review.",
+    ],
+)
+async def test_a_batch_with_no_valid_lookup_is_not_a_step_or_a_review(reply):
+    from mira.core.passes import agentic_review_loop
+
+    transport, prompts, _ = _scripted([reply])
+    provider = _provider(transport)
+    executor = _RecordingExecutor()
+    assert await agentic_review_loop(provider, list(_SYSTEM), executor) == ""
+    assert executor.calls == [] and len(prompts) == 1
+    assert [e["state"] for e in provider.call_log] == ["ok", "bad_response"]
+
+
+async def test_a_plan_after_a_batch_is_not_a_review_and_the_forced_review_repairs_once():
+    from mira.core.passes import agentic_review_loop
+
+    transport, prompts, _ = _scripted(
+        [
+            _batch(_call("read_file", path="a.py"), _call("grep_repo", pattern="x")),
+            _PLAN,
+            _PLAN,
+            _DONE,
+        ]
+    )
+    provider = _provider(transport)
+    executor = _RecordingExecutor()
+    assert await agentic_review_loop(provider, list(_SYSTEM), executor) == ""
+    assert len(executor.calls) == 2
+    # The engine's forced review: the plan is rejected, the one repair finishes.
+    assert json.loads(await provider.review(list(_SYSTEM))) == json.loads(_DONE)
+    assert len(prompts) == 4
+    states = [(e["state"], e.get("turn", "")) for e in provider.call_log]
+    assert states == [
+        ("ok", ""),
+        ("ok", ""),
+        ("bad_response", ""),
+        ("ok", ""),
+        ("bad_response", ""),
+        ("ok", "repair"),
+    ]
+
+
+async def test_a_submission_after_a_batch_must_still_close_the_reply():
+    from mira.core.passes import agentic_review_loop
+
+    transport, _prompts, _ = _scripted(
+        [
+            _batch(_call("read_file", path="a.py")),
+            _call("submit_review", **_REVIEW) + "\nNext I'll check the tests.",
+        ]
+    )
+    provider = _provider(transport)
+    assert await agentic_review_loop(provider, list(_SYSTEM), _RecordingExecutor()) == ""
+    assert [e["state"] for e in provider.call_log] == ["ok", "ok", "bad_response"]
+
+
+class _NativeSeat:
+    """A provider with native parallel tool calls: one scripted message per step."""
+
+    def __init__(self, steps: list[list[tuple[str, dict]]]) -> None:
+        self.steps = steps
+        self.seen: list[list] = []
+
+    async def complete_agentic(self, messages, tools, temperature=None):
+        self.seen.append([dict(m) for m in messages])
+        calls = self.steps[min(len(self.seen), len(self.steps)) - 1]
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"n{len(self.seen)}_{i}",
+                    "function": {"name": n, "arguments": json.dumps(a)},
+                }
+                for i, (n, a) in enumerate(calls)
+            ],
+        }
+
+
+async def test_native_batch_answers_every_call_id_and_honors_the_cap():
+    from mira.core.passes import AGENTIC_MAX_LOOKUPS, agentic_review_loop
+
+    batch = [("grep_repo", {"pattern": f"p{i}"}) for i in range(AGENTIC_MAX_LOOKUPS + 1)]
+    seat = _NativeSeat([batch, [("submit_review", _REVIEW)]])
+    executor = _RecordingExecutor()
+    assert json.loads(await agentic_review_loop(seat, list(_SYSTEM), executor)) == _REVIEW
+    assert len(executor.calls) == AGENTIC_MAX_LOOKUPS
+    results = [m for m in seat.seen[1] if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in results] == [f"n1_{i}" for i in range(len(batch))]
+    assert "lookup cap is used up" in results[-1]["content"]
+
+
+async def test_a_submission_in_a_native_batch_wins_without_running_lookups():
+    from mira.core.passes import agentic_review_loop
+
+    seat = _NativeSeat([[("read_file", {"path": "a.py"}), ("submit_review", _REVIEW)]])
+    executor = _RecordingExecutor()
+    assert json.loads(await agentic_review_loop(seat, list(_SYSTEM), executor)) == _REVIEW
+    assert executor.calls == []
