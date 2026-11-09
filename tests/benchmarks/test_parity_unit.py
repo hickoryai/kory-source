@@ -1634,3 +1634,36 @@ def test_relay_cap_is_parsed_like_the_relay(monkeypatch, raw, cap):
     else:
         monkeypatch.setenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", raw)
     assert rp._relay_cap_seconds() == cap
+
+
+def test_seat_usage_reports_call_and_review_latency():
+    def review(walls: list[float], duration: float, error: str = "") -> dict:
+        calls = [{"state": "ok", "attempts": 1, "wall_s": w} for w in walls]
+        calls.insert(1, {"state": "bad_response", "attempts": 1})  # parse verdict, no wall
+        return {
+            "review": {"seat_calls": calls, "duration_s": duration, "error": error},
+            "judge": {},
+        }
+
+    records = [
+        review([10.0, 20.0], 100.0),
+        review([30.0, 40.0, 50.0], 300.0),
+        review([1000.0], 5000.0, error="router_acp_timeout"),
+    ]
+    latency = parity_runner._seat_usage(records)["latency"]
+    # Every transport call counts; a failed review's duration does not.
+    assert latency["review_call_wall_s"] == {
+        "n": 6,
+        "mean": 191.7,
+        "median": 35.0,
+        "p90": 1000.0,
+    }
+    assert latency["review_duration_s"] == {"n": 2, "mean": 200.0, "median": 200.0, "p90": 300.0}
+    assert latency["review_calls_per_review"]["median"] == 2.5
+
+
+def test_latency_is_absent_not_zero_without_wall_times():
+    latency = parity_runner._seat_usage(
+        [{"review": {"seat_calls": [{"state": "ok", "attempts": 1}], "error": "x"}, "judge": {}}]
+    )["latency"]
+    assert latency["review_call_wall_s"] == {"n": 0, "mean": None, "median": None, "p90": None}

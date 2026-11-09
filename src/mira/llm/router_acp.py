@@ -48,6 +48,8 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   sets it around one job so each job sees only its own completions, however
   many jobs share ``call_log``. A reply the provider cannot parse is reported
   as a ``bad_response`` entry after the ``ok`` transport entry.
+  Every transport entry (``ok`` or a failure state) carries ``wall_s``:
+  seconds from the first attempt to the outcome, retries included.
 * A final structured answer (``complete_with_tools``, ``review``,
   ``walkthrough``, and an agentic ``submit_*`` call) is the JSON object that
   ends the reply, bare or in a closing json fence, and it must carry the
@@ -72,6 +74,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
@@ -112,6 +115,7 @@ job_llm: ContextVar[Any] = ContextVar("mira_router_acp_job_llm", default=None)
 _turn: ContextVar[str] = ContextVar("mira_router_acp_turn", default="")
 _REJECTED_QUOTE_CHARS = 1_500
 _tracing_ready = False
+_monotonic = time.monotonic  # tests replace it
 
 
 class RouterTransportError(Exception):
@@ -268,8 +272,16 @@ class RouterAcpProvider:
             headers["X-Kory-Agent-Session"] = session
         return headers
 
-    def _record(self, *, state: str, requested: str, actual: str, attempts: int) -> None:
-        entry = {
+    def _record(
+        self,
+        *,
+        state: str,
+        requested: str,
+        actual: str,
+        attempts: int,
+        wall_s: float | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
             "state": state,
             "requested_model": requested,
             "actual_model": actual,
@@ -277,6 +289,8 @@ class RouterAcpProvider:
             "priority": self._priority(),
             "attribution": attribution_key.get(),
         }
+        if wall_s is not None:
+            entry["wall_s"] = wall_s
         if _turn.get():
             entry["turn"] = _turn.get()
         self.call_log.append(entry)
@@ -352,8 +366,11 @@ class RouterAcpProvider:
         actual: str,
         detail: str,
         attempts: int,
+        wall_s: float | None = None,
     ) -> NonRetriableLLMError:
-        self._record(state=state, requested=requested, actual=actual, attempts=attempts)
+        self._record(
+            state=state, requested=requested, actual=actual, attempts=attempts, wall_s=wall_s
+        )
         code = _STATE_CODE.get(state, "router_acp_failed")
         return NonRetriableLLMError(
             code,
@@ -405,6 +422,12 @@ class RouterAcpProvider:
         return await self._transport(request)
 
     async def _complete_raw(self, prompt: str, requested: str) -> dict[str, Any]:
+        started = _monotonic()
+
+        def wall() -> float:
+            # Seconds since the first attempt: retries and their backoff included.
+            return round(_monotonic() - started, 3)
+
         attempts = 0
         extra = self.config.router_acp_max_retries
         while True:
@@ -428,6 +451,7 @@ class RouterAcpProvider:
                     actual=actual,
                     detail=str(exc),
                     attempts=attempts,
+                    wall_s=wall(),
                 ) from exc
             actual = str(payload.get("actual_model") or "unknown")
             text = str(payload.get("text") or "")
@@ -439,6 +463,7 @@ class RouterAcpProvider:
                     actual=actual,
                     detail=f"requested {requested}, actual {actual}",
                     attempts=attempts,
+                    wall_s=wall(),
                 )
             if not text.strip():
                 raise self._fail(
@@ -447,8 +472,11 @@ class RouterAcpProvider:
                     actual=actual,
                     detail="empty completion",
                     attempts=attempts,
+                    wall_s=wall(),
                 )
-            self._record(state="ok", requested=requested, actual=actual, attempts=attempts)
+            self._record(
+                state="ok", requested=requested, actual=actual, attempts=attempts, wall_s=wall()
+            )
             logger.info(
                 "router completion state=ok requested=%s actual=%s attempts=%s",
                 requested,

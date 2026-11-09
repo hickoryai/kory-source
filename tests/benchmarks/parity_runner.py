@@ -18,6 +18,7 @@ import dataclasses
 import enum
 import hashlib
 import json
+import math
 import os
 import statistics
 import time
@@ -962,7 +963,48 @@ def _seat_usage(records: list[dict]) -> dict:
             ),
         }
 
-    return {"review": _block(review_calls), "judge": _block(judge_calls)}
+    return {
+        "review": _block(review_calls),
+        "judge": _block(judge_calls),
+        "latency": _latency(records),
+    }
+
+
+def _spread(values: list[float]) -> dict:
+    """n, mean, median and nearest-rank p90 of ``values`` (seconds)."""
+    if not values:
+        return {"n": 0, "mean": None, "median": None, "p90": None}
+    ordered = sorted(values)
+    p90 = ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
+    return {
+        "n": len(ordered),
+        "mean": round(statistics.fmean(ordered), 1),
+        "median": round(statistics.median(ordered), 1),
+        "p90": round(p90, 1),
+    }
+
+
+def _latency(records: list[dict]) -> dict:
+    """Where review time goes: per transport call, and per review that ran."""
+    calls = [
+        float(c["wall_s"])
+        for r in records
+        for c in r["review"]["seat_calls"]
+        if isinstance(c.get("wall_s"), (int, float))
+    ]
+    reviews = [r["review"] for r in records if not r["review"].get("error")]
+    durations = [
+        float(v["duration_s"]) for v in reviews if isinstance(v.get("duration_s"), (int, float))
+    ]
+    # Transport calls only: a bad_response entry is the parse verdict on the call before it.
+    per_review = [
+        float(sum(1 for c in v["seat_calls"] if c.get("state") != "bad_response")) for v in reviews
+    ]
+    return {
+        "review_call_wall_s": _spread(calls),
+        "review_duration_s": _spread(durations),
+        "review_calls_per_review": _spread(per_review),
+    }
 
 
 def _pipeline(arm_rows: list[dict]) -> dict:
@@ -1290,6 +1332,17 @@ def render_markdown(summary: dict) -> str:
         f"- review unusable replies: {usage['review'].get('unusable_replies', 'n/a')}; repair-turn calls: {usage['review'].get('repair_calls', 'n/a')}",
         f"- judge: {usage['judge']['logical_calls']} calls, {usage['judge']['seat_sessions']} seat sessions, models {usage['judge']['actual_models']}",
     ]
+    for label, key in (
+        ("review call wall time (s)", "review_call_wall_s"),
+        ("review duration (s, reviews without error)", "review_duration_s"),
+        ("reviewer calls per review", "review_calls_per_review"),
+    ):
+        spread = (usage.get("latency") or {}).get(key) or {}
+        if spread.get("n"):
+            lines.append(
+                f"- {label}: n {spread['n']}, mean {spread['mean']}, "
+                f"median {spread['median']}, p90 {spread['p90']}"
+            )
     meter = summary.get("seat_meter") or {}
     if meter:
         lines.append(

@@ -908,3 +908,35 @@ async def test_a_submission_in_a_native_batch_wins_without_running_lookups():
     executor = _RecordingExecutor()
     assert json.loads(await agentic_review_loop(seat, list(_SYSTEM), executor)) == _REVIEW
     assert executor.calls == []
+
+
+async def test_each_transport_entry_records_its_wall_time(monkeypatch):
+    import mira.llm.router_acp as router_acp
+
+    ticks = iter([100.0, 102.5, 200.0, 207.25])
+    monkeypatch.setattr(router_acp, "_monotonic", lambda: next(ticks))
+    transport, _prompts, _ = _scripted([_PLAN, _DONE])
+    provider = _provider(transport)
+    await provider.review([{"role": "user", "content": "d"}])
+    # ok (plan) -> bad_response -> ok (repair): the parse verdict has no wall time.
+    assert [(e["state"], e.get("wall_s")) for e in provider.call_log] == [
+        ("ok", 2.5),
+        ("bad_response", None),
+        ("ok", 7.25),
+    ]
+
+
+async def test_a_failed_call_records_the_wall_time_through_its_retries(monkeypatch):
+    import mira.llm.router_acp as router_acp
+
+    ticks = iter([10.0, 13.0])
+    monkeypatch.setattr(router_acp, "_monotonic", lambda: next(ticks))
+
+    async def transport(_request):
+        raise RouterTransportError("busy", kind="seat_exhausted", body={"state": "seat_exhausted"})
+
+    provider = _provider(transport, router_acp_max_retries=1)
+    with pytest.raises(NonRetriableLLMError):
+        await provider.complete([{"role": "user", "content": "d"}])
+    (entry,) = provider.call_log
+    assert entry["state"] == "seat_exhausted" and entry["attempts"] == 2 and entry["wall_s"] == 3.0
