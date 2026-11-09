@@ -256,7 +256,9 @@ def _preflight(reviewer_cfg, judge_cfg) -> list[dict]:
     async def _all() -> list[dict]:
         checks = [await _preflight_one("reviewer", reviewer_cfg, RouterAcpProvider(reviewer_cfg))]
         if reviewer_cfg.router_acp_conversations:
-            checks.append(await _conversations_check(RouterAcpProvider(reviewer_cfg)))
+            checks.append(
+                await _conversations_check(RouterAcpProvider(reviewer_cfg), reviewer_cfg.model)
+            )
         if judge_cfg.provider in {"router-acp", "router_acp"}:
             checks.append(await _preflight_one("judge", judge_cfg, make_judge_llm(judge_cfg)))
         else:
@@ -275,20 +277,43 @@ def _preflight(reviewer_cfg, judge_cfg) -> list[dict]:
     return asyncio.run(_all())
 
 
-async def _conversations_check(provider) -> dict:
-    """The relay must keep sessions before any reviewer sends only a delta."""
+async def _conversations_check(provider, requested: str) -> dict:
+    """The relay must keep sessions before any reviewer sends only a delta.
+
+    A close probe (no seat), then two tiny turns on one fresh session: the
+    relay must report ``conversation.opened`` true, then false, each from the
+    pinned model. Two seat calls.
+    """
+    from mira.llm.router_acp import call_observer
+
+    seen: list[dict] = []
+    token = call_observer.set(seen.append)
+    state, detail = "ok", ""
     try:
-        kept = await provider.probe_conversations()
-        detail = "" if kept else "close probe did not answer state closed"
+        if not await provider.probe_conversations():
+            state, detail = "conversations_unsupported", "close probe did not answer state closed"
+        else:
+            replies = await provider.check_conversation(PREFLIGHT_PROMPT)
+            if any(
+                json.loads(provider._extract_json_object(r)) != {"preflight": "ok"} for r in replies
+            ):
+                state, detail = "wrong_reply", " | ".join(r[:100] for r in replies)
     except Exception as exc:
-        kept, detail = False, str(exc)[:300]
+        state = str(getattr(exc, "code", "") or "conversations_unsupported")
+        detail = str(exc)[:300]
+    finally:
+        call_observer.reset(token)
+    transport = [e for e in seen if e.get("state") != "bad_response"]
+    reported = sorted({str(e.get("actual_model") or "unknown") for e in transport}) or ["unknown"]
+    if state == "ok" and reported != [requested]:
+        state = "model_mismatch"
     return {
         "role": "conversations",
-        "requested_model": "kept relay sessions",
-        "reported_model": "supported" if kept else "unsupported",
-        "state": "ok" if kept else "conversations_unsupported",
+        "requested_model": requested,
+        "reported_model": ",".join(reported),
+        "state": state,
         "detail": detail,
-        "calls": 0,
+        "calls": len(transport),
     }
 
 

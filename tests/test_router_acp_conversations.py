@@ -39,17 +39,28 @@ class _Relay:
         self.replies = list(replies)
         self.prompts: list[dict] = []
         self.closes: list[str] = []
+        self.open: set[str] = set()
+        self.forget_before: set[int] = set()  # prompt numbers whose session the relay lost
 
     async def __call__(self, request: dict) -> dict:
         body = request["body"]
         if body.get("close") is True:
             self.closes.append(body["conversation_id"])
+            self.open.discard(body["conversation_id"])
             return {"state": "closed", "conversation_id": body["conversation_id"]}
         self.prompts.append(body)
+        cid = body.get("conversation_id")
+        if len(self.prompts) in self.forget_before:
+            self.open.discard(cid)  # idle close, eviction or restart: the id reopens empty
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
+            self.open.discard(cid)  # a failed prompt closes the session
             raise reply
-        return {"text": reply, "actual_model": "grok@x/grok-4.7"}
+        payload = {"text": reply, "actual_model": "grok@x/grok-4.7"}
+        if cid:
+            payload["conversation"] = {"id": cid, "opened": cid not in self.open}
+            self.open.add(cid)
+        return payload
 
 
 def _provider(relay: _Relay, conversations: bool = True, **kwargs) -> RouterAcpProvider:
@@ -292,3 +303,95 @@ async def test_a_kept_turn_from_another_model_is_refused_not_reopened():
     assert provider.call_log[-1]["state"] == "model_mismatch"
     assert len(relay.prompts) == 2  # no reopen after a substitution
     assert relay.closes == [relay.prompts[0]["conversation_id"]]
+
+
+async def test_a_kept_turn_on_a_reopened_session_is_discarded_and_resent_whole():
+    relay = _Relay(
+        [
+            _batch(_call("read_file", path="a.py")),
+            _call("submit_review", **_REVIEW),  # answered without the transcript: discarded
+            _call("submit_review", comments=[], summary="whole"),
+        ]
+    )
+    relay.forget_before = {2}
+    provider = _provider(relay)
+    assert json.loads(await _loop(provider)) == {"comments": [], "summary": "whole"}
+    first, lost, resent = relay.prompts
+    assert lost["conversation_id"] == first["conversation_id"]
+    assert "THE-DIFF" not in lost["prompt"]
+    assert resent["conversation_id"] != first["conversation_id"]
+    assert "THE-DIFF" in resent["prompt"] and "RESULT-1" in resent["prompt"]
+    assert first["conversation_id"] in relay.closes
+    entries = [(e["state"], e.get("conversation"), e.get("session")) for e in provider.call_log]
+    assert entries == [
+        ("ok", "new", None),
+        ("lost_context", "kept", "reopened_lost"),
+        ("ok", "new", None),
+    ]
+
+
+async def test_lost_context_reopens_only_once():
+    relay = _Relay(
+        [
+            _batch(_call("read_file", path="a.py")),
+            _call("submit_review", **_REVIEW),
+            _call("submit_review", **_REVIEW),
+        ]
+    )
+    relay.forget_before = {2}
+    provider = _provider(relay)
+
+    original = relay.__call__
+
+    async def reopened_reports_kept(request):
+        payload = await original(request)
+        if len(relay.prompts) == 3 and "conversation" in payload:
+            payload["conversation"]["opened"] = False  # a fresh id that claims to be kept
+        return payload
+
+    provider._transport = reopened_reports_kept
+    assert await _loop(provider) == ""
+    assert len(relay.prompts) == 3
+    assert [e["state"] for e in provider.call_log] == ["ok", "lost_context", "lost_context"]
+    assert provider._conversations == []
+
+
+@pytest.mark.parametrize(
+    "conversation",
+    [None, {"opened": False}, {"id": "someone-else", "opened": False}, {"id": "", "opened": None}],
+)
+async def test_a_kept_reply_without_its_conversation_is_not_trusted(conversation):
+    relay = _Relay([_batch(_call("read_file", path="a.py")), _call("submit_review", **_REVIEW)])
+    provider = _provider(relay)
+    original = relay.__call__
+
+    async def transport(request):
+        payload = await original(request)
+        if len(relay.prompts) == 2 and not request["body"].get("close"):
+            if conversation is None:
+                payload.pop("conversation", None)
+            else:
+                payload["conversation"] = dict(conversation)
+        return payload
+
+    provider._transport = transport
+    relay.replies.append(_call("submit_review", **_REVIEW))
+    assert json.loads(await _loop(provider)) == _REVIEW
+    assert [e["state"] for e in provider.call_log] == ["ok", "lost_context", "ok"]
+    assert "THE-DIFF" in relay.prompts[2]["prompt"]
+
+
+async def test_check_conversation_needs_opened_then_kept():
+    relay = _Relay(['{"preflight": "ok"}', '{"preflight": "ok"}'])
+    provider = _provider(relay)
+    assert await provider.check_conversation("ping") == ['{"preflight": "ok"}'] * 2
+    assert relay.prompts[0]["conversation_id"] == relay.prompts[1]["conversation_id"]
+    assert relay.closes == [relay.prompts[0]["conversation_id"]]
+
+    forgetful = _Relay(['{"preflight": "ok"}', '{"preflight": "ok"}'])
+    forgetful.forget_before = {2}
+    provider = _provider(forgetful)
+    with pytest.raises(Exception) as raised:
+        await provider.check_conversation("ping")
+    assert getattr(raised.value, "code", "") == "router_acp_lost_context"
+    assert forgetful.closes == [forgetful.prompts[0]["conversation_id"]]

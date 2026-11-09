@@ -27,6 +27,11 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   prompt failed and would reopen the id empty. A seat-busy or outage failure
   reopens once with the whole transcript; any other failure raises. A session
   idle longer than ``router_acp_conversation_idle_seconds`` is not reused.
+  Every reply on a conversation must carry ``conversation: {id, opened}``:
+  ``opened: true`` on the first turn and ``false`` after. A later turn that
+  comes back ``opened: true`` (or without the field) ran without the
+  transcript: it is discarded, logged as ``lost_context`` with
+  ``session: "reopened_lost"``, and reopened once under a fresh id.
   ``probe_conversations`` checks the relay supports it without using a seat.
 * ``supports_tool_calling`` (native tool calling) and ``supports_temperature``
   are false. Ensemble sampling stays off.
@@ -111,6 +116,7 @@ _STATE_CODE = {
     "empty_response": "router_acp_empty_response",
     "timeout": "router_acp_timeout",
     "bad_response": "router_acp_bad_response",
+    "lost_context": "router_acp_lost_context",
 }
 _STATUS_KIND = {
     429: "seat_exhausted",
@@ -134,7 +140,13 @@ _conversation: ContextVar[tuple[str, str] | None] = ContextVar(
     "mira_router_acp_conversation", default=None
 )
 # A kept turn that failed with one of these reopens once, with the full transcript.
-_REOPEN_CODES = frozenset({_STATE_CODE["seat_exhausted"], _STATE_CODE["workstation_outage"]})
+_REOPEN_CODES = frozenset(
+    {
+        _STATE_CODE["seat_exhausted"],
+        _STATE_CODE["workstation_outage"],
+        _STATE_CODE["lost_context"],
+    }
+)
 _CLOSE_TIMEOUT_SECONDS = 30
 
 
@@ -315,6 +327,7 @@ class RouterAcpProvider:
         actual: str,
         attempts: int,
         wall_s: float | None = None,
+        session: str | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "state": state,
@@ -331,6 +344,8 @@ class RouterAcpProvider:
         conversation = _conversation.get()
         if conversation is not None:
             entry["conversation"] = conversation[1]
+        if session:
+            entry["session"] = session
         self.call_log.append(entry)
         observer = call_observer.get()
         if observer is not None:
@@ -405,9 +420,15 @@ class RouterAcpProvider:
         detail: str,
         attempts: int,
         wall_s: float | None = None,
+        session: str | None = None,
     ) -> NonRetriableLLMError:
         self._record(
-            state=state, requested=requested, actual=actual, attempts=attempts, wall_s=wall_s
+            state=state,
+            requested=requested,
+            actual=actual,
+            attempts=attempts,
+            wall_s=wall_s,
+            session=session,
         )
         code = _STATE_CODE.get(state, "router_acp_failed")
         return NonRetriableLLMError(
@@ -510,6 +531,19 @@ class RouterAcpProvider:
                     attempts=attempts,
                     wall_s=wall(),
                 )
+            if conversation is not None:
+                lost = _lost_context(payload, conversation)
+                if lost:
+                    # The reply came from a session without this transcript: never use it.
+                    raise self._fail(
+                        "lost_context",
+                        requested=requested,
+                        actual=actual,
+                        detail=lost,
+                        attempts=attempts,
+                        wall_s=wall(),
+                        session="reopened_lost" if conversation[1] == "kept" else None,
+                    )
             if not text.strip():
                 raise self._fail(
                     "empty_response",
@@ -872,6 +906,29 @@ class RouterAcpProvider:
             if attribution is None or conv.attribution == attribution:
                 await self._close(conv)
 
+    async def check_conversation(self, prompt: str) -> list[str]:
+        """Two turns of ``prompt`` on one fresh kept session, then close it.
+
+        The relay must answer the first ``opened: true`` and the second
+        ``opened: false``, or the turn raises ``router_acp_lost_context``.
+        Returns both replies. Two seat calls; preflight only.
+        """
+        conv = _Conversation(
+            id=f"mira-preflight-{uuid.uuid4().hex}",
+            owner=0,
+            attribution=attribution_key.get(),
+            tools=(),
+            sent=[],
+            last_reply=0.0,
+        )
+        self._conversations.append(conv)
+        try:
+            first, _ = await self._in_conversation(conv, "new", prompt)
+            second, _ = await self._in_conversation(conv, "kept", prompt)
+        finally:
+            await self._close(conv)
+        return [first, second]
+
     async def probe_conversations(self) -> bool:
         """True if the relay keeps sessions: closing an unknown id answers ``closed``.
 
@@ -920,6 +977,20 @@ _JSON_TYPES: dict[str, tuple[type, ...]] = {
     "array": (list,),
     "object": (dict,),
 }
+
+
+def _lost_context(payload: dict[str, Any], conversation: tuple[str, str]) -> str:
+    """Why a conversation reply cannot be trusted to carry its transcript, or ""."""
+    conversation_id, mode = conversation
+    info = payload.get("conversation")
+    if not isinstance(info, dict) or info.get("id") != conversation_id:
+        return f"relay reply carries no conversation {conversation_id}"
+    opened = info.get("opened")
+    if mode == "kept" and opened is not False:
+        return f"relay opened a fresh session for kept conversation {conversation_id}"
+    if mode == "new" and opened is not True:
+        return f"relay did not open a fresh session for new conversation {conversation_id}"
+    return ""
 
 
 def _render_messages(messages: list, start: int) -> list[str]:

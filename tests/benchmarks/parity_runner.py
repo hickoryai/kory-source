@@ -973,6 +973,8 @@ def _seat_usage(records: list[dict]) -> dict:
             "repair_calls": sum(
                 1 for c in calls if c.get("turn") == "repair" and c.get("state") != "bad_response"
             ),
+            # Kept turns the relay answered on a fresh session: discarded, resent whole.
+            "reopened_lost": sum(1 for c in calls if c.get("session") == "reopened_lost"),
             # Agentic steps on a kept relay session: "new" opened it, "kept" reused it.
             "conversation_turns": dict(
                 Counter(
@@ -1354,7 +1356,10 @@ def render_markdown(summary: dict) -> str:
     ]
     turns = usage["review"].get("conversation_turns")
     if turns:
-        lines.append(f"- reviewer agentic steps on kept relay sessions: {turns}")
+        lines.append(
+            f"- reviewer agentic steps on kept relay sessions: {turns}; "
+            f"lost-context reopens: {usage['review'].get('reopened_lost', 0)}"
+        )
     for label, key in (
         ("review call wall time (s)", "review_call_wall_s"),
         ("review duration (s, reviews without error)", "review_duration_s"),

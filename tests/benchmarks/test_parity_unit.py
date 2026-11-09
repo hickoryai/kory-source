@@ -1693,23 +1693,55 @@ async def test_review_unit_closes_kept_sessions_even_when_the_review_fails():
     assert closed == [f"review|registry_off|r1|{unit.unit_id}"]
 
 
-async def test_preflight_refuses_a_relay_without_kept_sessions():
+@pytest.mark.parametrize(
+    ("probe", "turns", "expect"),
+    [
+        (True, [("grok@x/g", True), ("grok@x/g", False)], "ok"),
+        (False, [], "conversations_unsupported"),
+        (RuntimeError("400 prompt is required"), [], "conversations_unsupported"),
+        # The relay reopened the session on the second turn: context would be lost.
+        (True, [("grok@x/g", True), ("grok@x/g", True)], "router_acp_lost_context"),
+        # The relay predates the conversation field.
+        (True, [("grok@x/g", None)], "router_acp_lost_context"),
+        (True, [("grok@x/g", True), ("claude@y/fable", False)], "router_acp_model_mismatch"),
+    ],
+)
+async def test_preflight_requires_kept_sessions_that_report_opened(
+    monkeypatch, probe, turns, expect
+):
+    from mira.llm.router_acp import RouterAcpProvider
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
     rp = _run_parity_module()
+    script = list(turns)
 
-    class _Probe:
-        def __init__(self, result):
-            self.result = result
+    async def relay(request):
+        body = request["body"]
+        if body.get("close"):
+            if isinstance(probe, Exception):
+                raise probe
+            if probe:
+                return {"state": "closed", "conversation_id": body["conversation_id"]}
+            return {"text": "hello", "actual_model": "grok@x/g"}
+        model, opened = script.pop(0)
+        payload = {"text": '{"preflight": "ok"}', "actual_model": model}
+        if opened is not None:
+            payload["conversation"] = {"id": body["conversation_id"], "opened": opened}
+        return payload
 
-        async def probe_conversations(self):
-            if isinstance(self.result, Exception):
-                raise self.result
-            return self.result
-
-    ok = await rp._conversations_check(_Probe(True))
-    assert ok["state"] == "ok" and rp._preflight_ok([ok])
-    for result in (False, RuntimeError("400 prompt is required")):
-        check = await rp._conversations_check(_Probe(result))
-        assert check["state"] == "conversations_unsupported" and not rp._preflight_ok([check])
+    cfg = LLMConfig(
+        provider="router-acp",
+        model="grok@x/g",
+        router_acp_conversations=True,
+        router_acp_max_retries=0,
+    )
+    check = await rp._conversations_check(
+        RouterAcpProvider(cfg, transport=relay, relay=False), "grok@x/g"
+    )
+    assert check["state"] == expect, check
+    assert rp._preflight_ok([check]) is (expect == "ok")
+    if expect == "ok":
+        assert check["calls"] == 2 and check["reported_model"] == "grok@x/g"
 
 
 def test_reviewer_conversations_are_opt_in_and_the_judge_stays_one_shot():
@@ -1731,7 +1763,15 @@ def test_seat_usage_counts_agentic_steps_on_kept_sessions():
         {"state": "ok", "attempts": 1, "conversation": "new"},
         {"state": "ok", "attempts": 1, "conversation": "kept"},
         {"state": "bad_response", "attempts": 1, "conversation": "kept"},
+        {
+            "state": "lost_context",
+            "attempts": 1,
+            "conversation": "kept",
+            "session": "reopened_lost",
+        },
         {"state": "ok", "attempts": 1},
     ]
     usage = parity_runner._seat_usage([{"review": {"seat_calls": calls}, "judge": {}}])
-    assert usage["review"]["conversation_turns"] == {"new": 1, "kept": 1}
+    assert usage["review"]["conversation_turns"] == {"new": 1, "kept": 2}
+    assert usage["review"]["reopened_lost"] == 1
+    assert usage["review"]["failed"] == 2  # the bad_response verdict and the lost turn
