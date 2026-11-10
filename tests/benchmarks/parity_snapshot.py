@@ -29,6 +29,7 @@ from mira.models import FileHistoryEntry, PRInfo
 from mira.providers.github import GitHubProvider
 
 _SHA_IN_SUMMARY = re.compile(r"Last reviewed commit:.*?/commit/([0-9a-f]{40})", re.S)
+_FULL_SHA = re.compile(r"[0-9a-f]{40}")
 _DETAILS = re.compile(r"<details>.*?</details>", re.S | re.I)
 _HTML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 _TAG = re.compile(r"<[^>]+>")
@@ -144,6 +145,46 @@ def units_for_fixture(fixture: dict) -> list[Unit]:
     for comment, finding in zip(inline, findings, strict=True):
         sha = comment.get("original_commit_id") or comment.get("commit_id") or fixture["head_sha"]
         groups.setdefault(sha, []).append(_golden(finding, comment))
+
+    snapshot_sha = fixture.get("snapshot_sha")
+    if snapshot_sha is not None:
+        if not isinstance(snapshot_sha, str) or _FULL_SHA.fullmatch(snapshot_sha) is None:
+            raise ValueError(f"{fixture['pr_url']}: snapshot_sha must be a full 40-character SHA")
+
+        requested = groups.get(snapshot_sha, [])
+        matching_summaries = [
+            summary
+            for summary in summaries
+            if (match := _SHA_IN_SUMMARY.search(summary.get("body", "")))
+            and match.group(1) == snapshot_sha
+        ]
+        reviewed_at = (
+            min(g["created_at"] for g in requested)
+            if requested
+            else min(
+                (s.get("updated_at") or s.get("created_at", "") for s in matching_summaries),
+                default="",
+            )
+        )
+        ordered = sorted(groups.items(), key=lambda item: min(g["created_at"] for g in item[1]))
+        prior = [
+            finding
+            for sha, golden in ordered
+            if sha != snapshot_sha
+            for finding in golden
+            if not reviewed_at or finding["created_at"] < reviewed_at
+        ]
+        return [
+            Unit(
+                unit_id=f"{common['pr_number']}@{snapshot_sha[:12]}",
+                sha=snapshot_sha,
+                greptile_reviewed=bool(requested or matching_summaries),
+                greptile_at=reviewed_at,
+                golden=tuple(requested),
+                prior=tuple(prior),
+                **common,
+            )
+        ]
 
     if not groups:
         last = None

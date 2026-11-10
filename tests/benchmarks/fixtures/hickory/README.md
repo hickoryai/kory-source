@@ -9,6 +9,12 @@ Greptile inline comments are golden judge truth. GitHub thread resolution and
 outdated state are retained as export metadata, but do not rewrite that truth.
 Summary comments are provenance only and are not findings.
 
+Nightly manifests may set optional `snapshot_sha` to a full 40-character commit
+SHA. The loader then emits only that snapshot unit, carries earlier inline
+findings as judge-only prior context, and marks the unit uncovered unless an
+inline or summary review matches that SHA. Manifests without this field retain
+the behavior described below.
+
 Golden text must never enter reviewer context. `run_baseline.py` constructs a
 minimal runner fixture, passes only the PR URL to `ReviewEngine`, and makes
 findings available only to Mira's judge phase.
@@ -375,3 +381,8 @@ uv run python tests/benchmarks/study_capture.py report --out <dir>              
   - the judge error rate counts terminal per-unit outcomes, not attempts;
   - when every unit-run a rule covers is a valid zero-draft capture, the judge error rate is N/A and the judge-validity precondition does not apply to the descriptive R-draft;
   - precision and critique rules are not evaluable without a denominator.
+
+
+For private nightly runs, set `KORY_PARITY_RELAY_LOG` to a new file in private
+local storage. The harness creates it with mode `0600` and refuses to overwrite
+an existing file. Without this opt-in, the legacy loopback log path is unchanged.
