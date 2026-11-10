@@ -258,7 +258,7 @@ class TestSpeculativeGrade:
         assert audit[-1]["counts"] == {"plausible": 1, "speculative": 1}
 
     @pytest.mark.asyncio
-    async def test_prompt_offers_speculative_and_platform_rule(self, monkeypatch):
+    async def test_prompt_offers_speculative_grade(self, monkeypatch):
         from mira.llm import provider as provider_mod
 
         captured = {}
@@ -274,7 +274,8 @@ class TestSpeculativeGrade:
 
         prompt = captured["prompt"]
         assert "`speculative`" in prompt
-        assert "library, database, or framework" in prompt
+        assert "library, database, or framework" not in prompt
+        assert "depends on an unshown contract stays `plausible`" in prompt
         evidence = captured["tools"][0]["function"]["parameters"]["properties"]["verdicts"][
             "items"
         ]["properties"]["evidence"]
