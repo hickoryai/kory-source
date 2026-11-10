@@ -140,6 +140,10 @@ class FilterConfig(BaseModel):
     category_confidence_thresholds: dict[str, float] = Field(default_factory=dict)
     max_comments: int = Field(default=5, ge=1)
     min_severity: str = "nitpick"
+    # Drop the review prompt's standalone "Missing test coverage" finding before
+    # posting. It asks for tests without showing wrong behaviour, which reviewers
+    # read as noise. Set False to post it.
+    drop_test_coverage_requests: bool = True
     exclude_patterns: list[str] = Field(
         default_factory=lambda: [
             "*.lock",

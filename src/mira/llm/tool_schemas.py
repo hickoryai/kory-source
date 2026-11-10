@@ -131,7 +131,7 @@ SUBMIT_CRITIQUE_TOOL = {
                             },
                             "evidence": {
                                 "type": "string",
-                                "enum": ["proven", "plausible", "unsupported"],
+                                "enum": ["proven", "plausible", "unsupported", "speculative"],
                                 "description": (
                                     "proven: the shown code demonstrates the issue and the "
                                     "reasoning is correct. "
@@ -139,8 +139,13 @@ SUBMIT_CRITIQUE_TOOL = {
                                     "but depends on behaviour or code not shown — this is a "
                                     "valid grade for real findings, not a failure. "
                                     "unsupported: the shown code contradicts the claim, the "
-                                    "reasoning is wrong, or it's a style preference dressed "
-                                    "up as an issue."
+                                    "reasoning is wrong (including a wrong claim about how a "
+                                    "language, library, or database behaves), or it's a style "
+                                    "preference dressed up as an issue. "
+                                    "speculative: the failure needs a hypothetical caller or "
+                                    "test, a guess about the environment, or treats a change the "
+                                    "code says is intended as a regression; or it asks for tests or "
+                                    "hygiene without naming wrong behaviour."
                                 ),
                             },
                             "reason": {

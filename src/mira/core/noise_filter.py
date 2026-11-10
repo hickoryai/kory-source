@@ -82,6 +82,25 @@ def _deduplicate(
     return kept
 
 
+# The review prompt's fixed title for its "this logic has no tests" finding.
+_TEST_COVERAGE_TITLE = "missing test coverage"
+
+
+def _is_test_coverage_request(comment: ReviewComment) -> bool:
+    """True for the prompt's "Missing test coverage" finding.
+
+    Matches only that title, so findings about a defect inside a test file
+    (a test that never exercises its case, a fixture that leaks state) are kept.
+    """
+    title = " ".join(comment.title.lower().replace("_", " ").split()).rstrip(".:")
+    return title == _TEST_COVERAGE_TITLE
+
+
+def drop_test_coverage_requests(comments: list[ReviewComment]) -> list[ReviewComment]:
+    """Drop findings that only ask for tests and do not show a defect."""
+    return [c for c in comments if not _is_test_coverage_request(c)]
+
+
 def filter_noise(
     comments: list[ReviewComment],
     config: FilterConfig,
@@ -89,7 +108,9 @@ def filter_noise(
 ) -> list[ReviewComment]:
     """Apply the full noise filtering pipeline.
 
-    1. Drop below confidence threshold (escalates per ``review_round``)
+    1. Drop below confidence threshold (escalates per ``review_round``), and
+       the prompt's "Missing test coverage" finding unless
+       ``drop_test_coverage_requests`` is off
     2. Drop below minimum severity (escalates per ``review_round``)
     3. Sort by severity (desc) then confidence (desc)
     4. Deduplicate (first occurrence = highest quality)
@@ -122,6 +143,8 @@ def filter_noise(
         return max(confidence_floor, category_floors.get(c.category, 0.0))
 
     result = [c for c in comments if c.confidence >= _floor(c)]
+    if config.drop_test_coverage_requests:
+        result = drop_test_coverage_requests(result)
     result = [c for c in result if c.severity >= min_severity]
     result.sort(key=lambda c: (c.severity, c.confidence), reverse=True)
     result = _deduplicate(result)

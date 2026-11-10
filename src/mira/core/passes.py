@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import json as _json
 import logging
+from collections import Counter
 from collections.abc import Callable
 
 from mira.config import load_config
@@ -432,7 +433,10 @@ def _critique_keep(verdict: dict, comment: ReviewComment) -> bool:
         # drafter's own confidence already passed the noise-filter floor, so a
         # second, stricter confidence cut only deletes them.
         return comment.severity >= Severity.WARNING
-    if evidence == "unsupported":
+    if evidence in ("unsupported", "speculative"):
+        # speculative: the failure rests on an assumption the comment does not
+        # ground in code (a hypothetical caller or test, a guessed environment,
+        # behaviour the code says it intends) or asks for hygiene, not a fix.
         return False
     # Older binary shape (model fallback): honor it.
     return verdict.get("keep") is True
@@ -508,11 +512,25 @@ async def self_critique(
         "- `unsupported` — the shown code contradicts the claim, the "
         "language-semantics reasoning is wrong (e.g. 'decorator only "
         "registers last route' — stacked decorators register both), or "
-        "it's a style preference dressed up as an issue.\n\n"
+        "it's a style preference dressed up as an issue.\n"
+        "- `speculative` — the claimed failure needs something the comment "
+        "does not show in code: a hypothetical future caller or test, a guess "
+        "about the deployed environment or data, or a reading that treats a "
+        "change the code or its comments say is intended as a regression. Also use it "
+        "for requests for tests, cleanup, or hygiene that name no wrong "
+        "behaviour in the code as written.\n\n"
+        "A claim about how a language, library, database, or framework behaves "
+        "(a function signature, a default type conversion, an error it raises) "
+        "is not 'code not shown'. Check it against what you know: if the "
+        "platform does not behave that way, grade `unsupported`.\n\n"
         "Grade the evidence; do NOT construct counter-arguments. A subtle "
         "issue clearly visible in the code (a predicate with side effects, "
         "an idiom misuse) is `proven` even if reasonable people might ship "
-        "it anyway.\n\n" + rules_block + "## Draft comments\n\n" + "\n".join(draft_lines)
+        "it anyway. A concrete failure traced through the shown code that "
+        "depends on an unshown contract stays `plausible`.\n\n"
+        + rules_block
+        + "## Draft comments\n\n"
+        + "\n".join(draft_lines)
     )
 
     critic_llm = indexing_llm or _indexing_llm(llm)
@@ -574,6 +592,13 @@ async def self_critique(
         logger.info(
             "Self-critique dropped [%d] %s:%d (%s) — %s", i, c.path, c.line, evidence, reason[:120]
         )
+
+    if audit is not None:
+        grades = Counter(
+            str(verdict_by_idx[i].get("evidence", "keep")) if i in verdict_by_idx else "none"
+            for i in range(len(comments))
+        )
+        audit.append({"stage": "self_critique_grades", "counts": dict(grades)})
 
     return [c for i, c in enumerate(comments) if i in keep_indices]
 

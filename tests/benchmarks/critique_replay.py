@@ -191,7 +191,7 @@ def _sums(step1: Path) -> dict[str, str]:
     return out
 
 
-GRADES = ("proven", "plausible", "unsupported")
+GRADES = ("proven", "plausible", "unsupported", "speculative")
 
 
 class ReplayReplyError(ValueError):

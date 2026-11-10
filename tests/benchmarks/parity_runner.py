@@ -1034,6 +1034,7 @@ def _pipeline(arm_rows: list[dict]) -> dict:
     drafted = 0
     dropped: Counter = Counter()
     tools: Counter = Counter()
+    grades: Counter = Counter()
     with_tools = 0
     for r in arm_rows:
         review = r["rec"]["review"]
@@ -1046,6 +1047,8 @@ def _pipeline(arm_rows: list[dict]) -> dict:
                 calls = entry.get("calls") or []
                 tools.update(str(c.get("tool")) for c in calls)
                 used = used or bool(calls)
+            elif stage == "self_critique_grades":
+                grades.update({str(k): int(v) for k, v in (entry.get("counts") or {}).items()})
             elif "path" in entry:
                 dropped[str(stage)] += 1
         with_tools += int(used)
@@ -1053,6 +1056,7 @@ def _pipeline(arm_rows: list[dict]) -> dict:
         "reviews_with_audit": sum(1 for r in arm_rows if "audit" in r["rec"]["review"]),
         "drafted": drafted,
         "dropped_by_stage": dict(dropped),
+        "critique_grades": dict(grades),
         "tool_calls": dict(tools),
         "reviews_using_tools": with_tools,
         "skipped_paths": sum(len(r["rec"]["review"].get("skipped_paths") or []) for r in arm_rows),
@@ -1342,6 +1346,7 @@ def render_markdown(summary: dict) -> str:
         pipe = a.get("pipeline") or {}
         lines.append(
             f"- {name}: {pipe.get('drafted')} drafted; dropped {pipe.get('dropped_by_stage')}; "
+            f"critique grades {pipe.get('critique_grades') or {}}; "
             f"tool calls {pipe.get('tool_calls')} in {pipe.get('reviews_using_tools')} reviews; "
             f"{pipe.get('skipped_paths')} skipped paths"
         )

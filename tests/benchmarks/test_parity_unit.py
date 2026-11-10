@@ -768,6 +768,7 @@ async def test_review_records_the_pipeline_trail_without_changing_scores(monkeyp
         "reviews_with_audit": 2,
         "drafted": 6,
         "dropped_by_stage": {"noise_filter": 2, "critique": 2},
+        "critique_grades": {},
         "tool_calls": {"read_file": 2},
         "reviews_using_tools": 2,
         "skipped_paths": 2,
