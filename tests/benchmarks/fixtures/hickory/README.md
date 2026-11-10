@@ -381,3 +381,8 @@ uv run python tests/benchmarks/study_capture.py report --out <dir>              
   - the judge error rate counts terminal per-unit outcomes, not attempts;
   - when every unit-run a rule covers is a valid zero-draft capture, the judge error rate is N/A and the judge-validity precondition does not apply to the descriptive R-draft;
   - precision and critique rules are not evaluable without a denominator.
+
+
+For private nightly runs, set `KORY_PARITY_RELAY_LOG` to a new file in private
+local storage. The harness creates it with mode `0600` and refuses to overwrite
+an existing file. Without this opt-in, the legacy loopback log path is unchanged.

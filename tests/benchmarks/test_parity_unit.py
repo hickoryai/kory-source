@@ -1834,3 +1834,23 @@ def test_seat_usage_counts_agentic_steps_on_kept_sessions():
     assert usage["review"]["conversation_turns"] == {"new": 1, "kept": 2}
     assert usage["review"]["reopened_lost"] == 1
     assert usage["review"]["failed"] == 2  # the bad_response verdict and the lost turn
+
+
+def test_private_loopback_log_is_exclusive_and_owner_only(monkeypatch, tmp_path):
+    rp = _run_parity_module()
+    log_path = tmp_path / "relay.log"
+    monkeypatch.setenv("MIRA_ROUTER_ACP_RELAY_ENTRY", "/synthetic/relay.mjs")
+    monkeypatch.setenv("KORY_PARITY_RELAY_LOG", str(log_path))
+    process = object()
+    monkeypatch.setattr(rp.subprocess, "Popen", lambda *a, **kw: process)
+    monkeypatch.setattr(rp, "_wait_for_port", lambda port: None)
+    proc, log = rp._start_loopback("synthetic")
+    try:
+        assert proc is process
+        assert log_path.stat().st_mode & 0o777 == 0o600
+        log.write("private synthetic log")
+    finally:
+        log.close()
+    with pytest.raises(FileExistsError):
+        rp._start_loopback("synthetic")
+    assert log_path.read_text() == "private synthetic log"

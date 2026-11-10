@@ -151,7 +151,12 @@ def _start_loopback(token: str) -> tuple[subprocess.Popen | None, object | None]
     env = os.environ.copy()
     env["PORT"] = str(LOOPBACK_PORT)
     env["MIRA_ROUTER_ACP_TOKEN"] = token
-    log = open("/tmp/router-acp-parity-loopback.log", "w", encoding="utf-8")  # noqa: SIM115
+    private_log = os.environ.get("KORY_PARITY_RELAY_LOG", "")
+    if private_log:
+        descriptor = os.open(private_log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        log = os.fdopen(descriptor, "w", encoding="utf-8")
+    else:
+        log = open("/tmp/router-acp-parity-loopback.log", "w", encoding="utf-8")  # noqa: SIM115
     proc = subprocess.Popen(["node", entry], env=env, stdout=log, stderr=subprocess.STDOUT)
     _wait_for_port(LOOPBACK_PORT)
     return proc, log
