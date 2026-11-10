@@ -9,6 +9,12 @@ Greptile inline comments are golden judge truth. GitHub thread resolution and
 outdated state are retained as export metadata, but do not rewrite that truth.
 Summary comments are provenance only and are not findings.
 
+Nightly manifests may set optional `snapshot_sha` to a full 40-character commit
+SHA. The loader then emits only that snapshot unit, carries earlier inline
+findings as judge-only prior context, and marks the unit uncovered unless an
+inline or summary review matches that SHA. Manifests without this field retain
+the behavior described below.
+
 Golden text must never enter reviewer context. `run_baseline.py` constructs a
 minimal runner fixture, passes only the PR URL to `ReviewEngine`, and makes
 findings available only to Mira's judge phase.
