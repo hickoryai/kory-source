@@ -38,11 +38,16 @@ class TestKeepRule:
         c = _comment(severity=Severity.BLOCKER, confidence=1.0)
         assert not _critique_keep({"evidence": "unsupported"}, c)
 
-    def test_plausible_kept_only_when_severe_and_confident(self):
+    def test_plausible_kept_when_warning_or_above(self):
         assert _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, confidence=0.8))
         assert _critique_keep({"evidence": "plausible"}, _comment(Severity.BLOCKER, 0.95))
-        assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, 0.7))
+        assert _critique_keep({"evidence": "plausible"}, _comment(Severity.WARNING, 0.7))
         assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.SUGGESTION, 0.95))
+        assert not _critique_keep({"evidence": "plausible"}, _comment(Severity.NITPICK, 0.99))
+
+    def test_speculative_always_dropped(self):
+        c = _comment(severity=Severity.BLOCKER, confidence=1.0)
+        assert not _critique_keep({"evidence": "speculative"}, c)
 
     def test_legacy_keep_boolean_honored(self):
         c = _comment()
@@ -196,7 +201,11 @@ class TestEvidenceGradedCritique:
         audit: list[dict] = []
         await self_critique(AsyncMock(), comments, audit=audit)
 
-        assert len(audit) == 1
+        assert len(audit) == 2
+        assert audit[1] == {
+            "stage": "self_critique_grades",
+            "counts": {"proven": 1, "unsupported": 1},
+        }
         entry = audit[0]
         assert entry["stage"] == "self_critique"
         assert entry["title"] == "dropped claim"
@@ -217,3 +226,56 @@ class TestEvidenceGradedCritique:
 
         assert kept == []
         assert audit[0]["reason"].startswith("no-verdict:")
+
+
+class TestSpeculativeGrade:
+    @pytest.mark.asyncio
+    async def test_speculative_dropped_and_audited(self, monkeypatch):
+        comments = [
+            _comment(title="traced bug"),
+            _comment(title="cache may leak into a later test", severity=Severity.WARNING),
+        ]
+        response = json.dumps(
+            {
+                "verdicts": [
+                    {"index": 0, "evidence": "plausible", "reason": "depends on caller"},
+                    {"index": 1, "evidence": "speculative", "reason": "hypothetical test"},
+                ]
+            }
+        )
+        from mira.llm import provider as provider_mod
+
+        async def fake(self, messages, tools, temperature=None):
+            return response
+
+        monkeypatch.setattr(provider_mod.LLMProvider, "complete_with_tools", fake)
+
+        audit: list[dict] = []
+        kept = await self_critique(AsyncMock(), comments, audit=audit)
+
+        assert [c.title for c in kept] == ["traced bug"]
+        assert audit[0]["reason"] == "speculative: hypothetical test"
+        assert audit[-1]["counts"] == {"plausible": 1, "speculative": 1}
+
+    @pytest.mark.asyncio
+    async def test_prompt_offers_speculative_and_platform_rule(self, monkeypatch):
+        from mira.llm import provider as provider_mod
+
+        captured = {}
+
+        async def fake(self, messages, tools, temperature=None):
+            captured["prompt"] = messages[0]["content"]
+            captured["tools"] = tools
+            return json.dumps({"verdicts": [{"index": 0, "evidence": "proven"}]})
+
+        monkeypatch.setattr(provider_mod.LLMProvider, "complete_with_tools", fake)
+
+        await self_critique(AsyncMock(), [_comment()])
+
+        prompt = captured["prompt"]
+        assert "`speculative`" in prompt
+        assert "library, database, or framework" in prompt
+        evidence = captured["tools"][0]["function"]["parameters"]["properties"]["verdicts"][
+            "items"
+        ]["properties"]["evidence"]
+        assert "speculative" in evidence["enum"]

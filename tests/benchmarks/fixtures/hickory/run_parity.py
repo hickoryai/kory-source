@@ -4,6 +4,8 @@
 Subcommands (the rerun interface HAI-11608 depends on; keep it stable):
 
     plan     units, call estimate, and seat budget. No network, no model.
+    preflight  one tiny completion per requested reviewer and judge model;
+             fails unless each reports exactly the requested model.
     run      review, judge, write <out>.json (artifact) and <out>.md (report).
     rescore  rebuild the report from a stored artifact. No network, no model.
     export   write a manifest for a merged-PR window from GitHub.
@@ -26,6 +28,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -46,8 +49,18 @@ RERUN = (
     "uv run python tests/benchmarks/fixtures/hickory/run_parity.py run "
     "--manifest {manifest} --split {split} --runs {runs} --arms {arms} "
     "--reviewer-model {reviewer} --judge-provider {judge_provider} --judge-model {judge} "
-    "--seed {seed} --seat-budget {budget} --out {out}"
+    "--seed {seed} --seat-budget {budget}{calls}{review_timeout}{conversations} --out {out}"
 )
+# The relay's own default per-completion cap. A longer reviewer timeout needs a
+# loopback relay started with a cap at least that long.
+RELAY_DEFAULT_CAP_SECONDS = 900
+RELAY_CAP_ENV = "KORY_COMPLETION_TIMEOUT_CAP_SECONDS"
+RELAY_CAP_LIMIT_SECONDS = 3600
+PREFLIGHT_PROMPT = (
+    "Preflight check for a benchmark run. Reply with exactly this JSON object and "
+    'nothing else: {"preflight": "ok"}'
+)
+PREFLIGHT_FAILED = 6
 
 
 def _sha256(path: Path) -> str:
@@ -78,6 +91,14 @@ def _review_calls_per_unit() -> float:
         return 3.5
 
 
+def _per_review(args: argparse.Namespace) -> tuple[float, str]:
+    measured = float(getattr(args, "calls_per_review", 0) or 0)
+    if measured > 0:
+        return measured, f"{measured:.2f} seat calls per review from --calls-per-review"
+    per_review = _review_calls_per_unit()
+    return per_review, f"{per_review:.2f} seat calls per review from {PRIOR_SEAT_RUN.name}"
+
+
 def _plan(args: argparse.Namespace) -> dict:
     from benchmarks.parity_snapshot import load_units
 
@@ -92,7 +113,7 @@ def _plan(args: argparse.Namespace) -> dict:
     scored = [u for u in units if u.greptile_reviewed]
     arms = args.arms.split(",")
     reviews = len(scored) * args.runs * len(arms)
-    per_review = _review_calls_per_unit()
+    per_review, basis = _per_review(args)
     return {
         "manifest": str(args.manifest),
         "manifest_sha256": _sha256(Path(args.manifest)),
@@ -107,7 +128,7 @@ def _plan(args: argparse.Namespace) -> dict:
         "reviews": reviews,
         "judge_calls": reviews,
         "estimated_seat_sessions": round(reviews * per_review + reviews),
-        "estimate_basis": f"{per_review:.2f} seat calls per review from {PRIOR_SEAT_RUN.name}, plus 1 judge call",
+        "estimate_basis": f"{basis}, plus 1 judge call",
         "unit_ids": [u.unit_id for u in units],
     }
 
@@ -136,7 +157,39 @@ def _start_loopback(token: str) -> tuple[subprocess.Popen | None, object | None]
     return proc, log
 
 
-def _llm(provider: str, model: str, url: str, token: str, priority: str):
+def _relay_cap_seconds() -> int:
+    """The cap the loopback relay will apply, parsed exactly as the relay parses it.
+
+    A positive integer without sign or leading zero, clamped to 3600; anything
+    else leaves the relay at its 900 s default.
+    """
+    raw = os.environ.get(RELAY_CAP_ENV, "").strip()
+    if not re.fullmatch(r"[1-9][0-9]*", raw):
+        return RELAY_DEFAULT_CAP_SECONDS
+    return min(int(raw), RELAY_CAP_LIMIT_SECONDS)
+
+
+def _check_review_timeout(seconds: int) -> None:
+    """Refuse a reviewer timeout the loopback relay would silently cut short."""
+    if seconds <= 0:
+        raise SystemExit("--review-timeout-seconds must be positive")
+    cap = _relay_cap_seconds()
+    if seconds > cap:
+        raise SystemExit(
+            f"--review-timeout-seconds {seconds} exceeds the loopback relay cap {cap}s; "
+            f"start it with {RELAY_CAP_ENV}>={seconds} (a relay that reads it), or lower the timeout"
+        )
+
+
+def _llm(
+    provider: str,
+    model: str,
+    url: str,
+    token: str,
+    priority: str,
+    timeout_seconds: int = RELAY_DEFAULT_CAP_SECONDS,
+    conversations: bool = False,
+):
     from mira.config import LLMConfig
 
     if provider in ("codex-cli", "codex"):
@@ -153,8 +206,128 @@ def _llm(provider: str, model: str, url: str, token: str, priority: str):
         router_acp_token=token,
         router_acp_priority=priority,
         router_acp_max_retries=2,
+        router_acp_timeout_seconds=timeout_seconds,
+        router_acp_conversations=conversations,
         temperature=0.0,
     )
+
+
+async def _preflight_one(role: str, cfg, provider: object) -> dict:
+    """One tiny pinned completion; the requested and reported model must match."""
+    from mira.exceptions import LLMError
+    from mira.llm.router_acp import call_observer
+
+    requested = cfg.model
+    seen: list[dict] = []
+    token = call_observer.set(seen.append)
+    state, detail = "ok", ""
+    try:
+        reply = await provider.complete([{"role": "user", "content": PREFLIGHT_PROMPT}])
+        if json.loads(reply) != {"preflight": "ok"}:
+            state, detail = "wrong_reply", reply[:200]
+    except LLMError as exc:
+        state, detail = exc.code, str(exc)[:300]
+    finally:
+        call_observer.reset(token)
+    transport = [e for e in seen if e.get("state") != "bad_response"]
+    reported = str((transport[-1] if transport else {}).get("actual_model") or "unknown")
+    if state == "ok" and reported != requested:
+        state = "model_mismatch"
+    return {
+        "role": role,
+        "requested_model": requested,
+        "reported_model": reported,
+        "state": state,
+        "detail": detail,
+        "calls": len(transport),
+    }
+
+
+def _preflight(reviewer_cfg, judge_cfg) -> list[dict]:
+    """Reviewer and judge each answer one tiny prompt before any review runs.
+
+    The judge goes through the same provider class the run uses. Nothing is
+    retried or substituted: a judge or reviewer that does not report exactly the
+    requested model fails the preflight.
+    """
+    from benchmarks.parity_runner import make_judge_llm
+    from mira.llm.router_acp import RouterAcpProvider
+
+    async def _all() -> list[dict]:
+        checks = [await _preflight_one("reviewer", reviewer_cfg, RouterAcpProvider(reviewer_cfg))]
+        if reviewer_cfg.router_acp_conversations:
+            checks.append(
+                await _conversations_check(RouterAcpProvider(reviewer_cfg), reviewer_cfg.model)
+            )
+        if judge_cfg.provider in {"router-acp", "router_acp"}:
+            checks.append(await _preflight_one("judge", judge_cfg, make_judge_llm(judge_cfg)))
+        else:
+            checks.append(
+                {
+                    "role": "judge",
+                    "requested_model": judge_cfg.model,
+                    "reported_model": "not checked",
+                    "state": f"not_router_acp:{judge_cfg.provider}",
+                    "detail": "",
+                    "calls": 0,
+                }
+            )
+        return checks
+
+    return asyncio.run(_all())
+
+
+async def _conversations_check(provider, requested: str) -> dict:
+    """The relay must keep sessions before any reviewer sends only a delta.
+
+    A close probe (no seat), then two tiny turns on one fresh session: the
+    relay must report ``conversation.opened`` true, then false, each from the
+    pinned model. Two seat calls.
+    """
+    from mira.llm.router_acp import call_observer
+
+    seen: list[dict] = []
+    token = call_observer.set(seen.append)
+    state, detail = "ok", ""
+    try:
+        if not await provider.probe_conversations():
+            state, detail = "conversations_unsupported", "close probe did not answer state closed"
+        else:
+            replies = await provider.check_conversation(PREFLIGHT_PROMPT)
+            if any(
+                json.loads(provider._extract_json_object(r)) != {"preflight": "ok"} for r in replies
+            ):
+                state, detail = "wrong_reply", " | ".join(r[:100] for r in replies)
+    except Exception as exc:
+        state = str(getattr(exc, "code", "") or "conversations_unsupported")
+        detail = str(exc)[:300]
+    finally:
+        call_observer.reset(token)
+    transport = [e for e in seen if e.get("state") != "bad_response"]
+    reported = sorted({str(e.get("actual_model") or "unknown") for e in transport}) or ["unknown"]
+    if state == "ok" and reported != [requested]:
+        state = "model_mismatch"
+    return {
+        "role": "conversations",
+        "requested_model": requested,
+        "reported_model": ",".join(reported),
+        "state": state,
+        "detail": detail,
+        "calls": len(transport),
+    }
+
+
+def _preflight_ok(checks: list[dict]) -> bool:
+    return all(c["state"] == "ok" or c["state"].startswith("not_router_acp") for c in checks)
+
+
+def _print_preflight(checks: list[dict]) -> None:
+    for c in checks:
+        print(
+            f"preflight {c['role']}: requested {c['requested_model']} reported "
+            f"{c['reported_model']} state {c['state']} {c['detail']}".rstrip(),
+            file=sys.stderr,
+        )
 
 
 def _write(out: Path, artifact: dict) -> None:
@@ -180,6 +353,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         raise SystemExit("GITHUB_TOKEN is required; export it only for this process")
     if not args.judge_model or args.judge_model in ("auto", "default"):
         raise SystemExit("--judge-model must pin one model so verdicts are reproducible")
+    _check_review_timeout(args.review_timeout_seconds)
     registry_sha = _isolate_index(args.registry_db)
     plan = _plan(args)
     if args.seat_budget and plan["estimated_seat_sessions"] > args.seat_budget:
@@ -204,9 +378,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         for u in load_units(json.loads(Path(args.manifest).read_text()), args.split)
         if u.unit_id in set(plan["unit_ids"])
     ]
+    # Only reviewer calls get the longer timeout; the judge keeps the relay default.
+    reviewer_llm = _llm(
+        "router-acp",
+        args.reviewer_model,
+        url,
+        token,
+        "review",
+        args.review_timeout_seconds,
+        conversations=args.conversations,
+    )
+    # The judge stays one-shot: each verdict is independent.
+    judge_llm = _llm(args.judge_provider, args.judge_model, url, token, "review")
     cfg = ParityConfig(
-        reviewer_llm=_llm("router-acp", args.reviewer_model, url, token, "review"),
-        judge_llm=_llm(args.judge_provider, args.judge_model, url, token, "review"),
+        reviewer_llm=reviewer_llm,
+        judge_llm=judge_llm,
         runs=args.runs,
         arms=tuple(args.arms.split(",")),
         seed=args.seed,
@@ -223,6 +409,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True
         ).stdout.strip(),
         "traced": bool(os.environ.get("LLM_OTLP_ENDPOINT")),
+        "review_timeout_seconds": args.review_timeout_seconds,
+        "reviewer_conversations": args.conversations,
+        "judge_timeout_seconds": judge_llm.router_acp_timeout_seconds,
+        "relay_cap_seconds": _relay_cap_seconds(),
         "rerun_command": RERUN.format(
             manifest=args.manifest,
             split=args.split,
@@ -233,11 +423,27 @@ def cmd_run(args: argparse.Namespace) -> int:
             judge=args.judge_model,
             seed=args.seed,
             budget=args.seat_budget,
+            calls=f" --calls-per-review {args.calls_per_review}" if args.calls_per_review else "",
+            review_timeout=(
+                f" --review-timeout-seconds {args.review_timeout_seconds}"
+                if args.review_timeout_seconds != RELAY_DEFAULT_CAP_SECONDS
+                else ""
+            ),
+            conversations=" --conversations" if args.conversations else "",
             out=args.out,
         ),
     }
     proc, log = _start_loopback(token)
     try:
+        checks = _preflight(reviewer_llm, judge_llm)
+        _print_preflight(checks)
+        inputs["preflight"] = checks
+        if not _preflight_ok(checks):
+            out = Path(args.out).with_suffix(".preflight.json")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(checks, indent=1) + "\n")
+            print(f"preflight failed; no review ran. Details: {out}", file=sys.stderr)
+            return PREFLIGHT_FAILED
         artifact = asyncio.run(run_parity(units, cfg, os.environ["GITHUB_TOKEN"], inputs=inputs))
     finally:
         if proc is not None:
@@ -249,7 +455,45 @@ def cmd_run(args: argparse.Namespace) -> int:
         if log is not None:
             log.close()
     _write(Path(args.out), artifact)
+    fatal = (artifact.get("seat_meter") or {}).get("fatal")
+    if fatal:
+        print(f"run stopped, not scorable: {fatal}", file=sys.stderr)
+        return 5
     return 0
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    if not args.judge_model or args.judge_model in ("auto", "default"):
+        raise SystemExit("--judge-model must pin one model so verdicts are reproducible")
+    _check_review_timeout(args.review_timeout_seconds)
+    _isolate_index("")
+    if not os.environ.get("LLM_OTLP_ENDPOINT"):
+        os.environ["MIRA_ROUTER_ACP_ALLOW_UNTRACED"] = "1"
+    url = os.environ.get("MIRA_ROUTER_ACP_URL", f"http://127.0.0.1:{LOOPBACK_PORT}")
+    if ":8790" in url:
+        raise SystemExit("refusing the serving relay port; use the loopback entry")
+    token = os.environ.get("MIRA_ROUTER_ACP_TOKEN") or os.urandom(16).hex()
+    proc, log = _start_loopback(token)
+    try:
+        checks = _preflight(
+            _llm(
+                "router-acp", args.reviewer_model, url, token, "review", args.review_timeout_seconds
+            ),
+            _llm(args.judge_provider, args.judge_model, url, token, "review"),
+        )
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if log is not None:
+            log.close()
+    print(json.dumps(checks, indent=1))
+    if args.out:
+        Path(args.out).write_text(json.dumps(checks, indent=1) + "\n")
+    return 0 if _preflight_ok(checks) else PREFLIGHT_FAILED
 
 
 def cmd_rescore(args: argparse.Namespace) -> int:
@@ -297,6 +541,22 @@ def _selection(p: argparse.ArgumentParser) -> None:
     p.add_argument("--arms", default="registry_on,registry_off")
     p.add_argument("--limit", type=int, default=0, help="first N units only (smoke)")
     p.add_argument("--only", default="", help="unit id or PR URL substrings, comma = OR")
+    p.add_argument(
+        "--calls-per-review",
+        type=float,
+        default=0.0,
+        help="measured seat calls per review for the estimate (default: the prior seat run)",
+    )
+
+
+def _review_timeout(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--review-timeout-seconds",
+        type=int,
+        default=RELAY_DEFAULT_CAP_SECONDS,
+        help=f"per-completion timeout for reviewer calls only; above "
+        f"{RELAY_DEFAULT_CAP_SECONDS} needs {RELAY_CAP_ENV} on the loopback relay",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -309,11 +569,26 @@ def main(argv: list[str] | None = None) -> int:
     _selection(plan)
     plan.set_defaults(fn=cmd_plan)
 
+    pre = sub.add_parser("preflight")
+    pre.add_argument("--reviewer-model", default="auto")
+    pre.add_argument("--judge-provider", default="router-acp", choices=["router-acp", "codex-cli"])
+    pre.add_argument("--judge-model", default="")
+    pre.add_argument("--out", default="", help="also write the checks as JSON here")
+    _review_timeout(pre)
+    pre.set_defaults(fn=cmd_preflight)
+
     run = sub.add_parser("run")
     _selection(run)
     run.add_argument("--reviewer-model", default="auto")
     run.add_argument("--judge-provider", default="router-acp", choices=["router-acp", "codex-cli"])
     run.add_argument("--judge-model", default="")
+    _review_timeout(run)
+    run.add_argument(
+        "--conversations",
+        action="store_true",
+        help="reviewer agentic steps reuse one kept relay session per transcript "
+        "(needs a relay with conversation_id; preflight checks it)",
+    )
     run.add_argument("--allow-same-family-judge", action="store_true")
     run.add_argument("--seed", type=int, default=11607)
     run.add_argument("--concurrency", type=int, default=2)

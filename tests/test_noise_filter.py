@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from mira.config import FilterConfig
-from mira.core.noise_filter import _is_duplicate, _jaccard_similarity, filter_noise
+from mira.core.noise_filter import (
+    _is_duplicate,
+    _jaccard_similarity,
+    drop_test_coverage_requests,
+    filter_noise,
+)
 from mira.models import ReviewComment, Severity
 
 
@@ -373,3 +378,35 @@ class TestCategoryConfidenceThresholds:
         )
         comments = [_make_comment(category="bug", confidence=0.6, line=1)]
         assert filter_noise(comments, config) == []
+
+
+class TestTestCoverageRequests:
+    def test_drops_prompt_title_any_case_or_spacing(self):
+        comments = [
+            _make_comment(title="Missing test coverage", category="maintainability"),
+            _make_comment(title="  missing  TEST coverage. ", line=2),
+            _make_comment(title="Missing_test_coverage", line=3),
+        ]
+        assert drop_test_coverage_requests(comments) == []
+
+    def test_keeps_defects_in_tests_and_other_findings(self):
+        comments = [
+            _make_comment(title="Survey test never sends a sales survey"),
+            _make_comment(title="Tenant cache stays warm after DB tests", line=2),
+            _make_comment(title="Missing test coverage for the null branch crashes", line=3),
+            _make_comment(title="Null id crashes the release", line=4),
+        ]
+        assert drop_test_coverage_requests(comments) == comments
+
+    def test_drop_is_on_by_default(self):
+        assert FilterConfig().drop_test_coverage_requests is True
+
+    def test_filter_noise_applies_drop_unless_disabled(self):
+        coverage = _make_comment(title="Missing test coverage", confidence=0.9)
+        bug = _make_comment(title="Null id crashes", line=5, confidence=0.9)
+        assert filter_noise([coverage, bug], FilterConfig()) == [bug]
+        keep = FilterConfig(drop_test_coverage_requests=False)
+        assert {c.title for c in filter_noise([coverage, bug], keep)} == {
+            coverage.title,
+            bug.title,
+        }

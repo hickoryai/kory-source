@@ -242,6 +242,55 @@ class TestReviewEngine:
         assert len(result.comments) == 0
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("drop", [True, False])
+    async def test_test_coverage_request_dropped_before_posting(
+        self, sample_diff_text: str, drop: bool
+    ):
+        llm = MagicMock(spec=LLMProvider)
+        llm.count_tokens = MagicMock(return_value=100)
+        llm.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        response = json.dumps(
+            {
+                "comments": [
+                    {
+                        "path": "src/utils.py",
+                        "line": 1,
+                        "severity": "warning",
+                        "category": "maintainability",
+                        "title": "Missing test coverage",
+                        "body": "The new helper has no tests.",
+                        "confidence": 0.9,
+                    },
+                    {
+                        "path": "src/utils.py",
+                        "line": 3,
+                        "severity": "warning",
+                        "category": "bug",
+                        "title": "Empty input divides by zero",
+                        "body": "len(items) can be 0.",
+                        "confidence": 0.9,
+                    },
+                ],
+                "summary": "s",
+                "metadata": {"reviewed_files": 1},
+            }
+        )
+        llm.review = AsyncMock(return_value=response)
+        llm.walkthrough = AsyncMock(return_value=_WALKTHROUGH_LLM_RESPONSE)
+        llm.complete = AsyncMock(return_value=response)
+
+        config = MiraConfig()
+        config.review.self_critique = False
+        config.filter.drop_test_coverage_requests = drop
+        result = await ReviewEngine(config=config, llm=llm).review_diff(sample_diff_text)
+
+        titles = {c.title for c in result.comments}
+        assert "Empty input divides by zero" in titles
+        assert ("Missing test coverage" in titles) is not drop
+        dropped = [e["title"] for e in result.audit if e.get("stage") == "noise_filter"]
+        assert ("Missing test coverage" in dropped) is drop
+
+    @pytest.mark.asyncio
     async def test_diff_files_passed_to_convert(self, mock_llm: LLMProvider, sample_diff_text: str):
         """Fix 1: convert_to_review_comments receives diff_files for existing_code validation."""
         engine = ReviewEngine(config=MiraConfig(), llm=mock_llm)

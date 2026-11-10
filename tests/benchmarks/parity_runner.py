@@ -14,16 +14,24 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import dataclasses
+import enum
 import hashlib
+import json
+import logging
+import math
+import os
 import statistics
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from mira.config import FilterConfig, LLMConfig, MiraConfig, ReviewConfig
 from mira.core.engine import ReviewEngine
+from mira.llm.router_acp import UNPINNED_MODELS, RouterTransportError
 
 from .parity_judge import GREPTILE, KORY, judge_unit, rescore_unit
 from .parity_snapshot import (
@@ -43,7 +51,13 @@ from .parity_stats import (
     totals,
 )
 
+logger = logging.getLogger(__name__)
+
 SCHEMA_VERSION = 1
+# Reviewer inputs changed in HAI-12817: reads pinned to the snapshot, fixture
+# title, no live description, no registry search. Scores from artifacts
+# without this marker came from a different harness; do not compare directly.
+HARNESS = "hai-12817-pinned-reads"
 ARMS = ("registry_on", "registry_off")
 
 _as_of: contextvars.ContextVar[float | None] = contextvars.ContextVar("parity_as_of", default=None)
@@ -65,6 +79,13 @@ class ParityConfig:
     allow_same_family_judge: bool = False
     rule: dict = field(default_factory=lambda: dict(DEFAULT_RULE))
     seat_budget: int = 0
+    # Opt-in raw capture (HAI-12817). Empty = off, and the artifact is unchanged.
+    capture_path: str = field(default_factory=lambda: os.environ.get(CAPTURE_ENV, ""))
+    # Diagnostic studies only (HAI-12817). Defaults keep the ordinary parity run.
+    # skip_posted_judge: no posted-comment judge call; the artifact cannot be scored.
+    # ordered: review units one at a time, in the order given.
+    skip_posted_judge: bool = False
+    ordered: bool = False
 
 
 class SeatBudgetExhausted(RuntimeError):
@@ -82,10 +103,13 @@ class SeatMeter:
         self.budget = budget
         self.used = 0
         self.refused = 0
+        # First pinned request served by another model. A fallback reply is not
+        # evidence for the pinned reviewer, so it stops the whole run.
+        self.fatal = ""
 
     @property
     def exhausted(self) -> bool:
-        return bool(self.budget) and self.used >= self.budget
+        return bool(self.fatal) or (bool(self.budget) and self.used >= self.budget)
 
     def guard(self, llm: Any) -> Any:
         inner = getattr(llm, "_transport", None)
@@ -95,9 +119,31 @@ class SeatMeter:
         async def _metered(request: dict[str, Any]) -> dict[str, Any]:
             if self.exhausted:
                 self.refused += 1
+                if self.fatal:
+                    raise SeatBudgetExhausted(f"run_stopped: {self.fatal}")
                 raise SeatBudgetExhausted(f"seat_budget_exhausted: {self.used}/{self.budget} used")
             self.used += 1
-            return await inner(request)
+            requested = str(((request.get("body") or {}).get("model")) or "")
+            try:
+                payload = await inner(request)
+            except RouterTransportError as exc:
+                # The relay refused a pinned request another model answered. That
+                # is the same fallback as a 200 reply from the wrong model.
+                actual = str((exc.body or {}).get("actual_model") or "unknown")
+                if exc.kind == "model_mismatch" and not self.fatal:
+                    self.fatal = f"pinned model {requested} served by {actual}"
+                raise
+            actual = (
+                str((payload or {}).get("actual_model") or "") if isinstance(payload, dict) else ""
+            )
+            if (
+                requested not in UNPINNED_MODELS
+                and actual
+                and actual != requested
+                and not self.fatal
+            ):
+                self.fatal = f"pinned model {requested} served by {actual}"
+            return payload
 
         llm._transport = _metered
         return llm
@@ -108,7 +154,232 @@ class SeatMeter:
             "used": self.used,
             "refused": self.refused,
             "exhausted": self.exhausted or self.refused > 0,
+            "fatal": self.fatal,
         }
+
+
+CAPTURE_SCHEMA = "hai-12817-capture-v1"
+CAPTURE_ENV = "KORY_PARITY_CAPTURE_PATH"
+# Engine stages whose model calls the capture labels. Each wrapper only sets
+# the label and delegates; arguments, return values and call order are untouched.
+_CAPTURE_STAGES = {
+    "agentic_review_loop": "agentic_review",
+    "security_review_pass": "security",
+    "dependency_review_pass": "dependency",
+    "generate_pr_summary": "pr_summary",
+    "regenerate_summary": "summary",
+}
+_capture_stage: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "parity_capture_stage", default="review"
+)
+_capture_sink: contextvars.ContextVar[CaptureSink | None] = contextvars.ContextVar(
+    "parity_capture_sink", default=None
+)
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, enum.Enum):
+        return value.name
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.asdict(value)
+    return repr(value)
+
+
+def _named(value: Any) -> Any:
+    # IntEnum (Severity) would otherwise serialize as a bare number.
+    if isinstance(value, enum.Enum):
+        return value.name
+    if isinstance(value, dict):
+        return {k: _named(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_named(v) for v in value]
+    return value
+
+
+def _comment_record(comment: Any) -> dict:
+    if dataclasses.is_dataclass(comment) and not isinstance(comment, type):
+        fields = {f.name: getattr(comment, f.name) for f in dataclasses.fields(comment)}
+        return json.loads(json.dumps(_named(fields), default=_jsonable))
+    return {"repr": repr(comment)}
+
+
+def _current_attribution() -> str:
+    try:
+        from mira.llm.router_acp import attribution_key
+    except Exception:
+        return ""
+    return attribution_key.get()
+
+
+class CaptureSink:
+    """Append-only JSONL of everything the reviewer saw and said (HAI-12817).
+
+    Holds private source code, so the file is created owner-only (0600) in an
+    owner-only directory and never overwrites an existing file. Records carry
+    request bodies only: transport headers (the relay bearer token) are never
+    written. Scoring never reads this file.
+    """
+
+    def __init__(self, path: str) -> None:
+        target = Path(path)
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        self._fh = os.fdopen(fd, "w", encoding="utf-8")
+        self.path = str(target)
+        self.records = 0
+        self._digest = hashlib.sha256()
+
+    def write(self, kind: str, **fields: Any) -> None:
+        if self._fh.closed:
+            return
+        self.records += 1
+        record = {
+            "seq": self.records,
+            "kind": kind,
+            "attribution": _current_attribution(),
+            "stage": _capture_stage.get(),
+            **fields,
+        }
+        line = json.dumps(record, default=_jsonable, ensure_ascii=False) + "\n"
+        self._fh.write(line)
+        self._fh.flush()
+        self._digest.update(line.encode("utf-8"))
+
+    def close(self) -> None:
+        if not self._fh.closed:
+            self._fh.close()
+
+    def as_dict(self) -> dict:
+        return {
+            "schema": CAPTURE_SCHEMA,
+            "path": self.path,
+            "records": self.records,
+            "sha256": self._digest.hexdigest(),
+        }
+
+
+def capture_transport(llm: Any, sink: CaptureSink | None) -> Any:
+    """Record each seat request body and its reply or error, then pass it through."""
+    inner = getattr(llm, "_transport", None)
+    if sink is None or inner is None:
+        return llm
+
+    async def _captured(request: dict[str, Any]) -> dict[str, Any]:
+        body = dict(request.get("body") or {})
+        start = time.monotonic()
+        try:
+            payload = await inner(request)
+        except BaseException as exc:
+            sink.write(
+                "seat_call",
+                request=body,
+                error={
+                    "type": type(exc).__name__,
+                    "kind": str(getattr(exc, "kind", "") or ""),
+                    "detail": str(exc)[:2000],
+                    "body": getattr(exc, "body", None),
+                },
+                duration_s=round(time.monotonic() - start, 3),
+            )
+            raise
+        sink.write(
+            "seat_call",
+            request=body,
+            response=payload,
+            duration_s=round(time.monotonic() - start, 3),
+        )
+        return payload
+
+    llm._transport = _captured
+    return llm
+
+
+def _staged(stage: str, fn: Any) -> Any:
+    async def _wrapper(*args: Any, **kwargs: Any) -> Any:
+        token = _capture_stage.set(stage)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _capture_stage.reset(token)
+
+    _wrapper.__wrapped__ = fn  # type: ignore[attr-defined]
+    return _wrapper
+
+
+def install_capture(sink: CaptureSink) -> Any:
+    """Patch harness-visible engine hooks to record drafts, critique and tools.
+
+    Returns a function that restores every patched attribute.
+    """
+    import mira.core.engine as engine_module
+    from mira.llm.agentic_tools import AgenticToolExecutor
+
+    saved: list[tuple[Any, str, Any]] = []
+
+    def _patch(owner: Any, name: str, value: Any) -> None:
+        saved.append((owner, name, getattr(owner, name)))
+        setattr(owner, name, value)
+
+    for name, stage in _CAPTURE_STAGES.items():
+        _patch(engine_module, name, _staged(stage, getattr(engine_module, name)))
+
+    original_filter = engine_module.filter_noise
+
+    def _filter_noise(comments: list, *args: Any, **kwargs: Any) -> list:
+        kept = original_filter(comments, *args, **kwargs)
+        sink.write(
+            "noise_filter",
+            drafts=[_comment_record(c) for c in comments],
+            kept=[_comment_record(c) for c in kept],
+        )
+        return kept
+
+    _patch(engine_module, "filter_noise", _filter_noise)
+
+    original_critique = engine_module.self_critique
+
+    async def _self_critique(llm: Any, comments: list, *args: Any, **kwargs: Any) -> list:
+        token = _capture_stage.set("self_critique")
+        try:
+            sink.write(
+                "critique_input",
+                drafts=[_comment_record(c) for c in comments],
+                diff_paths=[getattr(f, "path", "") for f in kwargs.get("diff_files") or []],
+                learned_rules=list(kwargs.get("learned_rules") or []),
+                custom_rules=list(kwargs.get("custom_rules") or []),
+            )
+            kept = await original_critique(llm, comments, *args, **kwargs)
+            sink.write(
+                "critique_output",
+                kept_indices=[i for i, c in enumerate(comments) if any(c is k for k in kept)],
+            )
+            return kept
+        finally:
+            _capture_stage.reset(token)
+
+    _patch(engine_module, "self_critique", _self_critique)
+
+    original_execute = AgenticToolExecutor.execute
+
+    async def _execute(self: Any, name: str, args: dict) -> str:
+        result = await original_execute(self, name, args)
+        sink.write(
+            "tool_call",
+            executor=id(self),
+            tool=name,
+            args=dict(args or {}),
+            result=result,
+            answered_by="executor",
+        )
+        return result
+
+    _patch(AgenticToolExecutor, "execute", _execute)
+
+    def _restore() -> None:
+        for owner, name, value in reversed(saved):
+            setattr(owner, name, value)
+
+    return _restore
 
 
 EXCLUDED_STATE = "excluded_family"
@@ -219,6 +490,45 @@ async def _apply_registry_arm(
         custom_rules.insert(0, block)
 
 
+class _NoRegistrySearch:
+    """Reviewer tool executor for both arms: ``search_decisions`` finds nothing.
+
+    The A/B measures the prompt block. The live search has no as-of filter, so
+    in ``registry_on`` it could return decisions approved after Greptile's
+    review, and in ``registry_off`` it would leak the registry into the off arm.
+    Since HAI-12817 a router-acp seat can call tools, so the harness answers
+    the call itself. ``read_file`` and ``grep_repo`` go to the real executor.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    async def execute(self, name: str, args: dict) -> str:
+        from mira.registry.prompt import SEARCH_DECISIONS_TOOL
+
+        if name != SEARCH_DECISIONS_TOOL["function"]["name"]:
+            return await self._inner.execute(name, args)
+        self._inner.call_log.append({"tool": name, "arg": (args or {}).get("query") or ""})
+        sink = _capture_sink.get()
+        if sink is not None:
+            sink.write(
+                "tool_call",
+                executor=id(self._inner),
+                tool=name,
+                args=dict(args or {}),
+                result="[registry unavailable]",
+                answered_by="harness",
+            )
+        return "[registry unavailable]"
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _no_registry_search(executor: Any, pr_info: Any) -> Any:
+    return _NoRegistrySearch(executor)
+
+
 def install_arm(arm: str) -> None:
     import mira.core.engine as engine_module
     import mira.registry.prompt as registry_prompt
@@ -227,6 +537,7 @@ def install_arm(arm: str) -> None:
     registry_prompt.registry_rule = (
         _registry_rule_as_of if arm == "registry_on" else _registry_rule_off
     )
+    registry_prompt.with_registry_tool = _no_registry_search
 
 
 def _seat_calls(attribution: str) -> list[dict]:
@@ -285,6 +596,11 @@ def make_judge_llm(config: LLMConfig) -> Any:
     from mira.llm.router_acp import RouterAcpProvider
 
     class JudgeRouterProvider(RouterAcpProvider):
+        # The judge keeps the extraction and single attempt every earlier run used,
+        # so verdicts stay comparable. A judge parse failure stays a judge error.
+        strict_final_answer = False
+        repair_turns = 0
+
         def _messages_prompt(self, messages: list[dict]) -> str:
             return "\n".join([*_JUDGE_FRAME, *(str(m.get("content", "")) for m in messages)])
 
@@ -309,14 +625,29 @@ async def review_unit(
     start = time.monotonic()
     comments: list[dict] = []
     error = ""
+    # HAI-12817: where each draft went. Additive; scoring never reads these.
+    trail: dict[str, Any] = {
+        "audit": [],
+        "reviewed_paths": [],
+        "skipped_paths": [],
+        "skipped_reason": "",
+    }
+    llm: Any = None
     try:
+        llm = llm_factory(reviewer_cfg)
         engine = ReviewEngine(
             config=config,
-            llm=llm_factory(reviewer_cfg),
+            llm=llm,
             provider=provider_factory(github_token, unit),
             dry_run=True,
         )
         result = await engine.review_pr(unit.pr_url)
+        trail = {
+            "audit": list(getattr(result, "audit", None) or []),
+            "reviewed_paths": list(getattr(result, "reviewed_paths", None) or []),
+            "skipped_paths": list(getattr(result, "skipped_paths", None) or []),
+            "skipped_reason": getattr(result, "skipped_reason", None) or "",
+        }
         for c in result.comments:
             comments.append(
                 {
@@ -330,6 +661,13 @@ async def review_unit(
     except Exception as exc:
         error = str(exc)[:500]
     finally:
+        # Kept relay sessions end with the review, whether it finished or failed.
+        close = getattr(llm, "close_conversations", None)
+        if close is not None:
+            try:
+                await close(attribution)
+            except Exception as exc:
+                logger.warning("closing kept sessions for %s failed: %s", attribution, exc)
         _block_sink.reset(sink_token)
         _as_of.reset(as_of_token)
         _reset_attribution(token)
@@ -339,6 +677,7 @@ async def review_unit(
         "duration_s": round(time.monotonic() - start, 2),
         "registry_blocks": blocks,
         "seat_calls": _seat_calls(attribution),
+        **trail,
     }
 
 
@@ -378,8 +717,13 @@ async def run_parity(
     judge_llm_factory: Any = None,
     revert_finder: Any = find_reverts,
     inputs: dict | None = None,
+    meter: Any = None,
 ) -> dict:
-    """Run every arm and run. Returns the artifact (the caller writes it)."""
+    """Run every arm and run. Returns the artifact (the caller writes it).
+
+    ``meter``, when given, replaces the ``SeatMeter(cfg.seat_budget)`` cap. It must
+    offer ``guard(llm)``, ``exhausted`` and ``as_dict()``.
+    """
     reviewer_family = model_family(cfg.reviewer_llm.model)
     judge_family = model_family(cfg.judge_llm.model)
     if (
@@ -392,6 +736,56 @@ async def run_parity(
             f"{judge_family}; pick another judge or pass --allow-same-family-judge"
         )
 
+    sink = CaptureSink(cfg.capture_path) if cfg.capture_path else None
+    restore = install_capture(sink) if sink is not None else None
+    sink_token = _capture_sink.set(sink)
+    try:
+        if sink is not None:
+            sink.write(
+                "header",
+                schema=CAPTURE_SCHEMA,
+                harness=HARNESS,
+                reviewer_model=cfg.reviewer_llm.model,
+                arms=list(cfg.arms),
+                runs=cfg.runs,
+                seed=cfg.seed,
+                units=[u.unit_id for u in units if u.greptile_reviewed],
+            )
+        artifact = await _run_arms(
+            units,
+            cfg,
+            github_token,
+            provider_factory=provider_factory,
+            llm_factory=llm_factory,
+            judge_llm_factory=judge_llm_factory,
+            revert_finder=revert_finder,
+            inputs=inputs,
+            meter=meter,
+        )
+    finally:
+        _capture_sink.reset(sink_token)
+        if restore is not None:
+            restore()
+        if sink is not None:
+            sink.close()
+    if sink is not None:
+        artifact["capture"] = sink.as_dict()
+    return artifact
+
+
+async def _run_arms(
+    units: list[Unit],
+    cfg: ParityConfig,
+    github_token: str,
+    *,
+    provider_factory: Any,
+    llm_factory: Any,
+    judge_llm_factory: Any,
+    revert_finder: Any,
+    inputs: dict | None,
+    meter: Any = None,
+) -> dict:
+    judge_family = model_family(cfg.judge_llm.model)
     scored = [u for u in units if u.greptile_reviewed]
     semaphore = asyncio.Semaphore(cfg.concurrency)
 
@@ -411,12 +805,13 @@ async def run_parity(
         except Exception as exc:
             reverts[pr_url] = f"error: {str(exc)[:200]}"
 
-    meter = SeatMeter(cfg.seat_budget)
+    meter = meter if meter is not None else SeatMeter(cfg.seat_budget)
     # The judge never scores its own family: reviewer replies from it are refused.
     excluded = set() if cfg.allow_same_family_judge else {judge_family}
 
     def metered_factory(config: LLMConfig) -> Any:
-        return meter.guard(exclude_reviewer_families(llm_factory(config), excluded))
+        llm = capture_transport(llm_factory(config), _capture_sink.get())
+        return meter.guard(exclude_reviewer_families(llm, excluded))
 
     if judge_llm_factory is None:
         judge_llm_factory = make_judge_llm if llm_factory is make_llm else llm_factory
@@ -430,6 +825,21 @@ async def run_parity(
             review = await review_unit(
                 u, arm, run, cfg.reviewer_llm, github_token, provider_factory, metered_factory
             )
+            if cfg.skip_posted_judge:
+                return {
+                    "unit_id": u.unit_id,
+                    "pr_url": u.pr_url,
+                    "arm": arm,
+                    "run": run,
+                    "review": review,
+                    "judge": {
+                        "skipped": True,
+                        "pool": [],
+                        "parsed": {},
+                        "error": "",
+                        "seat_calls": [],
+                    },
+                }
             label = f"{arm}|r{run}"
             attribution = f"judge|{arm}|r{run}|{u.unit_id}"
             token = _set_attribution(attribution)
@@ -461,7 +871,10 @@ async def run_parity(
     for arm in cfg.arms:
         install_arm(arm)
         for run in range(1, cfg.runs + 1):
-            done = await asyncio.gather(*(_one(u, arm, run) for u in scored))
+            if cfg.ordered:
+                done = [await _one(u, arm, run) for u in scored]
+            else:
+                done = await asyncio.gather(*(_one(u, arm, run) for u in scored))
             records.extend(r for r in done if r is not None)
 
     # Cross-check every flagged location against the merged PR, once per unit.
@@ -495,6 +908,9 @@ async def run_parity(
             "rule": cfg.rule,
         },
         "seat_meter": meter.as_dict(),
+        "harness": HARNESS,
+        **({"posted_judge_skipped": True} if cfg.skip_posted_judge else {}),
+        **({"ordered": True} if cfg.ordered else {}),
         "units": [u.as_dict() for u in units],
         "snapshots": {
             uid: {
@@ -551,13 +967,108 @@ def _seat_usage(records: list[dict]) -> dict:
                 1 for c in calls if c.get("state") not in (None, "ok", "success", "completed")
             ),
             "actual_models": dict(Counter(str(c.get("actual_model") or "unknown") for c in calls)),
+            # Replies the provider could not use (plans, prose, invalid JSON), and
+            # the transport calls spent on the one repair turn after a final answer.
+            "unusable_replies": sum(1 for c in calls if c.get("state") == "bad_response"),
+            "repair_calls": sum(
+                1 for c in calls if c.get("turn") == "repair" and c.get("state") != "bad_response"
+            ),
+            # Kept turns the relay answered on a fresh session: discarded, resent whole.
+            "reopened_lost": sum(1 for c in calls if c.get("session") == "reopened_lost"),
+            # Agentic steps on a kept relay session: "new" opened it, "kept" reused it.
+            "conversation_turns": dict(
+                Counter(
+                    str(c["conversation"])
+                    for c in calls
+                    if c.get("conversation") and c.get("state") != "bad_response"
+                )
+            ),
         }
 
-    return {"review": _block(review_calls), "judge": _block(judge_calls)}
+    return {
+        "review": _block(review_calls),
+        "judge": _block(judge_calls),
+        "latency": _latency(records),
+    }
+
+
+def _spread(values: list[float]) -> dict:
+    """n, mean, median and nearest-rank p90 of ``values`` (seconds)."""
+    if not values:
+        return {"n": 0, "mean": None, "median": None, "p90": None}
+    ordered = sorted(values)
+    p90 = ordered[max(0, math.ceil(0.9 * len(ordered)) - 1)]
+    return {
+        "n": len(ordered),
+        "mean": round(statistics.fmean(ordered), 1),
+        "median": round(statistics.median(ordered), 1),
+        "p90": round(p90, 1),
+    }
+
+
+def _latency(records: list[dict]) -> dict:
+    """Where review time goes: per transport call, and per review that ran."""
+    calls = [
+        float(c["wall_s"])
+        for r in records
+        for c in r["review"]["seat_calls"]
+        if isinstance(c.get("wall_s"), (int, float))
+    ]
+    reviews = [r["review"] for r in records if not r["review"].get("error")]
+    durations = [
+        float(v["duration_s"]) for v in reviews if isinstance(v.get("duration_s"), (int, float))
+    ]
+    # Transport calls only: a bad_response entry is the parse verdict on the call before it.
+    per_review = [
+        float(sum(1 for c in v["seat_calls"] if c.get("state") != "bad_response")) for v in reviews
+    ]
+    return {
+        "review_call_wall_s": _spread(calls),
+        "review_duration_s": _spread(durations),
+        "review_calls_per_review": _spread(per_review),
+    }
+
+
+def _pipeline(arm_rows: list[dict]) -> dict:
+    """Drafts, drops by stage, and reviewer tool calls. Informational only."""
+    drafted = 0
+    dropped: Counter = Counter()
+    tools: Counter = Counter()
+    grades: Counter = Counter()
+    with_tools = 0
+    for r in arm_rows:
+        review = r["rec"]["review"]
+        used = False
+        for entry in review.get("audit") or []:
+            stage = entry.get("stage")
+            if stage == "drafted":
+                drafted += int(entry.get("count") or 0)
+            elif stage == "agentic":
+                calls = entry.get("calls") or []
+                tools.update(str(c.get("tool")) for c in calls)
+                used = used or bool(calls)
+            elif stage == "self_critique_grades":
+                grades.update({str(k): int(v) for k, v in (entry.get("counts") or {}).items()})
+            elif "path" in entry:
+                dropped[str(stage)] += 1
+        with_tools += int(used)
+    return {
+        "reviews_with_audit": sum(1 for r in arm_rows if "audit" in r["rec"]["review"]),
+        "drafted": drafted,
+        "dropped_by_stage": dict(dropped),
+        "critique_grades": dict(grades),
+        "tool_calls": dict(tools),
+        "reviews_using_tools": with_tools,
+        "skipped_paths": sum(len(r["rec"]["review"].get("skipped_paths") or []) for r in arm_rows),
+    }
 
 
 def summarize(artifact: dict) -> dict:
     """The full report, computed only from the artifact."""
+    if artifact.get("posted_judge_skipped"):
+        raise ValueError(
+            "diagnostic capture: the posted-comment judge was skipped; not a parity artifact"
+        )
     cfg = artifact["config"]
     rule = cfg.get("rule") or DEFAULT_RULE
     rows = _unit_rows(artifact["records"])
@@ -663,9 +1174,11 @@ def summarize(artifact: dict) -> dict:
                     if arm_rows
                     else 0.0
                 ),
-                budget_exhausted=bool(meter.get("exhausted")),
+                # A pin stop also sets "exhausted"; it is reported as the stop, not the cap.
+                budget_exhausted=bool(meter.get("exhausted")) and not meter.get("fatal"),
             ),
             "per_unit": per_unit,
+            "pipeline": _pipeline(arm_rows),
         }
 
     ab = None
@@ -686,6 +1199,7 @@ def summarize(artifact: dict) -> dict:
     missing = [u["unit_id"] for u in units if not u["greptile_reviewed"]]
     return {
         "ticket": "HAI-11607",
+        "harness": artifact.get("harness", ""),
         "inputs": artifact.get("inputs", {}),
         "judge": {
             "config": cfg["judge_llm"],
@@ -708,7 +1222,13 @@ def summarize(artifact: dict) -> dict:
         "arms": arms,
         "registry_ab": ab,
         "shipped_arm": shipped,
-        "parity_verdict": arms[shipped]["parity"]["verdict"] if shipped in arms else "inconclusive",
+        "parity_verdict": (
+            "invalid"
+            if meter.get("fatal")
+            else arms[shipped]["parity"]["verdict"]
+            if shipped in arms
+            else "inconclusive"
+        ),
     }
 
 
@@ -744,6 +1264,17 @@ def render_markdown(summary: dict) -> str:
             f"- Git: `{inputs.get('git_sha')}`. Shuffle seed: {summary['judge'].get('seed')}.",
             f"- Command: `{inputs.get('rerun_command')}`",
         ]
+        if inputs.get("review_timeout_seconds"):
+            lines.append(
+                f"- Completion timeouts: reviewer {inputs.get('review_timeout_seconds')} s, "
+                f"judge {inputs.get('judge_timeout_seconds')} s; loopback relay cap "
+                f"{inputs.get('relay_cap_seconds')} s."
+            )
+        for check in inputs.get("preflight") or []:
+            lines.append(
+                f"- Preflight {check.get('role')}: requested `{check.get('requested_model')}`, "
+                f"reported `{check.get('reported_model')}`, state {check.get('state')}."
+            )
     judge = summary["judge"]
     lines += [
         "",
@@ -752,7 +1283,7 @@ def render_markdown(summary: dict) -> str:
         f"- Reviewer: actual models {summary['seat_usage']['review']['actual_models']}; families {judge['reviewer_families']}.",
         f"- Judge: requested `{(judge.get('config') or {}).get('model')}`; actual models {summary['seat_usage']['judge']['actual_models']}; families {judge['families']}.",
         f"- Reviewer/judge family overlap: {judge.get('family_overlap') or 'none'}. Judge is blind: {judge.get('blind')}.",
-        "- `unknown` is an unusable reply (no model reported); it is never scored.",
+        "- `unknown` is a reply the harness could not use, or a call that failed before a model was reported; it is never scored.",
         "",
         "## Uncertainty",
         "",
@@ -808,19 +1339,50 @@ def render_markdown(summary: dict) -> str:
         lines.append(f"- {key}: {value}")
     for key, value in sorted(arm.get("cross_check", {}).items()):
         lines.append(f"- {key}: {value}")
+    lines += ["", "## Pipeline (informational)", ""]
+    if summary.get("harness"):
+        lines.append(f"- Harness: `{summary['harness']}`")
+    for name, a in summary["arms"].items():
+        pipe = a.get("pipeline") or {}
+        lines.append(
+            f"- {name}: {pipe.get('drafted')} drafted; dropped {pipe.get('dropped_by_stage')}; "
+            f"critique grades {pipe.get('critique_grades') or {}}; "
+            f"tool calls {pipe.get('tool_calls')} in {pipe.get('reviews_using_tools')} reviews; "
+            f"{pipe.get('skipped_paths')} skipped paths"
+        )
     usage = summary["seat_usage"]
     lines += [
         "",
         "## Seat usage",
         "",
         f"- review: {usage['review']['logical_calls']} calls, {usage['review']['seat_sessions']} seat sessions, models {usage['review']['actual_models']}",
+        f"- review unusable replies: {usage['review'].get('unusable_replies', 'n/a')}; repair-turn calls: {usage['review'].get('repair_calls', 'n/a')}",
         f"- judge: {usage['judge']['logical_calls']} calls, {usage['judge']['seat_sessions']} seat sessions, models {usage['judge']['actual_models']}",
     ]
+    turns = usage["review"].get("conversation_turns")
+    if turns:
+        lines.append(
+            f"- reviewer agentic steps on kept relay sessions: {turns}; "
+            f"lost-context reopens: {usage['review'].get('reopened_lost', 0)}"
+        )
+    for label, key in (
+        ("review call wall time (s)", "review_call_wall_s"),
+        ("review duration (s, reviews without error)", "review_duration_s"),
+        ("reviewer calls per review", "review_calls_per_review"),
+    ):
+        spread = (usage.get("latency") or {}).get(key) or {}
+        if spread.get("n"):
+            lines.append(
+                f"- {label}: n {spread['n']}, mean {spread['mean']}, "
+                f"median {spread['median']}, p90 {spread['p90']}"
+            )
     meter = summary.get("seat_meter") or {}
     if meter:
         lines.append(
             f"- metered: {meter['used']} of {meter['budget'] or 'unlimited'} seat sessions, {meter['refused']} refused at the cap"
         )
+        if meter.get("fatal"):
+            lines.append(f"- run stopped, not scorable: {meter['fatal']}")
     lines += [
         "",
         "`fixed_later` is biased toward Greptile (authors fixed what Greptile showed them) and can include base-branch merges into the PR's own files.",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -50,6 +51,13 @@ def _restore_registry_hooks(monkeypatch):
 
     monkeypatch.setattr(engine_module, "apply_registry", engine_module.apply_registry)
     monkeypatch.setattr(registry_prompt, "registry_rule", registry_prompt.registry_rule)
+    monkeypatch.setattr(registry_prompt, "with_registry_tool", registry_prompt.with_registry_tool)
+    from mira.llm.agentic_tools import AgenticToolExecutor
+
+    for name in ("filter_noise", "self_critique", *parity_runner._CAPTURE_STAGES):
+        monkeypatch.setattr(engine_module, name, getattr(engine_module, name))
+    monkeypatch.setattr(AgenticToolExecutor, "execute", AgenticToolExecutor.execute)
+    monkeypatch.delenv(parity_runner.CAPTURE_ENV, raising=False)
 
 
 GREPTILE_BODY = (
@@ -191,14 +199,14 @@ async def test_later_evidence_reads_snapshot_and_merged_file():
     assert "gone.py" in ev["error"]
 
 
-async def test_pinned_provider_diffs_the_snapshot_and_drops_greptile_lines(monkeypatch):
+async def test_pinned_provider_diffs_the_snapshot_with_fixture_text_only(monkeypatch):
     (unit,) = units_for_fixture(_fixture())
     calls = {}
 
     async def fake_info(self, url):
         return PRInfo(
-            title="t",
-            description="Fix auth\nAddressed Greptile P1 on refresh",
+            title="Live title edited after review",
+            description="Fix auth\nAddressed Greptile P1 on refresh\nAlso guards the null token",
             base_branch="main",
             head_branch="h",
             url=url,
@@ -216,10 +224,87 @@ async def test_pinned_provider_diffs_the_snapshot_and_drops_greptile_lines(monke
     monkeypatch.setattr("mira.providers.github.GitHubProvider.get_compare_diff", fake_compare)
     provider = PinnedGitHubProvider("tok", unit)
     info = await provider.get_pr_info(unit.pr_url)
-    assert info.head_sha == SHA_B and info.description == "Fix auth"
+    assert info.head_sha == SHA_B
+    # HAI-12817: the fixture title, and no live description at all.
+    assert info.title == "t" and info.description == ""
+    assert await provider.get_pr_description(info) == ""
     assert await provider.get_pr_diff(info) == "diff"
     assert calls["range"] == (unit.base_sha, SHA_B)
     assert await provider.get_all_bot_threads(info, "bot") == []
+
+
+async def test_pinned_provider_reads_source_tree_and_history_at_the_snapshot(monkeypatch):
+    """The live branch has moved on; every reviewer read still sees ``unit.sha``."""
+    (unit,) = units_for_fixture(_fixture())
+    refs: list[tuple[str, str]] = []
+    history_params: list[dict] = []
+
+    async def fake_info(self, url):
+        return PRInfo(
+            title="t",
+            description="",
+            base_branch="main",
+            head_branch="feature/moving",
+            url=url,
+            number=1,
+            owner="o",
+            repo="r",
+            head_sha=HEAD,
+        )
+
+    async def fake_content(self, info, path, ref):
+        refs.append(("content", ref))
+        return "x"
+
+    async def fake_tree(self, info, ref):
+        refs.append(("tree", ref))
+        return ["a.py"]
+
+    async def fake_token(self):
+        return "tok"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        history_params.append(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "sha": SHA_A,
+                    "commit": {
+                        "message": "Add refresh\n\nbody",
+                        "author": {"name": "dev", "date": "2026-09-30T00:00:00Z"},
+                    },
+                }
+            ],
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    monkeypatch.setattr("mira.providers.github.GitHubProvider.get_pr_info", fake_info)
+    monkeypatch.setattr("mira.providers.github.GitHubProvider.get_file_content", fake_content)
+    monkeypatch.setattr("mira.providers.github.GitHubProvider.get_repo_tree", fake_tree)
+    monkeypatch.setattr("mira.providers.github.GitHubProvider._resolve_token", fake_token)
+
+    provider = PinnedGitHubProvider("tok", unit)
+    info = await provider.get_pr_info(unit.pr_url)
+
+    from mira.index.context import ProviderSourceFetcher
+
+    # Exactly what the engine does: fetch at pr_info.head_branch.
+    await ProviderSourceFetcher(provider, info, info.head_branch).fetch("a.py")
+    await provider.get_repo_tree(info, info.head_branch)
+    # Explicit SHAs (later evidence reads the merged head) are left alone.
+    await provider.get_file_content(info, "a.py", HEAD)
+    assert refs == [("content", SHA_B), ("tree", SHA_B), ("content", HEAD)]
+
+    history = await provider.get_file_history(info, ["a.py"], max_per_file=3)
+    assert history_params == [{"path": "a.py", "sha": SHA_B, "per_page": "3"}]
+    (entry,) = history["a.py"]
+    assert entry.sha == SHA_A[:8] and entry.message == "Add refresh"
 
 
 # ---------------------------------------------------------------------- judge
@@ -528,8 +613,9 @@ class FakeRegistry:
         ]
 
 
-async def _artifact(monkeypatch, fail_on=frozenset()):
-    monkeypatch.setattr(parity_runner, "ReviewEngine", FakeEngine)
+async def _artifact(monkeypatch, fail_on=frozenset(), engine=None):
+    engine = engine or FakeEngine
+    monkeypatch.setattr(parity_runner, "ReviewEngine", engine)
     monkeypatch.setattr(FakeEngine, "fail_on", set(fail_on))
     monkeypatch.setattr("mira.registry.get_registry", lambda create=True: FakeRegistry())
     judge = FakeJudge()
@@ -627,6 +713,89 @@ async def test_arm_owns_the_engine_registry_hook(monkeypatch):
         assert bool(rules) is expect_block
 
 
+async def test_registry_search_answers_nothing_in_both_arms(monkeypatch):
+    import mira.registry.prompt as registry_prompt
+
+    def no_registry(create=True):
+        raise AssertionError("the harness must not search the live registry")
+
+    monkeypatch.setattr("mira.registry.get_registry", no_registry)
+
+    class Inner:
+        call_log: list = []
+
+        async def execute(self, name, args):
+            return f"inner {name}"
+
+    for arm in ("registry_off", "registry_on"):
+        parity_runner.install_arm(arm)
+        inner = Inner()
+        inner.call_log = []
+        executor = registry_prompt.with_registry_tool(inner, SimpleNamespace(owner="o", repo="r"))
+        assert (
+            await executor.execute("search_decisions", {"query": "q"}) == "[registry unavailable]"
+        )
+        assert await executor.execute("read_file", {"path": "a.py"}) == "inner read_file"
+        assert executor.call_log == [{"tool": "search_decisions", "arg": "q"}]
+
+
+class TrailEngine(FakeEngine):
+    async def review_pr(self, url):
+        result = await super().review_pr(url)
+        result.audit = [
+            {"stage": "agentic", "chunk": 0, "calls": [{"tool": "read_file", "arg": "b.py"}]},
+            {"stage": "drafted", "chunk": 0, "count": 3},
+            {"stage": "noise_filter", "path": "a.py", "line": 9, "title": "x"},
+            {"stage": "critique", "path": "a.py", "line": 12, "title": "y"},
+        ]
+        result.reviewed_paths = ["a.py"]
+        result.skipped_paths = ["big.lock"]
+        result.skipped_reason = None
+        return result
+
+
+async def test_review_records_the_pipeline_trail_without_changing_scores(monkeypatch):
+    plain, _ = await _artifact(monkeypatch)
+    art, _ = await _artifact(monkeypatch, engine=TrailEngine)
+    assert art["harness"] == parity_runner.HARNESS
+    review = art["records"][0]["review"]
+    assert review["reviewed_paths"] == ["a.py"] and review["skipped_paths"] == ["big.lock"]
+    assert review["skipped_reason"] == "" and len(review["audit"]) == 4
+
+    summary = json.loads(json.dumps(parity_runner.summarize(art)))
+    pipe = summary["arms"]["registry_off"]["pipeline"]
+    assert pipe == {
+        "reviews_with_audit": 2,
+        "drafted": 6,
+        "dropped_by_stage": {"noise_filter": 2, "critique": 2},
+        "critique_grades": {},
+        "tool_calls": {"read_file": 2},
+        "reviews_using_tools": 2,
+        "skipped_paths": 2,
+    }
+    assert "## Pipeline (informational)" in parity_runner.render_markdown(summary)
+    base = json.loads(json.dumps(parity_runner.summarize(plain)))
+    for arm in ("registry_on", "registry_off"):
+        assert summary["arms"][arm]["kory_totals"] == base["arms"][arm]["kory_totals"]
+        assert summary["arms"][arm]["parity"] == base["arms"][arm]["parity"]
+
+
+async def test_artifact_from_before_the_trail_still_rescores(monkeypatch):
+    art, _ = await _artifact(monkeypatch)
+    new = parity_runner.summarize(json.loads(json.dumps(art)))
+    old = json.loads(json.dumps(art))
+    old.pop("harness")
+    for rec in old["records"]:
+        for key in ("audit", "reviewed_paths", "skipped_paths", "skipped_reason"):
+            rec["review"].pop(key)
+    summary = parity_runner.summarize(old)
+    assert summary["harness"] == ""
+    assert summary["arms"]["registry_off"]["pipeline"]["reviews_with_audit"] == 0
+    for arm in ("registry_on", "registry_off"):
+        assert summary["arms"][arm]["kory_totals"] == new["arms"][arm]["kory_totals"]
+    parity_runner.render_markdown(summary)
+
+
 async def test_seat_meter_refuses_past_the_cap():
     sent = []
 
@@ -645,8 +814,64 @@ async def test_seat_meter_refuses_past_the_cap():
         "used": 2,
         "refused": 1,
         "exhausted": True,
+        "fatal": "",
     }
     assert parity_runner.SeatMeter(0).exhausted is False  # 0 = no cap
+
+
+async def test_pinned_fallback_stops_the_whole_run():
+    replies = iter(
+        [
+            {"actual_model": "claude@acct/opus", "text": "{}"},
+            {"actual_model": "codex/gpt-6-astra", "text": "{}"},
+        ]
+    )
+    sent = []
+
+    async def transport(request):
+        sent.append(request)
+        return next(replies)
+
+    meter = parity_runner.SeatMeter(0)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    pinned = {"body": {"model": "claude@acct/opus"}}
+    await llm._transport(pinned)
+    assert meter.exhausted is False
+    await llm._transport(pinned)  # the fallback reply itself is returned; the client rejects it
+    assert meter.exhausted is True
+    assert meter.fatal == "pinned model claude@acct/opus served by codex/gpt-6-astra"
+    with pytest.raises(parity_runner.SeatBudgetExhausted, match="run_stopped"):
+        await llm._transport(pinned)
+    assert len(sent) == 2 and meter.as_dict()["refused"] == 1
+
+
+async def test_unpinned_requests_never_trip_the_pin_guard():
+    async def transport(request):
+        return {"actual_model": "codex/gpt-6-astra"}
+
+    meter = parity_runner.SeatMeter(0)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    await llm._transport({"body": {"model": "auto"}})
+    await llm._transport({})
+    assert meter.fatal == "" and meter.exhausted is False
+
+
+async def test_fatal_meter_makes_the_verdict_invalid(monkeypatch):
+    art, _ = await _artifact(monkeypatch)
+    art = json.loads(json.dumps(art))
+    art["seat_meter"] = {
+        "budget": 0,
+        "used": 2,
+        "refused": 1,
+        "exhausted": True,
+        "fatal": "pinned model a served by b",
+    }
+    summary = parity_runner.summarize(art)
+    assert summary["parity_verdict"] == "invalid"
+    md = parity_runner.render_markdown(summary)
+    assert "**Verdict: invalid**" in md
+    assert "run stopped, not scorable: pinned model a served by b" in md
+    assert "seat budget ran out" not in md
 
 
 def test_exhausted_budget_is_inconclusive():
@@ -705,7 +930,7 @@ def _scripted_reviewer(models: list[str], **cfg):
 
     async def transport(request):
         sent.append(request)
-        return {"text": '{"comments": []}', "actual_model": models[len(sent) - 1]}
+        return {"text": '{"comments": [], "summary": ""}', "actual_model": models[len(sent) - 1]}
 
     async def no_sleep(_):
         return None
@@ -729,7 +954,10 @@ async def test_excluded_reviewer_reply_is_a_failed_call_and_retried(monkeypatch,
     llm = meter.guard(parity_runner.exclude_reviewer_families(llm, {"xai"}))
     token = attribution_key.set("review|t")
     try:
-        assert await llm.review([{"role": "user", "content": "diff"}]) == '{"comments": []}'
+        assert (
+            await llm.review([{"role": "user", "content": "diff"}])
+            == '{"comments": [], "summary": ""}'
+        )
     finally:
         attribution_key.reset(token)
     log = [(e["state"], e["actual_model"], e["attempts"]) for e in RouterAcpProvider.call_log]
@@ -780,7 +1008,7 @@ async def test_run_parity_never_scores_a_judge_family_reviewer_reply(monkeypatch
             return judge
 
         async def transport(request):
-            return {"text": '{"comments": []}', "actual_model": next(replies)}
+            return {"text": '{"comments": [], "summary": ""}', "actual_model": next(replies)}
 
         return RouterAcpProvider(cfg, transport=transport)
 
@@ -945,3 +1173,606 @@ async def test_cli_rescore_check(monkeypatch, tmp_path):
     art["records"][0]["judge"]["parsed"]["issues"][0]["verdict"] = "not_real"
     path.write_text(json.dumps(art))
     assert _cli("rescore", str(path), "--check").returncode == 1
+
+
+# --- HAI-12817 opt-in capture -------------------------------------------------
+
+
+def _capture_lines(path) -> list[dict]:
+    return [json.loads(line) for line in Path(path).read_text().splitlines()]
+
+
+def _engine_hooks() -> dict:
+    import mira.core.engine as engine_module
+    from mira.llm.agentic_tools import AgenticToolExecutor
+
+    names = ("filter_noise", "self_critique", *parity_runner._CAPTURE_STAGES)
+    hooks = {n: getattr(engine_module, n) for n in names}
+    hooks["execute"] = AgenticToolExecutor.execute
+    return hooks
+
+
+def _stable(art: dict) -> dict:
+    """The artifact minus wall-clock fields and the capture pointer."""
+    out = json.loads(json.dumps(art))
+    for key in ("started_at", "finished_at", "capture"):
+        out.pop(key, None)
+    for rec in out["records"]:
+        rec["review"].pop("duration_s")
+    return out
+
+
+async def test_capture_is_off_by_default(monkeypatch):
+    before = _engine_hooks()
+    art, _ = await _artifact(monkeypatch)
+    assert "capture" not in art
+    assert _engine_hooks() == before
+
+
+async def test_capture_keeps_the_artifact_and_scores(monkeypatch, tmp_path):
+    plain, _ = await _artifact(monkeypatch)
+    before = _engine_hooks()
+    path = tmp_path / "private" / "capture.jsonl"
+    monkeypatch.setenv(parity_runner.CAPTURE_ENV, str(path))
+    art, _ = await _artifact(monkeypatch)
+
+    assert _stable(art) == _stable(plain)
+    assert (
+        parity_runner.summarize(json.loads(json.dumps(art)))["arms"]
+        == (parity_runner.summarize(json.loads(json.dumps(plain)))["arms"])
+    )
+    assert _engine_hooks() == before  # every patched hook is restored
+
+    lines = _capture_lines(path)
+    assert lines[0]["kind"] == "header" and lines[0]["schema"] == parity_runner.CAPTURE_SCHEMA
+    assert lines[0]["units"] == [f"1@{SHA_A[:12]}"]
+    assert art["capture"]["records"] == len(lines)
+    assert art["capture"]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    assert oct(path.parent.stat().st_mode & 0o777) == "0o700"
+    with pytest.raises(FileExistsError):  # never overwrites an earlier capture
+        await _artifact(monkeypatch)
+
+
+async def test_capture_transport_records_bodies_not_headers(monkeypatch, tmp_path):
+    from mira.llm.router_acp import RouterAcpProvider, attribution_key
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    monkeypatch.setattr(RouterAcpProvider, "call_log", type(RouterAcpProvider.call_log)())
+
+    async def drive(sink):
+        llm, sent = _scripted_reviewer(
+            ["grok@x/grok-4.7", "claude@x/opus"], router_acp_token="relay-secret"
+        )
+        meter = parity_runner.SeatMeter(10)
+        llm = parity_runner.capture_transport(llm, sink)
+        llm = meter.guard(parity_runner.exclude_reviewer_families(llm, {"xai"}))
+        token = attribution_key.set("review|registry_off|r1|u1")
+        try:
+            reply = await llm.review([{"role": "user", "content": "diff"}])
+        finally:
+            attribution_key.reset(token)
+        return reply, sent, meter.used
+
+    plain = await drive(None)
+    sink = parity_runner.CaptureSink(str(tmp_path / "c.jsonl"))
+    captured = await drive(sink)
+    sink.close()
+
+    assert captured == plain  # same reply, same requests, same seat count
+    text = (tmp_path / "c.jsonl").read_text()
+    assert "relay-secret" not in text and "Authorization" not in text
+    calls = _capture_lines(tmp_path / "c.jsonl")
+    assert [c["kind"] for c in calls] == ["seat_call", "seat_call"]
+    assert [c["request"] for c in calls] == [r["body"] for r in plain[1]]
+    assert [c["response"]["actual_model"] for c in calls] == ["grok@x/grok-4.7", "claude@x/opus"]
+    assert {c["attribution"] for c in calls} == {"review|registry_off|r1|u1"}
+
+
+async def test_capture_records_full_drafts_critique_and_tools(monkeypatch, tmp_path):
+    import mira.core.engine as engine_module
+    from mira.core import passes
+    from mira.llm.agentic_tools import AgenticToolExecutor
+    from mira.llm.router_acp import RouterAcpProvider
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    verdicts = json.dumps(
+        {
+            "verdicts": [
+                {"index": 0, "evidence": "proven", "reason": "shown"},
+                {"index": 1, "evidence": "unsupported", "reason": "contradicted"},
+            ]
+        }
+    )
+    long_body = "x" * 900  # the critic only sees 500 chars; the capture keeps all
+
+    def drafts():
+        return [
+            ReviewComment(
+                path="a.py",
+                line=3,
+                end_line=None,
+                severity=Severity.WARNING,
+                category="bug",
+                title=f"t{i}",
+                body=long_body,
+                confidence=0.75,
+            )
+            for i in range(2)
+        ]
+
+    def critic():
+        sent: list[dict] = []
+
+        async def transport(request):
+            sent.append(request)
+            return {"text": verdicts, "actual_model": "claude@x/opus"}
+
+        llm = RouterAcpProvider(
+            LLMConfig(provider="router-acp", model="claude@x/opus", router_acp_url="http://x"),
+            transport=transport,
+        )
+        return llm, sent
+
+    plain_llm, plain_sent = critic()
+    plain_kept = await passes.self_critique(plain_llm, drafts(), indexing_llm=plain_llm)
+
+    sink = parity_runner.CaptureSink(str(tmp_path / "c.jsonl"))
+    restore = parity_runner.install_capture(sink)
+    token = parity_runner._capture_sink.set(sink)
+    try:
+        llm, sent = critic()
+        llm = parity_runner.capture_transport(llm, sink)
+        kept = await engine_module.self_critique(llm, drafts(), indexing_llm=llm)
+
+        async def fetch(path):
+            return "line1\nline2\n"
+
+        executor = AgenticToolExecutor(
+            source_fetcher=SimpleNamespace(fetch=fetch), repo_tree=["a.py"]
+        )
+        read = await executor.execute("read_file", {"path": "a.py"})
+        stub = parity_runner._NoRegistrySearch(executor)
+        await stub.execute("search_decisions", {"query": "nulls"})
+    finally:
+        parity_runner._capture_sink.reset(token)
+        restore()
+        sink.close()
+
+    assert [c.title for c in kept] == [c.title for c in plain_kept] == ["t0"]
+    assert [r["body"] for r in sent] == [r["body"] for r in plain_sent]  # identical prompt
+    assert engine_module.self_critique is passes.self_critique
+
+    by_kind: dict[str, list[dict]] = {}
+    for rec in _capture_lines(tmp_path / "c.jsonl"):
+        by_kind.setdefault(rec["kind"], []).append(rec)
+    (inp,) = by_kind["critique_input"]
+    assert [d["body"] for d in inp["drafts"]] == [long_body, long_body]
+    assert inp["drafts"][0]["severity"] == "WARNING" and inp["drafts"][0]["confidence"] == 0.75
+    (call,) = by_kind["seat_call"]
+    assert call["stage"] == "self_critique" and call["request"] == sent[0]["body"]
+    assert call["response"]["text"] == verdicts
+    assert by_kind["critique_output"][0]["kept_indices"] == [0]
+    tools = by_kind["tool_call"]
+    assert [(t["tool"], t["answered_by"]) for t in tools] == [
+        ("read_file", "executor"),
+        ("search_decisions", "harness"),
+    ]
+    assert tools[0]["result"] == read and tools[0]["args"] == {"path": "a.py"}
+
+
+async def test_capture_hooks_are_the_ones_the_real_engine_calls(
+    tmp_path, sample_diff_text, sample_llm_response_text
+):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from mira.config import MiraConfig
+    from mira.core.engine import ReviewEngine
+    from mira.llm.provider import LLMProvider
+
+    critique = json.dumps(
+        {"verdicts": [{"index": i, "evidence": "proven", "reason": "r"} for i in range(20)]}
+    )
+
+    def llm():
+        m = MagicMock(spec=LLMProvider)
+        m.review = AsyncMock(return_value=sample_llm_response_text)
+        m.complete = AsyncMock(return_value=sample_llm_response_text)
+        m.complete_with_tools = AsyncMock(return_value=critique)
+        m.count_tokens = MagicMock(return_value=100)
+        m.usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        return m
+
+    def shape(result, m):
+        comments = [(c.path, c.line, c.title, c.body, c.confidence) for c in result.comments]
+        calls = {
+            name: [c.args for c in getattr(m, name).call_args_list]
+            for name in ("review", "complete", "complete_with_tools")
+        }
+        return comments, calls
+
+    plain_llm = llm()
+    plain = shape(
+        await ReviewEngine(config=MiraConfig(), llm=plain_llm).review_diff(sample_diff_text),
+        plain_llm,
+    )
+
+    sink = parity_runner.CaptureSink(str(tmp_path / "c.jsonl"))
+    restore = parity_runner.install_capture(sink)
+    try:
+        cap_llm = llm()
+        result = await ReviewEngine(config=MiraConfig(), llm=cap_llm).review_diff(sample_diff_text)
+        captured = shape(result, cap_llm)
+    finally:
+        restore()
+        sink.close()
+
+    assert captured == plain  # same comments, same LLM calls with the same arguments
+    assert plain[0], "fixture should produce at least one comment"
+    kinds = [r["kind"] for r in _capture_lines(tmp_path / "c.jsonl")]
+    assert "noise_filter" in kinds and "critique_input" in kinds and "critique_output" in kinds
+
+
+# --- HAI-12817 completed-evaluation guards ---------------------------------------
+
+
+async def test_relay_refused_pin_mismatch_stops_the_whole_run():
+    # The Grok trial: every judge call came back 409 model_mismatch and the run kept paying.
+    from mira.llm.router_acp import RouterTransportError
+
+    sent = []
+
+    async def transport(request):
+        sent.append(request)
+        raise RouterTransportError(
+            "pinned model was not used",
+            kind="model_mismatch",
+            body={"actual_model": "claude@z/claude-fable-5-1"},
+        )
+
+    meter = parity_runner.SeatMeter(0)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    pinned = {"body": {"model": "codex/gpt-6-astra"}}
+    with pytest.raises(RouterTransportError):
+        await llm._transport(pinned)
+    assert meter.fatal == "pinned model codex/gpt-6-astra served by claude@z/claude-fable-5-1"
+    with pytest.raises(parity_runner.SeatBudgetExhausted, match="run_stopped"):
+        await llm._transport(pinned)
+    assert len(sent) == 1
+
+
+async def test_relay_errors_other_than_a_mismatch_do_not_stop_the_run():
+    from mira.llm.router_acp import RouterTransportError
+
+    async def transport(request):
+        raise RouterTransportError("timed out", kind="timeout")
+
+    meter = parity_runner.SeatMeter(0)
+    llm = meter.guard(SimpleNamespace(_transport=transport))
+    with pytest.raises(RouterTransportError):
+        await llm._transport({"body": {"model": "grok@x/grok-4.7"}})
+    assert meter.fatal == "" and meter.exhausted is False
+
+
+async def test_judge_keeps_its_lenient_single_attempt(monkeypatch):
+    # Reviewer repair turns must not change how the judge is called or parsed.
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    sent: list[dict] = []
+
+    async def transport(request):
+        sent.append(request)
+        return {"text": 'Verdicts follow.\n{"issues": []}', "actual_model": "claude@x/opus"}
+
+    llm = parity_runner.make_judge_llm(
+        LLMConfig(provider="router-acp", model="claude@x/opus", router_acp_url="http://x")
+    )
+    llm._transport = transport
+    out = await llm.complete_with_tools(
+        [{"role": "user", "content": "JUDGE BODY"}], tools=[SUBMIT_ISSUES_TOOL]
+    )
+    assert out == '{"issues": []}' and len(sent) == 1
+    assert "rejected" not in json.dumps(sent[0])
+
+
+def test_seat_usage_reports_unusable_replies_and_repair_calls():
+    calls = [
+        {"state": "ok", "actual_model": "grok@x/grok-4.7", "attempts": 1},
+        {"state": "bad_response", "actual_model": "unknown", "attempts": 1},
+        {"state": "ok", "actual_model": "grok@x/grok-4.7", "attempts": 1, "turn": "repair"},
+        {"state": "bad_response", "actual_model": "unknown", "attempts": 1, "turn": "repair"},
+    ]
+    usage = parity_runner._seat_usage([{"review": {"seat_calls": calls}, "judge": {}}])
+    assert usage["review"]["unusable_replies"] == 2
+    assert usage["review"]["repair_calls"] == 1
+    assert usage["review"]["seat_sessions"] == 2
+
+
+def _run_parity_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("run_parity_cli", HICKORY / "run_parity.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _preflight_provider(cfg: LLMConfig, reply: str, actual: str, judge: bool = False):
+    from mira.llm.router_acp import RouterAcpProvider
+
+    llm = parity_runner.make_judge_llm(cfg) if judge else RouterAcpProvider(cfg)
+
+    async def transport(request):
+        return {"text": reply, "actual_model": actual}
+
+    llm._transport = transport
+    return llm
+
+
+@pytest.mark.parametrize(
+    ("reply", "actual", "state", "reported"),
+    [
+        ('{"preflight": "ok"}', "grok@x/grok-4.7", "ok", "grok@x/grok-4.7"),
+        ('{"preflight": "ok"}', "claude@y/fable", "router_acp_model_mismatch", "claude@y/fable"),
+        (
+            "I'll check the workspace first.",
+            "grok@x/grok-4.7",
+            "router_acp_bad_response",
+            "grok@x/grok-4.7",
+        ),
+        ('{"preflight": "later"}', "grok@x/grok-4.7", "wrong_reply", "grok@x/grok-4.7"),
+    ],
+)
+async def test_preflight_reports_requested_and_reported_models(
+    monkeypatch, reply, actual, state, reported
+):
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    rp = _run_parity_module()
+    cfg = LLMConfig(
+        provider="router-acp",
+        model="grok@x/grok-4.7",
+        router_acp_url="http://x",
+        router_acp_max_retries=0,
+    )
+    check = await rp._preflight_one("reviewer", cfg, _preflight_provider(cfg, reply, actual))
+    assert check["requested_model"] == "grok@x/grok-4.7"
+    assert check["reported_model"] == reported
+    assert check["state"] == state
+    assert rp._preflight_ok([check]) is (state == "ok")
+
+
+async def test_preflight_judge_goes_through_the_judge_provider(monkeypatch):
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    rp = _run_parity_module()
+    cfg = LLMConfig(provider="router-acp", model="claude@x/opus", router_acp_url="http://x")
+    llm = _preflight_provider(cfg, '{"preflight": "ok"}', "claude@x/opus", judge=True)
+    check = await rp._preflight_one("judge", cfg, llm)
+    assert check["state"] == "ok" and check["reported_model"] == "claude@x/opus"
+
+
+def test_cli_plan_uses_a_measured_calls_per_review():
+    out = _cli(
+        "plan",
+        "--split",
+        "development",
+        "--runs",
+        "1",
+        "--arms",
+        "registry_off",
+        "--calls-per-review",
+        "12",
+    )
+    assert out.returncode == 0, out.stderr
+    plan = json.loads(out.stdout)
+    assert plan["estimated_seat_sessions"] == plan["reviews"] * 13
+    assert plan["estimate_basis"].startswith("12.00 seat calls per review from --calls-per-review")
+
+
+def test_cli_preflight_refuses_unpinned_judge():
+    out = _cli("preflight", "--judge-model", "auto")
+    assert out.returncode != 0 and "pin one model" in out.stderr
+
+
+def test_review_timeout_above_the_relay_cap_is_refused(monkeypatch):
+    rp = _run_parity_module()
+    monkeypatch.delenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", raising=False)
+    rp._check_review_timeout(900)
+    with pytest.raises(SystemExit, match="exceeds the loopback relay cap 900s"):
+        rp._check_review_timeout(1800)
+    monkeypatch.setenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", "1800")
+    rp._check_review_timeout(1800)
+    with pytest.raises(SystemExit):
+        rp._check_review_timeout(0)
+
+
+def test_review_timeout_reaches_reviewer_requests_only():
+    rp = _run_parity_module()
+    reviewer = rp._llm("router-acp", "grok@x/grok-4.7", "http://127.0.0.1:1", "t", "review", 1800)
+    judge = rp._llm("router-acp", "claude@x/opus", "http://127.0.0.1:1", "t", "review")
+    assert reviewer.router_acp_timeout_seconds == 1800
+    assert judge.router_acp_timeout_seconds == 900
+
+
+def test_cli_run_refuses_a_review_timeout_the_relay_would_cut():
+    env = {k: v for k, v in os.environ.items() if k != "KORY_COMPLETION_TIMEOUT_CAP_SECONDS"}
+    out = subprocess.run(
+        [
+            sys.executable,
+            str(HICKORY / "run_parity.py"),
+            "run",
+            "--judge-model",
+            "claude@x/opus",
+            "--review-timeout-seconds",
+            "1800",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        env={**env, "GITHUB_TOKEN": "x"},
+        timeout=120,
+    )
+    assert out.returncode != 0 and "exceeds the loopback relay cap" in out.stderr
+
+
+@pytest.mark.parametrize(
+    ("raw", "cap"),
+    [
+        (None, 900),
+        ("", 900),
+        ("1800", 1800),
+        (" 1800 ", 1800),
+        ("+1800", 900),
+        ("01800", 900),
+        ("1800.0", 900),
+        ("-5", 900),
+        ("0", 900),
+        ("7200", 3600),
+    ],
+)
+def test_relay_cap_is_parsed_like_the_relay(monkeypatch, raw, cap):
+    rp = _run_parity_module()
+    if raw is None:
+        monkeypatch.delenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("KORY_COMPLETION_TIMEOUT_CAP_SECONDS", raw)
+    assert rp._relay_cap_seconds() == cap
+
+
+def test_seat_usage_reports_call_and_review_latency():
+    def review(walls: list[float], duration: float, error: str = "") -> dict:
+        calls = [{"state": "ok", "attempts": 1, "wall_s": w} for w in walls]
+        calls.insert(1, {"state": "bad_response", "attempts": 1})  # parse verdict, no wall
+        return {
+            "review": {"seat_calls": calls, "duration_s": duration, "error": error},
+            "judge": {},
+        }
+
+    records = [
+        review([10.0, 20.0], 100.0),
+        review([30.0, 40.0, 50.0], 300.0),
+        review([1000.0], 5000.0, error="router_acp_timeout"),
+    ]
+    latency = parity_runner._seat_usage(records)["latency"]
+    # Every transport call counts; a failed review's duration does not.
+    assert latency["review_call_wall_s"] == {
+        "n": 6,
+        "mean": 191.7,
+        "median": 35.0,
+        "p90": 1000.0,
+    }
+    assert latency["review_duration_s"] == {"n": 2, "mean": 200.0, "median": 200.0, "p90": 300.0}
+    assert latency["review_calls_per_review"]["median"] == 2.5
+
+
+def test_latency_is_absent_not_zero_without_wall_times():
+    latency = parity_runner._seat_usage(
+        [{"review": {"seat_calls": [{"state": "ok", "attempts": 1}], "error": "x"}, "judge": {}}]
+    )["latency"]
+    assert latency["review_call_wall_s"] == {"n": 0, "mean": None, "median": None, "p90": None}
+
+
+async def test_review_unit_closes_kept_sessions_even_when_the_review_fails():
+    (unit,) = units_for_fixture(_fixture())
+    closed: list[str] = []
+
+    class _Seat:
+        async def close_conversations(self, attribution=None):
+            closed.append(attribution)
+
+    def broken_provider(_token, _unit):
+        raise RuntimeError("github down")
+
+    review = await parity_runner.review_unit(
+        unit,
+        "registry_off",
+        1,
+        LLMConfig(provider="router-acp", model="grok@x/grok-4.7"),
+        "token",
+        provider_factory=broken_provider,
+        llm_factory=lambda _cfg: _Seat(),
+    )
+    assert "github down" in review["error"]
+    assert closed == [f"review|registry_off|r1|{unit.unit_id}"]
+
+
+@pytest.mark.parametrize(
+    ("probe", "turns", "expect"),
+    [
+        (True, [("grok@x/g", True), ("grok@x/g", False)], "ok"),
+        (False, [], "conversations_unsupported"),
+        (RuntimeError("400 prompt is required"), [], "conversations_unsupported"),
+        # The relay reopened the session on the second turn: context would be lost.
+        (True, [("grok@x/g", True), ("grok@x/g", True)], "router_acp_lost_context"),
+        # The relay predates the conversation field.
+        (True, [("grok@x/g", None)], "router_acp_lost_context"),
+        (True, [("grok@x/g", True), ("claude@y/fable", False)], "router_acp_model_mismatch"),
+    ],
+)
+async def test_preflight_requires_kept_sessions_that_report_opened(
+    monkeypatch, probe, turns, expect
+):
+    from mira.llm.router_acp import RouterAcpProvider
+
+    monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
+    rp = _run_parity_module()
+    script = list(turns)
+
+    async def relay(request):
+        body = request["body"]
+        if body.get("close"):
+            if isinstance(probe, Exception):
+                raise probe
+            if probe:
+                return {"state": "closed", "conversation_id": body["conversation_id"]}
+            return {"text": "hello", "actual_model": "grok@x/g"}
+        model, opened = script.pop(0)
+        payload = {"text": '{"preflight": "ok"}', "actual_model": model}
+        if opened is not None:
+            payload["conversation"] = {"id": body["conversation_id"], "opened": opened}
+        return payload
+
+    cfg = LLMConfig(
+        provider="router-acp",
+        model="grok@x/g",
+        router_acp_conversations=True,
+        router_acp_max_retries=0,
+    )
+    check = await rp._conversations_check(
+        RouterAcpProvider(cfg, transport=relay, relay=False), "grok@x/g"
+    )
+    assert check["state"] == expect, check
+    assert rp._preflight_ok([check]) is (expect == "ok")
+    if expect == "ok":
+        assert check["calls"] == 2 and check["reported_model"] == "grok@x/g"
+
+
+def test_reviewer_conversations_are_opt_in_and_the_judge_stays_one_shot():
+    rp = _run_parity_module()
+    assert (
+        rp._llm(
+            "router-acp", "grok@x/g", "http://127.0.0.1:1", "t", "review"
+        ).router_acp_conversations
+        is False
+    )
+    reviewer = rp._llm(
+        "router-acp", "grok@x/g", "http://127.0.0.1:1", "t", "review", conversations=True
+    )
+    assert reviewer.router_acp_conversations is True
+
+
+def test_seat_usage_counts_agentic_steps_on_kept_sessions():
+    calls = [
+        {"state": "ok", "attempts": 1, "conversation": "new"},
+        {"state": "ok", "attempts": 1, "conversation": "kept"},
+        {"state": "bad_response", "attempts": 1, "conversation": "kept"},
+        {
+            "state": "lost_context",
+            "attempts": 1,
+            "conversation": "kept",
+            "session": "reopened_lost",
+        },
+        {"state": "ok", "attempts": 1},
+    ]
+    usage = parity_runner._seat_usage([{"review": {"seat_calls": calls}, "judge": {}}])
+    assert usage["review"]["conversation_turns"] == {"new": 1, "kept": 2}
+    assert usage["review"]["reopened_lost"] == 1
+    assert usage["review"]["failed"] == 2  # the bad_response verdict and the lost turn

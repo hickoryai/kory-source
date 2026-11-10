@@ -4,11 +4,38 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
 
 * ``RouterAcpProvider`` implements ``LLMProviderProtocol``.
 * ``complete``, ``complete_with_tools``, ``review``, and ``walkthrough``
-  return a string. ``complete_agentic`` returns no tool calls and does not
-  call the relay, so the engine performs one forced review.
-* ``supports_tool_calling`` and ``supports_temperature`` are false. Ensemble
-  sampling stays off. This provider does not map ``read_file`` or
-  ``grep_repo`` onto the seat.
+  return a string.
+* ``complete_agentic`` is a JSON tool-call adapter. Each step is
+  one ordinary completion: the prompt carries the tool schemas and the whole
+  call/result history. The seat answers with a batch of lookups,
+  ``{"calls": [{"tool": name, "arguments": {...}}, ...]}``, or with its
+  submission, ``{"tool": "submit_...", "arguments": {...}}``, alone. The
+  provider checks each name and its arguments against the supplied schemas and
+  returns an OpenAI-shaped assistant message with one tool call per valid
+  lookup (or the submission). Invalid batch entries are not run; the message
+  content names them, so the seat sees why in the next step. A reply with
+  nothing usable returns no tool calls, so the engine falls back to one forced
+  review. The seat never runs
+  the tools: Mira's own executor answers ``read_file`` and ``grep_repo``.
+* ``router_acp_conversations`` (off by default) keeps one relay session per
+  agentic transcript: the first step sends the whole prompt with a fresh
+  ``conversation_id``, and each later step of the same transcript sends only
+  the messages added since. Other calls stay one-shot. A session is closed
+  (``{conversation_id, close: true}``) when the transcript submits, gives an
+  unusable reply, or its loop ends, and by ``close_conversations`` at the end
+  of a review. A kept turn is never resent: the relay closes a session whose
+  prompt failed and would reopen the id empty. A seat-busy or outage failure
+  reopens once with the whole transcript; any other failure raises. A session
+  idle longer than ``router_acp_conversation_idle_seconds`` is not reused.
+  Every reply on a conversation must carry ``conversation: {id, opened}``:
+  ``opened: true`` on the first turn and ``false`` after. A later turn that
+  comes back ``opened: true`` (or without the field) ran without the
+  transcript: it is discarded, logged as ``lost_context`` with
+  ``session: "reopened_lost"``, and reopened under a fresh id. A transcript
+  gets one reopen in total; a second failure on its kept turns raises.
+  ``probe_conversations`` checks the relay supports it without using a seat.
+* ``supports_tool_calling`` (native tool calling) and ``supports_temperature``
+  are false. Ensemble sampling stays off.
 * A model pin is a router candidate id (``grok/grok-4.6``). ``auto``,
   ``default``, ``router-default``, and ``router-acp-default`` are unpinned.
   A pin that does not run raises ``router_acp_model_mismatch``. The provider
@@ -38,6 +65,19 @@ Public interface for later callers (indexing relink, reviews, the benchmark):
   sets it around one job so each job sees only its own completions, however
   many jobs share ``call_log``. A reply the provider cannot parse is reported
   as a ``bad_response`` entry after the ``ok`` transport entry.
+  Every transport entry (``ok`` or a failure state) carries ``wall_s``:
+  seconds from the first attempt to the outcome, retries included.
+* A final structured answer (``complete_with_tools``, ``review``,
+  ``walkthrough``, and an agentic ``submit_*`` call) is the JSON object that
+  ends the reply, bare or in a closing json fence, and it must carry the
+  submission schema's required fields with the declared types. Text before
+  it is narration from the same turn (the relay returns every message of the
+  turn). A reply with no closing object (a plan), with text after the object
+  (the seat had not finished), or whose object is not a submission is
+  ``bad_response``. Such a reply
+  gets ``repair_turns`` (one) more completion that quotes the rejected reply
+  and asks for the final JSON. Its call-log entries carry ``"turn": "repair"``.
+  A repair that is still unusable raises, so the caller sees the failure.
 
 Every logical call goes through the runtime-configured tracing adapter.
 An unset ``LLM_OTLP_ENDPOINT``, a missing tracer, or a failed exporter raises
@@ -51,9 +91,12 @@ import asyncio
 import json
 import logging
 import os
+import time
+import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
@@ -74,6 +117,7 @@ _STATE_CODE = {
     "empty_response": "router_acp_empty_response",
     "timeout": "router_acp_timeout",
     "bad_response": "router_acp_bad_response",
+    "lost_context": "router_acp_lost_context",
 }
 _STATUS_KIND = {
     429: "seat_exhausted",
@@ -88,7 +132,36 @@ call_observer: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
     "mira_router_acp_call_observer", default=None
 )
 job_llm: ContextVar[Any] = ContextVar("mira_router_acp_job_llm", default=None)
+_turn: ContextVar[str] = ContextVar("mira_router_acp_turn", default="")
+_REJECTED_QUOTE_CHARS = 1_500
 _tracing_ready = False
+_monotonic = time.monotonic  # tests replace it
+# The kept relay session (id, "new" | "kept") the current completion runs on.
+_conversation: ContextVar[tuple[str, str] | None] = ContextVar(
+    "mira_router_acp_conversation", default=None
+)
+# A kept turn that failed with one of these reopens once, with the full transcript.
+_REOPEN_CODES = frozenset(
+    {
+        _STATE_CODE["seat_exhausted"],
+        _STATE_CODE["workstation_outage"],
+        _STATE_CODE["lost_context"],
+    }
+)
+_CLOSE_TIMEOUT_SECONDS = 30
+
+
+@dataclass
+class _Conversation:
+    """One kept relay session carrying one agentic transcript."""
+
+    id: str
+    owner: int  # id() of the caller's transcript list
+    attribution: str
+    tools: tuple[str, ...]
+    sent: list  # snapshot of the transcript the seat has seen
+    last_reply: float
+    reopened: bool = False  # already this transcript's one reopen
 
 
 class RouterTransportError(Exception):
@@ -182,6 +255,11 @@ class RouterAcpProvider:
     supports_temperature: bool = False
     supports_max_tokens: bool = False
     call_log: ClassVar[deque[dict[str, Any]]] = deque(maxlen=_CALL_LOG_LIMIT)
+    # A final answer must be only its JSON object. Subclasses with their own
+    # frame (the benchmark judge) may keep the lenient extraction.
+    strict_final_answer: ClassVar[bool] = True
+    # Extra completions after an unusable final answer. Each is one seat call.
+    repair_turns: ClassVar[int] = 1
 
     def __init__(
         self,
@@ -197,6 +275,9 @@ class RouterAcpProvider:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self._transport = transport or self._http_transport
+        # Close requests skip the harness wrappers on _transport: no seat, no reply.
+        self._base_transport = self._transport
+        self._conversations: list[_Conversation] = []
         self._tracer = tracer
         self._sleep = sleep or asyncio.sleep
 
@@ -240,8 +321,17 @@ class RouterAcpProvider:
             headers["X-Kory-Agent-Session"] = session
         return headers
 
-    def _record(self, *, state: str, requested: str, actual: str, attempts: int) -> None:
-        entry = {
+    def _record(
+        self,
+        *,
+        state: str,
+        requested: str,
+        actual: str,
+        attempts: int,
+        wall_s: float | None = None,
+        session: str | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
             "state": state,
             "requested_model": requested,
             "actual_model": actual,
@@ -249,22 +339,79 @@ class RouterAcpProvider:
             "priority": self._priority(),
             "attribution": attribution_key.get(),
         }
+        if wall_s is not None:
+            entry["wall_s"] = wall_s
+        if _turn.get():
+            entry["turn"] = _turn.get()
+        conversation = _conversation.get()
+        if conversation is not None:
+            entry["conversation"] = conversation[1]
+        if session:
+            entry["session"] = session
         self.call_log.append(entry)
         observer = call_observer.get()
         if observer is not None:
             observer(dict(entry))
 
+    def _record_bad_response(self) -> None:
+        self._record(
+            state="bad_response",
+            requested=self._requested_model(),
+            actual="unknown",
+            attempts=1,
+        )
+
     def _checked_json(self, raw: str) -> str:
         try:
             return self._extract_json_object(raw)
         except LLMError:
-            self._record(
-                state="bad_response",
-                requested=self._requested_model(),
-                actual="unknown",
-                attempts=1,
-            )
+            self._record_bad_response()
             raise
+
+    def _final_answer(self, raw: str, schema: dict | None = None) -> str:
+        if not self.strict_final_answer:
+            return self._extract_json_object(raw)
+        answer = _closing_json_object(raw)
+        if schema is not None:
+            _check_arguments("final answer", json.loads(answer), schema)
+        return answer
+
+    def _repair_prompt(self, prompt: str, rejected: str, reason: LLMError) -> str:
+        quoted = rejected.strip()[:_REJECTED_QUOTE_CHARS]
+        return (
+            prompt
+            + "\n\n## Your previous reply was rejected\n"
+            + f"Reason: {str(reason)[:300]}\n"
+            + "It was not a completed answer. Mira cannot act on a plan, a narration, "
+            + "or text around the JSON. Do not describe what you will do. Finish the task "
+            + "from the information above and reply with the final JSON object only.\n"
+            + "Rejected reply (quoted, truncated):\n"
+            + "\n".join("> " + line for line in quoted.splitlines())
+        )
+
+    async def _final_json(self, prompt: str, schema: dict | None = None) -> str:
+        """One final structured answer, with at most ``repair_turns`` repairs.
+
+        Every unusable reply is logged as ``bad_response``. The last one raises.
+        """
+        current = prompt
+        for turn in range(self.repair_turns + 1):
+            token = _turn.set("repair") if turn else None
+            try:
+                raw, usage = await self._generate(current)
+                self._account(current, raw, usage)
+                try:
+                    return self._final_answer(raw, schema)
+                except LLMError as exc:
+                    self._record_bad_response()
+                    if turn >= self.repair_turns:
+                        raise
+                    logger.info("router final answer unusable, asking once more: %s", exc)
+                    current = self._repair_prompt(prompt, raw, exc)
+            finally:
+                if token is not None:
+                    _turn.reset(token)
+        raise AssertionError("unreachable")
 
     def _fail(
         self,
@@ -274,8 +421,17 @@ class RouterAcpProvider:
         actual: str,
         detail: str,
         attempts: int,
+        wall_s: float | None = None,
+        session: str | None = None,
     ) -> NonRetriableLLMError:
-        self._record(state=state, requested=requested, actual=actual, attempts=attempts)
+        self._record(
+            state=state,
+            requested=requested,
+            actual=actual,
+            attempts=attempts,
+            wall_s=wall_s,
+            session=session,
+        )
         code = _STATE_CODE.get(state, "router_acp_failed")
         return NonRetriableLLMError(
             code,
@@ -317,6 +473,9 @@ class RouterAcpProvider:
             "priority": self._priority(),
             "timeout_seconds": self.config.router_acp_timeout_seconds,
         }
+        conversation = _conversation.get()
+        if conversation is not None:
+            body["conversation_id"] = conversation[0]
         request: dict[str, Any] = {
             "body": body,
             "timeout": self.config.router_acp_timeout_seconds,
@@ -327,8 +486,18 @@ class RouterAcpProvider:
         return await self._transport(request)
 
     async def _complete_raw(self, prompt: str, requested: str) -> dict[str, Any]:
+        started = _monotonic()
+
+        def wall() -> float:
+            # Seconds since the first attempt: retries and their backoff included.
+            return round(_monotonic() - started, 3)
+
         attempts = 0
-        extra = self.config.router_acp_max_retries
+        conversation = _conversation.get()
+        # The relay closes a session whose prompt failed, and the same id would
+        # reopen empty: a kept turn is never resent. The caller reopens it whole.
+        kept = conversation is not None and conversation[1] == "kept"
+        extra = 0 if kept else self.config.router_acp_max_retries
         while True:
             attempts += 1
             try:
@@ -350,6 +519,7 @@ class RouterAcpProvider:
                     actual=actual,
                     detail=str(exc),
                     attempts=attempts,
+                    wall_s=wall(),
                 ) from exc
             actual = str(payload.get("actual_model") or "unknown")
             text = str(payload.get("text") or "")
@@ -361,7 +531,21 @@ class RouterAcpProvider:
                     actual=actual,
                     detail=f"requested {requested}, actual {actual}",
                     attempts=attempts,
+                    wall_s=wall(),
                 )
+            if conversation is not None:
+                lost = _lost_context(payload, conversation)
+                if lost:
+                    # The reply came from a session without this transcript: never use it.
+                    raise self._fail(
+                        "lost_context",
+                        requested=requested,
+                        actual=actual,
+                        detail=lost,
+                        attempts=attempts,
+                        wall_s=wall(),
+                        session="reopened_lost" if conversation[1] == "kept" else None,
+                    )
             if not text.strip():
                 raise self._fail(
                     "empty_response",
@@ -369,8 +553,11 @@ class RouterAcpProvider:
                     actual=actual,
                     detail="empty completion",
                     attempts=attempts,
+                    wall_s=wall(),
                 )
-            self._record(state="ok", requested=requested, actual=actual, attempts=attempts)
+            self._record(
+                state="ok", requested=requested, actual=actual, attempts=attempts, wall_s=wall()
+            )
             logger.info(
                 "router completion state=ok requested=%s actual=%s attempts=%s",
                 requested,
@@ -433,7 +620,8 @@ class RouterAcpProvider:
         parts = [
             "You are running as Mira's model backend through a router-acp seat.",
             "Follow the Mira review instructions exactly.",
-            "Return only the requested final answer.",
+            "Everything you need is in this message. Do not use any tools, files, or commands of your own.",
+            "Return only the requested final answer, not a plan or a description of what you will do.",
             "",
             "## Mira messages",
         ]
@@ -521,11 +709,8 @@ class RouterAcpProvider:
         tools: list[dict],
         temperature: float | None = None,
     ) -> str:
-        prompt = self._tool_prompt(messages, tools)
-        raw, usage = await self._generate(prompt)
-        result = self._checked_json(raw)
-        self._account(prompt, result, usage)
-        return result
+        schema = (tools[0].get("function") or {}).get("parameters") if tools else None
+        return await self._final_json(self._tool_prompt(messages, tools), schema)
 
     async def complete_agentic(
         self,
@@ -533,7 +718,248 @@ class RouterAcpProvider:
         tools: list[dict],
         temperature: float | None = None,
     ) -> dict:
-        return {"content": "", "tool_calls": []}
+        """One agentic step: ask the seat for its lookups or its submission, as JSON.
+
+        Returns ``{"role": "assistant", "content": note, "tool_calls": calls}``.
+        ``calls`` holds every valid lookup of a batch, or the one submission.
+        ``note`` names batch entries that were not run, so the seat sees why in
+        the next step. A reply with nothing usable returns no tool calls. The
+        caller's loop owns step and lookup caps, tool execution, and the
+        forced-review fallback.
+        """
+        specs = _tool_specs(tools)
+        if not specs:
+            return {"role": "assistant", "content": "", "tool_calls": []}
+        if self.config.router_acp_conversations:
+            raw, usage, prompt = await self._conversation_turn(messages, specs)
+        else:
+            prompt = self._agentic_prompt(messages, specs)
+            raw, usage = await self._generate(prompt)
+        self._account(prompt, raw, usage)
+        try:
+            calls, skipped = self._agentic_step(raw, specs)
+        except LLMError as exc:
+            self._record_bad_response()
+            logger.info("router agentic reply unusable: %s", exc)
+            await self.end_agentic(messages)  # the loop stops here
+            return {"role": "assistant", "content": "", "tool_calls": []}
+        if any(name.startswith("submit_") for name, _ in calls):
+            await self.end_agentic(messages)
+        if skipped:
+            logger.info("router agentic batch: %d lookup(s) not run", len(skipped))
+        first = _prior_tool_calls(messages) + 1
+        return {
+            "role": "assistant",
+            "content": _skipped_note(skipped),
+            "tool_calls": [
+                {
+                    "id": f"router_call_{first + offset}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+                for offset, (name, arguments) in enumerate(calls)
+            ],
+        }
+
+    def _agentic_step(
+        self, raw: str, specs: dict[str, dict]
+    ) -> tuple[list[tuple[str, dict]], list[str]]:
+        """The calls in one agentic reply, and why any batch entry was not run.
+
+        A submission is ``{"tool": "submit_...", ...}`` and must close the
+        reply. Lookups are ``{"calls": [...]}`` (or one bare ``{"tool": ...}``
+        lookup); narration around them is allowed. A batch runs its valid
+        lookups; one with no valid lookup is ``bad_response``.
+        """
+        try:
+            text = _closing_json_object(raw)
+        except LLMError:
+            text = self._extract_json_object(raw)
+        obj = json.loads(text)
+        if "calls" not in obj:
+            name, arguments = _parse_tool_call(text, specs)
+            if name.startswith("submit_"):
+                # A submission is the final answer: it must close the reply.
+                name, arguments = _parse_tool_call(self._final_answer(raw), specs)
+            return [(name, arguments)], []
+        entries = obj["calls"]
+        if not isinstance(entries, list) or not entries:
+            raise LLMError("router_acp_bad_response", detail="calls is not a non-empty list")
+        calls: list[tuple[str, dict]] = []
+        skipped: list[str] = []
+        for index, entry in enumerate(entries, 1):
+            try:
+                if not isinstance(entry, dict):
+                    raise LLMError("router_acp_bad_response", detail="not an object")
+                name, arguments = _parse_tool_call(json.dumps(entry), specs)
+                if name.startswith("submit_"):
+                    raise LLMError(
+                        "router_acp_bad_response",
+                        detail=f"{name} must be sent alone, as the final answer",
+                    )
+            except LLMError as exc:
+                reason = str(exc).removeprefix(exc.safe_message + ": ")
+                skipped.append(f"entry {index}: {reason}"[:300])
+                continue
+            calls.append((name, arguments))
+        if not calls:
+            raise LLMError(
+                "router_acp_bad_response", detail="no valid lookup: " + "; ".join(skipped)[:400]
+            )
+        return calls, skipped
+
+    def _agentic_prompt(self, messages: list, specs: dict[str, dict]) -> str:
+        parts = [
+            "You are running as Mira's model backend through a router-acp seat.",
+            "Follow the Mira review instructions exactly.",
+            "Mira runs the tools listed below for you and returns their results in the next request.",
+            "Do not use any other tools, files, or commands of your own.",
+            "",
+            "## Mira messages",
+            *_render_messages(messages, 0),
+            "",
+            "## Tools",
+        ]
+        for name, spec in specs.items():
+            parts.append(f"\n### `{name}`\n{spec.get('description') or ''}".rstrip())
+            parts.append("Arguments schema:\n" + json.dumps(spec["parameters"], sort_keys=True))
+        return "\n".join(parts + _required_output(specs))
+
+    def _agentic_delta_prompt(self, messages: list, start: int, specs: dict[str, dict]) -> str:
+        """A kept session's next turn: only the messages after ``start``."""
+        parts = [
+            "Mira's next messages in this review follow, continuing the numbering above.",
+            "The tools and rules from the first request still apply.",
+            "",
+            "## Mira messages",
+            *_render_messages(messages, start),
+        ]
+        return "\n".join(parts + _required_output(specs))
+
+    def _kept(self, messages: list, specs: dict[str, dict]) -> _Conversation | None:
+        """The open session this transcript continues, if it can be continued."""
+        owner, attribution = id(messages), attribution_key.get()
+        for conv in self._conversations:
+            if conv.owner == owner and conv.attribution == attribution:
+                fresh = _monotonic() - conv.last_reply < (
+                    self.config.router_acp_conversation_idle_seconds
+                )
+                sent = len(conv.sent)
+                extends = len(messages) > sent and _snapshot(messages[:sent]) == conv.sent
+                if fresh and extends and conv.tools == tuple(specs):
+                    return conv
+                return None
+        return None
+
+    async def _conversation_turn(
+        self, messages: list, specs: dict[str, dict]
+    ) -> tuple[str, dict[str, Any] | None, str]:
+        conv = self._kept(messages, specs)
+        reopen = False
+        if conv is not None:
+            prompt = self._agentic_delta_prompt(messages, len(conv.sent), specs)
+            try:
+                raw, usage = await self._in_conversation(conv, "kept", prompt)
+            except LLMError as exc:
+                await self._close(conv)
+                if exc.code not in _REOPEN_CODES or conv.reopened:
+                    raise
+                reopen = True
+                logger.info("kept router turn failed (%s); reopening with the transcript", exc.code)
+            else:
+                conv.sent, conv.last_reply = _snapshot(messages), _monotonic()
+                return raw, usage, prompt
+        await self.end_agentic(messages)
+        conv = _Conversation(
+            id=f"mira-{uuid.uuid4().hex}",
+            owner=id(messages),
+            attribution=attribution_key.get(),
+            tools=tuple(specs),
+            sent=[],
+            last_reply=0.0,
+            reopened=reopen,
+        )
+        self._conversations.append(conv)
+        prompt = self._agentic_prompt(messages, specs)
+        try:
+            raw, usage = await self._in_conversation(conv, "new", prompt)
+        except BaseException:
+            await self._close(conv)
+            raise
+        conv.sent, conv.last_reply = _snapshot(messages), _monotonic()
+        return raw, usage, prompt
+
+    async def _in_conversation(
+        self, conv: _Conversation, mode: str, prompt: str
+    ) -> tuple[str, dict[str, Any] | None]:
+        token = _conversation.set((conv.id, mode))
+        try:
+            return await self._generate(prompt)
+        finally:
+            _conversation.reset(token)
+
+    async def end_agentic(self, messages: list) -> None:
+        """Close the kept session of this transcript, if any. Safe to repeat."""
+        owner, attribution = id(messages), attribution_key.get()
+        for conv in list(self._conversations):
+            if conv.owner == owner and conv.attribution == attribution:
+                await self._close(conv)
+
+    async def close_conversations(self, attribution: str | None = None) -> None:
+        """Close every kept session, or only those of one attribution."""
+        for conv in list(self._conversations):
+            if attribution is None or conv.attribution == attribution:
+                await self._close(conv)
+
+    async def check_conversation(self, prompt: str) -> list[str]:
+        """Two turns of ``prompt`` on one fresh kept session, then close it.
+
+        The relay must answer the first ``opened: true`` and the second
+        ``opened: false``, or the turn raises ``router_acp_lost_context``.
+        Returns both replies. Two seat calls; preflight only.
+        """
+        conv = _Conversation(
+            id=f"mira-preflight-{uuid.uuid4().hex}",
+            owner=0,
+            attribution=attribution_key.get(),
+            tools=(),
+            sent=[],
+            last_reply=0.0,
+        )
+        self._conversations.append(conv)
+        try:
+            first, _ = await self._in_conversation(conv, "new", prompt)
+            second, _ = await self._in_conversation(conv, "kept", prompt)
+        finally:
+            await self._close(conv)
+        return [first, second]
+
+    async def probe_conversations(self) -> bool:
+        """True if the relay keeps sessions: closing an unknown id answers ``closed``.
+
+        Sends no prompt and uses no seat. A relay without kept sessions rejects
+        the request, and a later delta would reach a session with no context.
+        """
+        payload = await self._base_transport(self._close_request(f"mira-probe-{uuid.uuid4().hex}"))
+        return isinstance(payload, dict) and payload.get("state") == "closed"
+
+    def _close_request(self, conversation_id: str) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "body": {"conversation_id": conversation_id, "close": True},
+            "timeout": _CLOSE_TIMEOUT_SECONDS,
+        }
+        if self._relay:
+            request["url"] = f"{self._relay_url()}/api/agent/llm-complete"
+            request["headers"] = self._headers()
+        return request
+
+    async def _close(self, conv: _Conversation) -> None:
+        if conv in self._conversations:
+            self._conversations.remove(conv)
+        try:
+            await self._base_transport(self._close_request(conv.id))
+        except Exception as exc:  # the relay also closes it on idle
+            logger.warning("router conversation close failed: %s", exc)
 
     async def review(self, messages: list[dict[str, str]], temperature: float | None = None) -> str:
         from mira.llm.tool_schemas import SUBMIT_REVIEW_TOOL
@@ -546,6 +972,193 @@ class RouterAcpProvider:
         from mira.llm.tool_schemas import SUBMIT_WALKTHROUGH_TOOL
 
         return await self.complete_with_tools(messages, tools=[SUBMIT_WALKTHROUGH_TOOL])
+
+
+_JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "array": (list,),
+    "object": (dict,),
+}
+
+
+def _lost_context(payload: dict[str, Any], conversation: tuple[str, str]) -> str:
+    """Why a conversation reply cannot be trusted to carry its transcript, or ""."""
+    conversation_id, mode = conversation
+    info = payload.get("conversation")
+    if not isinstance(info, dict) or info.get("id") != conversation_id:
+        return f"relay reply carries no conversation {conversation_id}"
+    opened = info.get("opened")
+    if mode == "kept" and opened is not False:
+        return f"relay opened a fresh session for kept conversation {conversation_id}"
+    if mode == "new" and opened is not True:
+        return f"relay did not open a fresh session for new conversation {conversation_id}"
+    return ""
+
+
+def _render_messages(messages: list, start: int) -> list[str]:
+    """Mira messages from index ``start``, numbered from ``start + 1``."""
+    parts: list[str] = []
+    for index, message in enumerate(messages[start:], start + 1):
+        role = message.get("role", "user")
+        content = message.get("content") or ""
+        if role == "tool":
+            call_id = message.get("tool_call_id") or ""
+            parts.append(f"\n### Message {index}: tool result for `{call_id}`\n{content}")
+            continue
+        parts.append(f"\n### Message {index}: {role}\n{content}".rstrip())
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            parts.append(
+                f"Tool call `{call.get('id') or ''}`: "
+                + json.dumps({"tool": fn.get("name"), "arguments": _loads_args(fn)})
+            )
+    return parts
+
+
+def _required_output(specs: dict[str, dict]) -> list[str]:
+    lookups = [f"`{n}`" for n in specs if not n.startswith("submit_")]
+    submits = [f"`{n}`" for n in specs if n.startswith("submit_")]
+    parts = ["", "## Required output", "Return ONLY one JSON object, in one of these forms:"]
+    if lookups:
+        parts.append(
+            f"- Lookups ({', '.join(lookups)}): "
+            + '{"calls": [{"tool": "<tool name>", "arguments": {...}}, ...]}. '
+            + "Put every lookup you need now in this one list. Mira runs them all "
+            + "and returns every result in the next request. Do not ask for one "
+            + "lookup at a time."
+        )
+    if submits:
+        parts.append(
+            f"- Final answer ({', '.join(submits)}): "
+            + '{"tool": "<tool name>", "arguments": {...}}, alone, once the work is '
+            + "complete. Never put it in a calls list."
+        )
+    return parts + [
+        "The arguments must conform to that tool's schema.",
+        "Do not wrap the JSON in markdown fences. Do not include explanatory text.",
+    ]
+
+
+def _snapshot(messages: list) -> list:
+    """A detached copy of a transcript, for comparing what the seat has seen."""
+    return json.loads(json.dumps(messages, default=str))
+
+
+def _closing_json_object(text: str) -> str:
+    """The JSON object that ends the reply, bare or in a closing json fence.
+
+    Narration before it is allowed: the relay returns every message of the
+    seat's turn. No closing object means a plan; text after it means the seat
+    had not finished. Both raise ``router_acp_bad_response``.
+    """
+    candidate = text.strip()
+    if not candidate:
+        raise LLMError("router_acp_empty_response", detail="empty completion")
+    if candidate.endswith("```"):
+        opening = candidate.rfind("```", 0, len(candidate) - 3)
+        if opening != -1:
+            block = candidate[opening + 3 : -3].strip()
+            if block.startswith("json"):
+                block = block[4:].strip()
+            candidate = block
+    decoder = json.JSONDecoder()
+    index = candidate.find("{")
+    while index != -1:
+        try:
+            parsed, end = decoder.raw_decode(candidate, index)
+        except ValueError:
+            parsed, end = None, -1
+        if isinstance(parsed, dict) and not candidate[end:].strip():
+            return candidate[index:end]
+        index = candidate.find("{", index + 1)
+    raise LLMError(
+        "router_acp_bad_response",
+        detail="reply does not end with the final JSON object: " + text.strip()[:400],
+    )
+
+
+def _check_arguments(name: str, arguments: dict, schema: dict) -> None:
+    for key in schema.get("required") or []:
+        if key not in arguments:
+            raise LLMError("router_acp_bad_response", detail=f"{name}: missing {key}")
+    properties = schema.get("properties") or {}
+    for key, value in arguments.items():
+        expected = (properties.get(key) or {}).get("type")
+        if expected is not None and not _type_ok(value, expected):
+            raise LLMError("router_acp_bad_response", detail=f"{name}: {key} is not {expected}")
+
+
+def _tool_specs(tools: list[dict]) -> dict[str, dict]:
+    specs: dict[str, dict] = {}
+    for tool in tools or []:
+        fn = tool.get("function") or {}
+        name = fn.get("name")
+        if name:
+            specs[name] = {
+                "description": fn.get("description") or "",
+                "parameters": fn.get("parameters") or {"type": "object"},
+            }
+    return specs
+
+
+def _skipped_note(skipped: list[str]) -> str:
+    if not skipped:
+        return ""
+    return "Mira did not run these lookups from your last calls list:\n" + "\n".join(
+        "- " + reason for reason in skipped
+    )
+
+
+def _prior_tool_calls(messages: list) -> int:
+    return sum(len(m.get("tool_calls") or []) for m in messages if m.get("role") == "assistant")
+
+
+def _loads_args(fn: dict) -> Any:
+    raw = fn.get("arguments")
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return raw
+    return raw if raw is not None else {}
+
+
+def _type_ok(value: Any, expected: Any) -> bool:
+    names = expected if isinstance(expected, list) else [expected]
+    for name in names:
+        if name == "null":
+            if value is None:
+                return True
+            continue
+        kinds = _JSON_TYPES.get(name)
+        if kinds is None:
+            return True  # a type this adapter does not check
+        if isinstance(value, bool) and name in {"integer", "number"}:
+            continue
+        if isinstance(value, kinds):
+            return True
+    return False
+
+
+def _parse_tool_call(text: str, specs: dict[str, dict]) -> tuple[str, dict]:
+    """``{"tool": name, "arguments": {...}}`` checked against ``specs``."""
+    obj = json.loads(text)
+    name = obj.get("tool")
+    if not isinstance(name, str) or name not in specs:
+        raise LLMError("router_acp_bad_response", detail=f"unknown tool {name!r}")
+    arguments = obj.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except Exception as exc:
+            raise LLMError("router_acp_bad_response", detail=f"{name}: arguments not JSON") from exc
+    if not isinstance(arguments, dict):
+        raise LLMError("router_acp_bad_response", detail=f"{name}: arguments not an object")
+    _check_arguments(name, arguments, specs[name]["parameters"])
+    return name, arguments
 
 
 def _is_router_acp(config: LLMConfig) -> bool:

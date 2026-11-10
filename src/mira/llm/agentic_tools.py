@@ -95,6 +95,62 @@ _MAX_FILE_BYTES = 12_000  # ~3k tokens of source; truncate larger files
 _MAX_GREP_HITS = 30
 _MAX_GREP_BYTES_PER_HIT = 240
 _MAX_TOTAL_OUTPUT_BYTES = 50_000  # all tool calls in one review combined
+# Each scanned file is a network round-trip via source_fetcher; keep tight.
+_MAX_GREP_FILES = 15
+
+
+# A model-supplied glob like `{a,b}{c,d}...` expands multiplicatively; refuse
+# anything past this many concrete patterns instead of enumerating it.
+_MAX_GLOB_ALTERNATIVES = 64
+
+
+class GlobTooBroad(ValueError):
+    """The glob expands to more than ``_MAX_GLOB_ALTERNATIVES`` patterns."""
+
+
+def _cap(patterns: list[str]) -> list[str]:
+    if len(patterns) > _MAX_GLOB_ALTERNATIVES:
+        raise GlobTooBroad(f"more than {_MAX_GLOB_ALTERNATIVES} alternatives")
+    return patterns
+
+
+def _expand_braces(glob: str) -> list[str]:
+    """`**/*.{py,ts}` -> [`**/*.py`, `**/*.ts`]. fnmatch has no brace syntax.
+
+    Groups are expanded left to right and the running total is checked after
+    each one, so an oversized glob fails before it is enumerated. Nested
+    braces are not supported; an unmatched brace is a literal.
+    """
+    out = [""]
+    rest = glob
+    while True:
+        start = rest.find("{")
+        end = rest.find("}", start + 1)
+        if start < 0 or end < 0:
+            return [o + rest for o in out]
+        head, alts = rest[:start], rest[start + 1 : end].split(",")
+        out = _cap([o + head + alt for o in out for alt in alts])
+        rest = rest[end + 1 :]
+
+
+def _zero_dir_variants(pattern: str) -> list[str]:
+    """Each `**/` independently matches zero or more directories.
+
+    fnmatch's `*` already crosses `/`, so `**/` matches one or more directories;
+    adding the variant with that segment removed covers zero. Every subset of
+    `**/` segments is dropped, so `a/**/b/**/*.py` also matches `a/b/x/y.py`.
+    """
+    parts = pattern.split("**/")
+    variants = [parts[0]]
+    for part in parts[1:]:
+        variants = _cap([v + sep + part for v in variants for sep in ("**/", "")])
+    return variants
+
+
+def _glob_patterns(glob: str) -> list[str]:
+    """The concrete fnmatch patterns for `glob`: `{a,b}` alternation plus
+    zero-directory `**/` segments. Raises ``GlobTooBroad`` past the cap."""
+    return _cap([v for alt in _expand_braces(glob) for v in _zero_dir_variants(alt)])
 
 
 @dataclass
@@ -183,7 +239,14 @@ class AgenticToolExecutor:
 
         candidates: list[str]
         if path_glob:
-            candidates = [p for p in self.repo_tree if fnmatch.fnmatch(p, path_glob)]
+            try:
+                patterns = _glob_patterns(path_glob)
+            except GlobTooBroad:
+                return (
+                    f"[invalid path_glob `{path_glob}`: it expands to more than "
+                    f"{_MAX_GLOB_ALTERNATIVES} patterns; use fewer `{{a,b}}` alternatives]"
+                )
+            candidates = [p for p in self.repo_tree if any(fnmatch.fnmatch(p, g) for g in patterns)]
         else:
             candidates = list(self.repo_tree)
 
@@ -225,19 +288,17 @@ class AgenticToolExecutor:
         )
         skip_dirs = ("node_modules/", "vendor/", "dist/", "build/", ".git/")
 
+        eligible = [
+            c
+            for c in candidates
+            if not any(c.endswith(ext) for ext in skip_exts) and not any(d in c for d in skip_dirs)
+        ]
         hits: list[str] = []
         files_scanned = 0
-        # Each scanned file is a network round-trip via source_fetcher; keep tight.
-        max_files_to_scan = 15
 
-        for cand in candidates:
-            if len(hits) >= _MAX_GREP_HITS or files_scanned >= max_files_to_scan:
+        for cand in eligible:
+            if len(hits) >= _MAX_GREP_HITS or files_scanned >= _MAX_GREP_FILES:
                 break
-            if any(cand.endswith(ext) for ext in skip_exts):
-                continue
-            if any(d in cand for d in skip_dirs):
-                continue
-
             files_scanned += 1
             content = self._content_cache.get(cand)
             if content is None and cand not in self._content_cache:
@@ -255,9 +316,23 @@ class AgenticToolExecutor:
                     if len(hits) >= _MAX_GREP_HITS:
                         break
 
+        # Stopped by the file cap, not by running out of files: say so, so the
+        # model never reads an unscanned remainder as evidence of absence.
+        incomplete = len(hits) < _MAX_GREP_HITS and files_scanned < len(eligible)
         if not hits:
+            if incomplete:
+                return (
+                    f"[no content matches for `{pattern}` in the {files_scanned} files scanned, "
+                    f"out of {len(eligible)} candidates. The search is INCOMPLETE and is not "
+                    "evidence of absence: narrow `path_glob` or read_file the likely file]"
+                )
             return f"[no content matches for `{pattern}` (scanned {files_scanned} files)]"
         prefix = f"Content matches (scanned {files_scanned} files):"
+        if incomplete:
+            prefix = (
+                f"Content matches (scanned {files_scanned} of {len(eligible)} candidate files; "
+                "search incomplete):"
+            )
         if len(hits) == _MAX_GREP_HITS:
             prefix += f" showing first {_MAX_GREP_HITS}"
         return prefix + "\n" + "\n".join(hits)
