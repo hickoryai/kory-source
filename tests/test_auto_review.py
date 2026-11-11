@@ -42,12 +42,7 @@ from mira.dashboard.auth import SESSION_COOKIE, AuthMiddleware
 from mira.dashboard.db import AppDatabase
 from mira.models import PRInfo, ReviewComment, ReviewResult, Severity
 from mira.platforms.github.auth import GitHubAppAuth
-from mira.platforms.github.webhook import (
-    dispatch_github_event,
-    handle_comment,
-    handle_pull_request,
-    handle_thread_reject,
-)
+from mira.platforms.github.webhook import dispatch_github_event, handle_pull_request
 from mira.platforms.server import create_app
 from mira.providers.github import GitHubProvider
 from mira.review_api.snapshot import FrozenSnapshot, PullMeta, ReadOnlySnapshotProvider
@@ -55,7 +50,6 @@ from mira.review_api.snapshot import FrozenSnapshot, PullMeta, ReadOnlySnapshotP
 HEAD = "a" * 40
 HEAD_NEXT = "b" * 40
 BASE = "c" * 40
-TRIAL_REPO = "hickoryai/hickory-ai"
 ROUTEABLE_ACCOUNT = "grok@" + "ab" * 16
 ROUTEABLE_MODEL = f"{ROUTEABLE_ACCOUNT}/{MODEL_NAME}"
 
@@ -64,7 +58,6 @@ ROUTEABLE_MODEL = f"{ROUTEABLE_ACCOUNT}/{MODEL_NAME}"
 def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppDatabase:
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW", raising=False)
-    monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_REPOS", raising=False)
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", raising=False)
     monkeypatch.delenv(ENV_ACCOUNT, raising=False)
     database = AppDatabase(url="", admin_password="admin")
@@ -80,7 +73,6 @@ def _enable(
     monkeypatch: pytest.MonkeyPatch, database: AppDatabase, installation_id: int = 42
 ) -> None:
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", TRIAL_REPO)
     monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
     database.register_repo("hickoryai", "hickory-ai", installation_id=installation_id)
 
@@ -296,10 +288,10 @@ def test_enablement_steps_need_no_code_reconstruction() -> None:
     assert "dev-kory-ai" in text
     assert "0.11.0" in text
     assert "KORY_SOURCE_AUTO_REVIEW" in text
-    assert "KORY_SOURCE_AUTO_REVIEW_REPOS" in text
+    assert "KORY_SOURCE_AUTO_REVIEW_REPOS" not in text
+    assert "installed on" in text
     assert ENV_ACCOUNT in text
     assert MODEL_NAME in text
-    assert "one owner/repo" in text
     assert "hickory" not in text.lower()
     assert "No code reconstruction" in text
     assert "branch-protection" in text
@@ -311,19 +303,13 @@ def test_enablement_steps_need_no_code_reconstruction() -> None:
     assert HEAD in preamble
 
 
-def test_flag_off_reviews_only_the_allowlist(
-    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    assert ownership(db, "hickoryai", "hickory-ai", 42) == "ignore"
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", TRIAL_REPO)
+def test_flag_off_keeps_today_reviewer(db: AppDatabase, monkeypatch: pytest.MonkeyPatch) -> None:
     assert ownership(db, "hickoryai", "hickory-ai", 42) is None
-    assert ownership(db, "hickoryai", "other", 42) == "ignore"
 
 
 async def test_flag_off_webhook_still_schedules_legacy_handler(
     db: AppDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", TRIAL_REPO)
     payload = _payload(include_head=False)
     status, scheduled = await _dispatch(db, payload, monkeypatch)
     assert status == "processing"
@@ -334,23 +320,13 @@ async def test_flag_off_webhook_still_schedules_legacy_handler(
 def test_ownership_gates(db: AppDatabase, monkeypatch: pytest.MonkeyPatch) -> None:
     _enable(monkeypatch, db)
     assert ownership(db, "hickoryai", "hickory-ai", 42) == "enqueue"
-    assert ownership(db, "hickoryai", "other", 42) == "ignore"
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", "hickoryai/other")
-    assert ownership(db, "hickoryai", "hickory-ai", 42) == "ignore"
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", f"{TRIAL_REPO},hickoryai/other")
-    assert ownership(db, "hickoryai", "hickory-ai", 42) == "ignore"
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", TRIAL_REPO)
-    db.register_repo("hickoryai", "other", installation_id=42)
-    assert ownership(db, "hickoryai", "hickory-ai", 42) == "enqueue"
-    assert ownership(db, "hickoryai", "hickory-ai", 7) == "ignore"
-    db.register_repo("hickoryai", "hickory-ai", installation_id=99)
-    assert ownership(db, "hickoryai", "hickory-ai", 99) == "enqueue"
+    assert ownership(db, "acme", "widgets", 7) == "enqueue"
     set_paused(db, True)
-    assert ownership(db, "hickoryai", "hickory-ai", 99) == "ignore"
+    assert ownership(db, "acme", "widgets", 7) == "ignore"
     set_paused(db, False)
-    assert ownership(db, "hickoryai", "hickory-ai", 99) == "enqueue"
+    assert ownership(db, "acme", "widgets", 7) == "enqueue"
     monkeypatch.delenv(ENV_ACCOUNT)
-    assert ownership(db, "hickoryai", "hickory-ai", 99) == "ignore"
+    assert ownership(db, "acme", "widgets", 7) == "ignore"
     assert pinned_model() is None
 
 
@@ -374,112 +350,52 @@ async def test_webhook_enqueues_one_row_and_skips_legacy_handler(
     assert _store(db).get_by_head("hickoryai", "hickory-ai", 7, HEAD).id == row.id
 
 
-async def test_non_allowlisted_repo_on_same_installation_gets_no_review(
+async def test_flag_on_enqueues_every_installed_repo(
     db: AppDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _enable(monkeypatch, db)
-    db.register_repo("hickoryai", "kory-cli", installation_id=42)
-    payload = _payload(owner="hickoryai", repo="kory-cli")
-    status, scheduled = await _dispatch(db, payload, monkeypatch)
-    assert status == "ignored"
-    assert handle_pull_request not in scheduled
-    assert _store(db).get_by_head("hickoryai", "kory-cli", 7, HEAD) is None
+    db.register_repo("acme", "widgets", installation_id=42)
+    repos = (("hickoryai", "hickory-ai"), ("acme", "widgets"))
+    for owner, repo in repos:
+        status, scheduled = await _dispatch(
+            db, _payload(owner=owner, repo=repo, installation=42), monkeypatch
+        )
+        assert status == "processing"
+        assert handle_pull_request not in scheduled
+        row = _store(db).get_by_head(owner, repo, 7, HEAD)
+        assert row is not None
+        assert row.state == "queued"
+        again, scheduled_again = await _dispatch(
+            db, _payload(owner=owner, repo=repo, installation=42), monkeypatch
+        )
+        assert again == "processing"
+        assert handle_pull_request not in scheduled_again
+        assert _store(db).get_by_head(owner, repo, 7, HEAD).id == row.id
 
-    monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW")
-    status_off, scheduled_off = await _dispatch(db, payload, monkeypatch)
-    assert status_off == "ignored"
-    assert handle_pull_request not in scheduled_off
-    assert _store(db).get_by_head("hickoryai", "kory-cli", 7, HEAD) is None
 
-
-async def test_allowlisted_repo_enqueues_once_with_all_repos_installation(
+async def test_pause_or_missing_account_ignores_both_repos(
     db: AppDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _enable(monkeypatch, db)
-    db.register_repo("hickoryai", "kory-cli", installation_id=42)
-    db.register_repo("hickoryai", "kory-source", installation_id=42)
-    status, scheduled = await _dispatch(db, _payload(), monkeypatch)
-    assert status == "processing"
-    assert handle_pull_request not in scheduled
-    row = _store(db).get_by_head("hickoryai", "hickory-ai", 7, HEAD)
-    assert row is not None
-    assert row.state == "queued"
-
-    again, scheduled_again = await _dispatch(db, _payload(action="synchronize"), monkeypatch)
-    assert again == "processing"
-    assert handle_pull_request not in scheduled_again
-    assert _store(db).get_by_head("hickoryai", "hickory-ai", 7, HEAD).id == row.id
-
-
-async def test_mention_commands_follow_the_allowlist(
-    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", TRIAL_REPO)
-    monkeypatch.setattr("mira.platforms.github.webhook._get_app_db", lambda: db)
-    auth = AsyncMock()
-    auth.get_bot_identity = AsyncMock(return_value=None)
-
-    def comment_payload(repo: str) -> dict:
-        return {
-            "action": "created",
-            "installation": {"id": 42},
-            "comment": {
-                "body": "@mira-bot review",
-                "user": {"login": "octocat", "type": "User"},
-            },
-            "issue": {
-                "number": 7,
-                "pull_request": {"url": f"https://api.github.com/repos/hickoryai/{repo}/pulls/7"},
-            },
-            "repository": {
-                "owner": {"login": "hickoryai"},
-                "name": repo,
-                "full_name": f"hickoryai/{repo}",
-            },
-            "sender": {"login": "octocat"},
-        }
-
-    def review_comment_payload(repo: str) -> dict:
-        return {
-            "action": "created",
-            "installation": {"id": 42},
-            "comment": {
-                "body": "@mira-bot reject",
-                "user": {"login": "octocat", "type": "User"},
-            },
-            "pull_request": {"number": 7},
-            "repository": {
-                "owner": {"login": "hickoryai"},
-                "name": repo,
-                "full_name": f"hickoryai/{repo}",
-            },
-            "sender": {"login": "octocat"},
-        }
-
-    allowed_tasks = BackgroundTasks()
-    allowed = await dispatch_github_event(
-        "issue_comment", comment_payload("hickory-ai"), auth, "mira-bot", allowed_tasks
-    )
-    assert allowed == "processing"
-    assert handle_comment in [task.func for task in allowed_tasks.tasks]
-
-    blocked_tasks = BackgroundTasks()
-    blocked = await dispatch_github_event(
-        "issue_comment", comment_payload("kory-cli"), auth, "mira-bot", blocked_tasks
-    )
-    assert blocked == "ignored"
-    assert handle_comment not in [task.func for task in blocked_tasks.tasks]
-
-    thread_tasks = BackgroundTasks()
-    thread = await dispatch_github_event(
-        "pull_request_review_comment",
-        review_comment_payload("kory-cli"),
-        auth,
-        "mira-bot",
-        thread_tasks,
-    )
-    assert thread == "ignored"
-    assert handle_thread_reject not in [task.func for task in thread_tasks.tasks]
+    db.register_repo("acme", "widgets", installation_id=42)
+    repos = (("hickoryai", "hickory-ai"), ("acme", "widgets"))
+    set_paused(db, True)
+    for owner, repo in repos:
+        status, scheduled = await _dispatch(
+            db, _payload(owner=owner, repo=repo, installation=42), monkeypatch
+        )
+        assert status == "ignored"
+        assert handle_pull_request not in scheduled
+        assert _store(db).get_by_head(owner, repo, 7, HEAD) is None
+    set_paused(db, False)
+    monkeypatch.delenv(ENV_ACCOUNT)
+    for owner, repo in repos:
+        status, scheduled = await _dispatch(
+            db, _payload(owner=owner, repo=repo, installation=42), monkeypatch
+        )
+        assert status == "ignored"
+        assert handle_pull_request not in scheduled
+        assert _store(db).get_by_head(owner, repo, 7, HEAD) is None
 
 
 async def test_pause_stops_enqueue_without_a_code_change(
