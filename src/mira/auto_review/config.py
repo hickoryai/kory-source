@@ -17,6 +17,7 @@ from mira.config import FilterConfig, LLMConfig, MiraConfig, OverlapConfig, Revi
 ENV_FLAG = "KORY_SOURCE_AUTO_REVIEW"
 ENV_REPOS = "KORY_SOURCE_AUTO_REVIEW_REPOS"
 ENV_TOKEN = "KORY_SOURCE_AUTO_REVIEW_TOKEN"
+ENV_ACCOUNT = "KORY_SOURCE_AUTO_REVIEW_ACCOUNT"
 ENV_SOURCE_URL = "KORY_SOURCE_URL"
 PAUSE_SETTING = "auto_review_paused"
 
@@ -29,7 +30,10 @@ _ONE_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 # account pool. It is not started by this process.
 WORKER_HOST = "dev-kory-ai"
 
-MODEL_PIN = "grok@59aa6fc18f3f4b929dd9d59a6f3bfc11/grok-4.7"
+# The model stays this name. The account id is local to the worker's router
+# and is supplied at enablement. Nothing here fills in another account or model.
+MODEL_NAME = "grok-4.7"
+_ACCOUNT = re.compile(r"grok@[0-9a-f]{32}\Z")
 CALL_TIMEOUT_SECONDS = 1800
 REVIEW_EVENT = "COMMENT"
 SECONDARY_LABEL = "Kory Source (secondary reviewer)"
@@ -46,8 +50,11 @@ ENABLEMENT_STEPS: tuple[str, ...] = (
     "Confirm the installation lists that one repository and the dashboard has "
     "it registered to that installation.",
     "On the Kory Source service set KORY_SOURCE_AUTO_REVIEW=1, "
-    "KORY_SOURCE_AUTO_REVIEW_REPOS to that one owner/repo, and "
-    "KORY_SOURCE_AUTO_REVIEW_TOKEN to a shared secret. Restart the service.",
+    "KORY_SOURCE_AUTO_REVIEW_REPOS to that one owner/repo, "
+    "KORY_SOURCE_AUTO_REVIEW_TOKEN to a shared secret, and "
+    "KORY_SOURCE_AUTO_REVIEW_ACCOUNT to the routeable grok@ account on the "
+    "worker host. The model is grok-4.7. An unset account does not select "
+    "another model. Restart the service.",
     "On dev-kory-ai (the workstation with the logged-in router account pool) "
     "start the seat worker with KORY_SOURCE_AUTO_REVIEW=1, the same token, "
     "KORY_SOURCE_URL pointing at the service, and the local relay credentials. "
@@ -65,6 +72,18 @@ ENABLEMENT_STEPS: tuple[str, ...] = (
 def flag_on() -> bool:
     """True only when the process env explicitly enables the path."""
     return os.environ.get(ENV_FLAG) == "1"
+
+
+def pinned_model() -> str | None:
+    """The one review model, or None when the account is not configured.
+
+    The value is ``grok@<32 hex>/<MODEL_NAME>``. ``auto``, a different model,
+    and a missing account all return None. This does not substitute another id.
+    """
+    account = os.environ.get(ENV_ACCOUNT, "").strip()
+    if _ACCOUNT.fullmatch(account) is None:
+        return None
+    return f"{account}/{MODEL_NAME}"
 
 
 def env_repos() -> set[str]:
@@ -107,14 +126,20 @@ def trial_mira_config() -> MiraConfig:
     """Engine settings for one frozen head.
 
     Built here, not via ``load_config()``, so a dashboard override cannot
-    lower the floor, raise the cap, or turn nitpicks back on.
+    lower the floor, raise the cap, or turn nitpicks back on. Refuses to build
+    a config when the account env does not name a grok account.
     """
+    model = pinned_model()
+    if model is None:
+        raise RuntimeError(
+            f"{ENV_ACCOUNT} must be a grok@ account id. The model stays {MODEL_NAME}."
+        )
     llm = LLMConfig(
         provider="router-acp",
-        model=MODEL_PIN,
-        review_model=MODEL_PIN,
-        indexing_model=MODEL_PIN,
-        security_model=MODEL_PIN,
+        model=model,
+        review_model=model,
+        indexing_model=model,
+        security_model=model,
         router_acp_conversations=True,
         router_acp_timeout_seconds=CALL_TIMEOUT_SECONDS,
         router_acp_priority="review",
@@ -155,7 +180,7 @@ def ownership(db: Any, owner: str, repo: str, installation_id: int) -> str | Non
     chosen = selected_repo()
     if chosen is None or f"{owner}/{repo}" != chosen:
         return None
-    if paused(db) or not installation_is_only_trial(db, installation_id):
+    if paused(db) or pinned_model() is None or not installation_is_only_trial(db, installation_id):
         return "ignore"
     return "enqueue"
 
@@ -181,14 +206,15 @@ def switch_view(db: Any) -> dict[str, Any]:
     is_paused = paused(db)
     repos = sorted(env_repos())
     chosen = selected_repo()
+    model = pinned_model()
     return {
         "env_enabled": enabled,
         "paused": is_paused,
-        "effective": enabled and not is_paused and chosen is not None,
+        "effective": enabled and not is_paused and chosen is not None and model is not None,
         "allowlist": [chosen] if chosen is not None else [],
         "env_repos": repos,
         "worker_host": WORKER_HOST,
-        "model": MODEL_PIN,
+        "model": model,
         "timeout_seconds": CALL_TIMEOUT_SECONDS,
         "review_event": REVIEW_EVENT,
         "conversations": True,

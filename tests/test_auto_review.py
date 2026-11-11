@@ -18,11 +18,13 @@ from httpx import ASGITransport, AsyncClient
 
 from mira.auto_review.config import (
     ENABLEMENT_STEPS,
-    MODEL_PIN,
+    ENV_ACCOUNT,
+    MODEL_NAME,
     REVIEW_EVENT,
     SECONDARY_LABEL,
     WORKER_HOST,
     ownership,
+    pinned_model,
     review_preamble,
     set_paused,
     trial_filter,
@@ -49,6 +51,8 @@ HEAD = "a" * 40
 HEAD_NEXT = "b" * 40
 BASE = "c" * 40
 TRIAL_REPO = "hickoryai/hickory-ai"
+ROUTEABLE_ACCOUNT = "grok@" + "ab" * 16
+ROUTEABLE_MODEL = f"{ROUTEABLE_ACCOUNT}/{MODEL_NAME}"
 
 
 @pytest.fixture
@@ -57,6 +61,7 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppDatabase:
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW", raising=False)
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_REPOS", raising=False)
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", raising=False)
+    monkeypatch.delenv(ENV_ACCOUNT, raising=False)
     database = AppDatabase(url="", admin_password="admin")
     monkeypatch.setattr("mira.dashboard.api._app_db", database)
     return database
@@ -71,6 +76,7 @@ def _enable(
 ) -> None:
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", TRIAL_REPO)
+    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
     database.register_repo("hickoryai", "hickory-ai", installation_id=installation_id)
 
 
@@ -286,6 +292,8 @@ def test_enablement_steps_need_no_code_reconstruction() -> None:
     assert "0.11.0" in text
     assert "KORY_SOURCE_AUTO_REVIEW" in text
     assert "KORY_SOURCE_AUTO_REVIEW_REPOS" in text
+    assert ENV_ACCOUNT in text
+    assert MODEL_NAME in text
     assert "one owner/repo" in text
     assert "hickory" not in text.lower()
     assert "No code reconstruction" in text
@@ -329,6 +337,9 @@ def test_ownership_gates(db: AppDatabase, monkeypatch: pytest.MonkeyPatch) -> No
     assert ownership(db, "hickoryai", "hickory-ai", 99) == "ignore"
     set_paused(db, False)
     assert ownership(db, "hickoryai", "hickory-ai", 99) == "enqueue"
+    monkeypatch.delenv(ENV_ACCOUNT)
+    assert ownership(db, "hickoryai", "hickory-ai", 99) == "ignore"
+    assert pinned_model() is None
 
 
 async def test_webhook_enqueues_one_row_and_skips_legacy_handler(
@@ -470,17 +481,44 @@ def test_lapsed_lease_is_skipped_and_not_requeued(db: AppDatabase) -> None:
     assert store.claim_next("worker-b", lease_seconds=30, deadline_seconds=-1) is None
 
 
-def test_trial_filter_is_fixed_and_ignores_dashboard_overrides(db: AppDatabase) -> None:
+def test_pinned_model_rejects_substitution(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert pinned_model() is None
+    for value in (
+        "auto",
+        "",
+        "grok@AUTO",
+        "claude@" + "ab" * 16,
+        "grok@" + "AB" * 16,
+        "grok@" + "ab" * 15,
+        f"{ROUTEABLE_ACCOUNT}/other-model",
+        "grok@59aa6fc18f3f4b929dd9d59a6f3bfc11/grok-4.7",
+    ):
+        monkeypatch.setenv(ENV_ACCOUNT, value)
+        assert pinned_model() is None
+    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
+    assert pinned_model() == ROUTEABLE_MODEL
+    compiled = "\n".join(path.read_text() for path in Path("src/mira/auto_review").rglob("*.py"))
+    assert "59aa6fc18f3f4b929dd9d59a6f3bfc11" not in compiled
+    monkeypatch.delenv(ENV_ACCOUNT)
+    with pytest.raises(RuntimeError, match=MODEL_NAME):
+        trial_mira_config()
+
+
+def test_trial_filter_is_fixed_and_ignores_dashboard_overrides(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db.set_global_review_overrides(
         {"filter": {"confidence_threshold": 0.1, "max_comments": 50, "min_severity": "nitpick"}}
     )
     loaded = load_config()
     assert loaded.filter.max_comments == 50
+    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
     trial = trial_mira_config()
     assert trial.filter.confidence_threshold == 0.7
     assert trial.filter.max_comments == 5
     assert trial.filter.min_severity == "suggestion"
-    assert trial.llm.model == MODEL_PIN
+    assert trial.llm.model == ROUTEABLE_MODEL
+    assert trial.llm.model.endswith(f"/{MODEL_NAME}")
     assert trial.llm.router_acp_conversations is True
     assert trial.llm.router_acp_timeout_seconds == 1800
     assert trial.review.agentic_tools is True
@@ -526,6 +564,7 @@ def test_build_trial_engine_does_not_load_dashboard_config(
         raise AssertionError("load_config called")
 
     monkeypatch.setattr("mira.config.load_config", _boom)
+    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
     engine = build_trial_engine(provider=MagicMock(), transport=AsyncMock())
     assert isinstance(engine, ReviewEngine)
     assert engine.dry_run is True
@@ -534,7 +573,7 @@ def test_build_trial_engine_does_not_load_dashboard_config(
     assert engine.config.review.agentic_tools is True
     assert engine.config.llm.router_acp_conversations is True
     assert engine.config.llm.router_acp_timeout_seconds == 1800
-    assert engine.config.llm.model == MODEL_PIN
+    assert engine.config.llm.model == ROUTEABLE_MODEL
     assert engine.llm.config.router_acp_conversations is True
     assert engine.llm is engine.indexing_llm
     assert engine.llm is engine.security_llm
@@ -570,6 +609,7 @@ async def test_registry_context_skips_registry_hooks(
     monkeypatch.setattr("mira.registry.prompt.with_registry_tool", _wrap)
     monkeypatch.setattr("mira.core.engine.agentic_review_loop", _loop)
     monkeypatch.setattr("mira.core.engine.build_code_context", _context)
+    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
 
     config = trial_mira_config()
     config.review.security_pass = False
@@ -702,12 +742,12 @@ async def test_seat_transport_round_trip(db: AppDatabase) -> None:
             work = store.next_pending()
             if work is not None:
                 assert work.prompt == "review this"
-                assert work.model == MODEL_PIN
+                assert work.model == ROUTEABLE_MODEL
                 assert work.timeout_seconds == 1800
                 assert store.answer_work(
                     work.id,
                     text='{"comments": []}',
-                    actual_model=MODEL_PIN,
+                    actual_model=ROUTEABLE_MODEL,
                     conversation={"id": "conv-1", "opened": True},
                 )
                 return
@@ -719,7 +759,7 @@ async def test_seat_transport_round_trip(db: AppDatabase) -> None:
             {
                 "body": {
                     "prompt": "review this",
-                    "model": MODEL_PIN,
+                    "model": ROUTEABLE_MODEL,
                     "timeout_seconds": 1800,
                 }
             }
@@ -728,7 +768,7 @@ async def test_seat_transport_round_trip(db: AppDatabase) -> None:
     await _answer()
     payload = await asyncio.wait_for(task, timeout=3)
     assert payload["text"] == '{"comments": []}'
-    assert payload["actual_model"] == MODEL_PIN
+    assert payload["actual_model"] == ROUTEABLE_MODEL
     assert payload["conversation"] == {"id": "conv-1", "opened": True}
 
 
@@ -857,7 +897,7 @@ async def test_admin_switch_and_worker_routes(
         work_id = store.create_work(
             job.id,
             prompt="review this",
-            model=MODEL_PIN,
+            model=ROUTEABLE_MODEL,
             timeout_seconds=1800,
         )
         polled = await client.get(
@@ -873,7 +913,7 @@ async def test_admin_switch_and_worker_routes(
             headers={"Authorization": "Bearer seat-secret"},
             json={
                 "text": '{"comments": []}',
-                "actual_model": MODEL_PIN,
+                "actual_model": ROUTEABLE_MODEL,
                 "conversation": {"id": "conv-9", "opened": True},
             },
         )
