@@ -21,6 +21,8 @@ _PUBLIC_PATHS = {"/api/auth/login", "/docs", "/openapi.json", "/redoc"}
 # The badge SVG must be public so GitHub can embed it as an image
 _PUBLIC_SVG = re.compile(r"/api/repos/[^/]+/[^/]+/blast-radius\.svg")
 _REVIEW_API = re.compile(r"/api/reviews(?:/[^/]+(?:/report|/work/[^/]+)?)?")
+# Seat-worker bearer. It does not authenticate any other dashboard route.
+_AUTO_REVIEW_WORK = re.compile(r"/api/auto-review/work(?:/[^/]+)?")
 
 
 class LoginRequest(BaseModel):
@@ -200,9 +202,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if not request.url.path.startswith("/api/"):
             return await call_next(request)
 
-        # Review-API bearer tokens reach /api/reviews only; never the dashboard.
+        # Review-API bearer tokens reach /api/reviews only. The seat worker
+        # bearer reaches /api/auto-review/work only. Neither opens the dashboard.
         authorization = request.headers.get("authorization", "")
         if authorization[:7].lower() == "bearer ":
+            bearer = authorization[7:].strip()
+            if _AUTO_REVIEW_WORK.fullmatch(request.url.path):
+                from mira.auto_review.routes import worker_authorized
+
+                if not worker_authorized(bearer):
+                    return JSONResponse(
+                        status_code=401,
+                        content={"error": "Invalid auto-review worker token"},
+                    )
+                request.state.auto_review_worker = True
+                return await call_next(request)
             from mira.review_api.tokens import authenticate, transport_allowed
 
             if not _REVIEW_API.fullmatch(request.url.path):
@@ -213,7 +227,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 return JSONResponse(
                     status_code=403, content={"error": "Review API tokens require HTTPS"}
                 )
-            principal = authenticate(authorization[7:].strip())
+            principal = authenticate(bearer)
             if principal is None:
                 return JSONResponse(status_code=401, content={"error": "Invalid review token"})
             request.state.review_principal = principal

@@ -424,6 +424,7 @@ class ReviewEngine:
         dry_run: bool = False,
         indexing_llm: LLMProviderProtocol | None = None,
         security_llm: LLMProviderProtocol | None = None,
+        registry_context: bool = True,
     ) -> None:
         self.config = config
         self.llm = llm
@@ -432,6 +433,9 @@ class ReviewEngine:
         self.provider = provider
         self.bot_name = bot_name
         self.dry_run = dry_run
+        # Secondary review turns this off so the registry block and
+        # search_decisions tool stay out of the frozen-head pass.
+        self.registry_context = registry_context
         # `_jit_needed` (per-PR: index has no summaries for *this PR's* files)
         # is not the same as `_index_was_empty` (whole-repo: no data at all).
         # Only the latter drives the user-visible "your repo isn't indexed" nudge.
@@ -772,7 +776,7 @@ class ReviewEngine:
 
             raise
 
-        if not result.reviewed_files:  # Kory Source: returned before the registry hook
+        if not result.reviewed_files and self.registry_context:
             await finish_registry(self, [])
         # The final walkthrough must land after the in-progress one, or it gets
         # overwritten on fast PRs and stays stuck on "in progress".
@@ -1066,14 +1070,7 @@ class ReviewEngine:
         team_conventions: str = "",
         extra_custom_rules: list[dict[str, str]] | None = None,
     ) -> ReviewResult:
-        """Review a frozen PR snapshot and return the result without posting.
-
-        The caller supplies the diff and a provider pinned to the snapshot.
-        This path posts nothing, resolves no threads, and records no review
-        history, progress, or last-reviewed SHA. It is always a first-round,
-        full-diff review. ``extra_custom_rules`` are appended to the rules the
-        index already contributes.
-        """
+        """Review one frozen diff. Posts nothing and records no review history."""
         self._pr_info = pr_info
         return await self._review_diff_internal(
             diff_text,
@@ -1348,7 +1345,7 @@ class ReviewEngine:
             pass
         try:
             pr_info = getattr(self, "_pr_info", None)
-            if pr_info is not None:
+            if pr_info is not None and self.registry_context:
                 await apply_registry(
                     self, pr_info, filtered, custom_rules, diff_text, pr_title, pr_description
                 )
@@ -1420,7 +1417,8 @@ class ReviewEngine:
                             source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
                             repo_tree=list(self._agentic_repo_tree),
                         )
-                        executor = with_registry_tool(executor, getattr(self, "_pr_info", None))
+                        if self.registry_context:
+                            executor = with_registry_tool(executor, getattr(self, "_pr_info", None))
                         raw_response = await agentic_review_loop(self.llm, messages, executor)
                         audit.append({"stage": "agentic", "chunk": idx, "calls": executor.call_log})
                     if not raw_response:
@@ -1646,7 +1644,8 @@ class ReviewEngine:
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
 
-        final_comments = await finish_registry(self, final_comments)
+        if self.registry_context:
+            final_comments = await finish_registry(self, final_comments)
         all_key_issues = _drop_orphan_key_issues(all_key_issues, final_comments)
 
         if self.config.review.include_summary:

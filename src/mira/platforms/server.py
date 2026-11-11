@@ -120,7 +120,12 @@ def create_app(
 
         await review_service.start(app_auth)
 
+        from mira.auto_review.runner import start_auto_review, stop_auto_review
+
+        await start_auto_review(app_auth)
+
         yield
+        await stop_auto_review()
         await review_service.stop()
         if not registry_task.done():
             registry_task.cancel()
@@ -219,6 +224,10 @@ def create_app(
 
     register_dashboard(app)
     install_registry(app)
+
+    from mira.auto_review.routes import router as auto_review_router
+
+    app.include_router(auto_review_router)
 
     # UI dist resolution order: env override → Docker image path → repo-local.
     ui_dist_env = os.environ.get("MIRA_UI_DIST")

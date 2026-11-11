@@ -476,8 +476,21 @@ class GitHubProvider(BaseProvider):
         pr_info: PRInfo,
         result: ReviewResult,
         bot_name: str = "miracodeai",
+        commit_sha: str | None = None,
+        review_body: str | None = None,
+        comment_prefix: str | None = None,
     ) -> list[int]:
-        if not result.comments:
+        """Post one COMMENT review.
+
+        Callers that omit ``commit_sha`` keep today's behavior and anchor to
+        whatever commit is latest at post time. The secondary reviewer passes
+        the frozen sha so an older head cannot land on a newer commit. The
+        event is always COMMENT: this method never requests changes.
+        ``review_body``, when set, replaces the default summary heading and
+        is posted even when there are no inline comments.
+        """
+        self.last_review_id: int | None = None
+        if not result.comments and review_body is None:
             return []
 
         # The line GitHub anchors a comment to (the end line for multi-line).
@@ -487,6 +500,8 @@ class GitHubProvider(BaseProvider):
         review_comments: list[dict[str, str | int]] = []
         for comment in result.comments:
             body = _format_comment_body(comment, bot_name=bot_name)
+            if comment_prefix:
+                body = f"{comment_prefix}\n\n{body}"
             rc: dict[str, str | int] = {
                 "path": comment.path,
                 "body": body,
@@ -499,11 +514,12 @@ class GitHubProvider(BaseProvider):
 
             review_comments.append(rc)
 
-        review_body = ""
-        if result.summary:
-            review_body = f"**Mira Review Summary**\n\n{result.summary}"
-        if result.key_issues:
-            review_body += _format_key_issues(result.key_issues)
+        if review_body is None:
+            review_body = ""
+            if result.summary:
+                review_body = f"**Mira Review Summary**\n\n{result.summary}"
+            if result.key_issues:
+                review_body += _format_key_issues(result.key_issues)
 
         token = await self._resolve_token()
         gh = self._make_client(token)
@@ -513,10 +529,22 @@ class GitHubProvider(BaseProvider):
             gh_repo = gh.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             pr = gh_repo.get_pull(pr_info.number)
 
-            commits = list(pr.get_commits())
-            if not commits:
-                raise ProviderError("PR has no commits")
-            latest_commit = commits[-1]
+            if commit_sha:
+                try:
+                    latest_commit = gh_repo.get_commit(commit_sha)
+                except GithubException as exc:
+                    raise ProviderError(
+                        f"Frozen commit {commit_sha} is unavailable ({getattr(exc, 'status', '?')})"
+                    ) from exc
+            else:
+                commits = list(pr.get_commits())
+                if not commits:
+                    raise ProviderError("PR has no commits")
+                latest_commit = commits[-1]
+            logger.info(
+                "Posting COMMENT review on %s",
+                getattr(latest_commit, "sha", None) or commit_sha or "latest",
+            )
 
             # GitHub comment IDs aligned to result.comments (0 = unknown).
             ids = [0] * len(result.comments)
@@ -528,6 +556,7 @@ class GitHubProvider(BaseProvider):
                     event="COMMENT",
                     comments=review_comments,  # type: ignore[arg-type]
                 )
+                self.last_review_id = int(getattr(review, "id", 0) or 0)
                 # Map the posted comments back to ours by (path, anchored line)
                 # so human replies can later link to the exact comment.
                 try:
@@ -589,12 +618,13 @@ class GitHubProvider(BaseProvider):
             # If every inline failed, post the summary alone so the review still shows up.
             if posted == 0 and review_body:
                 try:
-                    pr.create_review(
+                    review = pr.create_review(
                         commit=latest_commit,
                         body=review_body,
                         event="COMMENT",
                         comments=[],
                     )
+                    self.last_review_id = int(getattr(review, "id", 0) or 0)
                 except GithubException as exc:
                     logger.warning(
                         "Summary-only fallback also failed (%s): %s",
