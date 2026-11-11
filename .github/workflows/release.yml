@@ -65,12 +65,16 @@ jobs:
           docker build --target build-context --output type=local,dest=/tmp/public-context .
           python3 scripts/audit_public_image.py --context /tmp/public-context
 
+      # Attestations stay off. A provenance or SBOM blob is not a layer of the
+      # candidate the next step audits, and the registry history audit scans it.
       - name: Build candidate locally
         uses: docker/build-push-action@v7
         with:
           context: .
           push: false
           load: true
+          provenance: false
+          sbom: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
