@@ -36,6 +36,16 @@ async def client(app) -> AsyncClient:  # noqa: ANN001
         yield c
 
 
+@pytest.fixture(autouse=True)
+def _review_allowlist_includes_fixture_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These HTTP cases describe testowner/testrepo, so it is on the allowlist.
+
+    Automatic reviews and @-mention commands run only for repositories named
+    by KORY_SOURCE_AUTO_REVIEW_REPOS.
+    """
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_REPOS", "testowner/testrepo")
+
+
 def _sign(payload_bytes: bytes) -> str:
     """Compute the X-Hub-Signature-256 for a payload."""
     sig = hmac.new(WEBHOOK_SECRET.encode(), payload_bytes, hashlib.sha256).hexdigest()

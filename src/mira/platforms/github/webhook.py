@@ -430,24 +430,48 @@ async def _handle_thread_freeform_reply(
         logger.exception("Error handling free-form thread reply")
 
 
-def _auto_review_status(payload: dict[str, Any]) -> str | None:
-    """Queue one secondary review, or leave today's reviewer in place.
-
-    ``None`` means the flag is off or this repository is not the trial
-    repository, so the caller keeps the existing path. The flag is read
-    before any head sha, so deliveries that omit ``head.sha`` stay valid
-    while the path is off. Drafts are included. ``ready_for_review`` for a
-    sha that is already queued inserts nothing.
-    """
-    from mira.auto_review.config import flag_on, ownership
-
-    if not flag_on():
-        return None
+def _payload_repo(payload: dict[str, Any]) -> tuple[str, str]:
     repository = payload.get("repository") or {}
     owner = str((repository.get("owner") or {}).get("login") or "")
     repo = str(repository.get("name") or "")
+    return owner, repo
+
+
+def _mention_repo_allowed(payload: dict[str, Any]) -> bool:
+    """Explicit @-mention commands follow the same repository allowlist."""
+    from mira.auto_review.config import repo_on_allowlist
+
+    owner, repo = _payload_repo(payload)
+    return repo_on_allowlist(owner, repo)
+
+
+def _auto_review_status(payload: dict[str, Any]) -> str | None:
+    """Queue one secondary review, or leave the allowlisted reviewer in place.
+
+    ``ignored`` means this repository is outside ``KORY_SOURCE_AUTO_REVIEW_REPOS``
+    or the secondary review is not allowed to run, so neither reviewer runs.
+    ``None`` means the repository is on that allowlist and the flag is off, so
+    the caller keeps the existing reviewer. The allowlist is read before the
+    flag, and the flag is read before any head sha, so a delivery that omits
+    ``head.sha`` stays valid for an allowlisted repository while the path is
+    off. Drafts are included. ``ready_for_review`` for a sha that is already
+    queued inserts nothing.
+    """
+    from mira.auto_review.config import flag_on, ownership, repo_on_allowlist
+
+    owner, repo = _payload_repo(payload)
     pr = payload.get("pull_request") or {}
     number = int(pr.get("number") or 0)
+    if not repo_on_allowlist(owner, repo):
+        logger.info(
+            "auto review ignored %s/%s#%s — repository is not on the review allowlist",
+            owner,
+            repo,
+            number,
+        )
+        return "ignored"
+    if not flag_on():
+        return None
     installation_id = int((payload.get("installation") or {}).get("id") or 0)
     decision = ownership(_get_app_db(), owner, repo, installation_id)
     if decision is None:
@@ -587,6 +611,14 @@ async def dispatch_github_event(
             return "ignored"
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         if "pull_request" in payload.get("issue", {}) and has_mention(comment_body, names):
+            if not _mention_repo_allowed(payload):
+                owner, repo = _payload_repo(payload)
+                logger.info(
+                    "mention ignored %s/%s — repository is not on the review allowlist",
+                    owner,
+                    repo,
+                )
+                return "ignored"
             cmd_word = command_after_mention(comment_body, names)
             if cmd_word in _PAUSE_KEYWORDS | _RESUME_KEYWORDS:
                 background_tasks.add_task(
@@ -605,6 +637,14 @@ async def dispatch_github_event(
             return "ignored"
         names = mention_names(bot_name, await app_auth.get_bot_identity())
         if has_mention(rc_body, names):
+            if not _mention_repo_allowed(payload):
+                owner, repo = _payload_repo(payload)
+                logger.info(
+                    "mention ignored %s/%s — repository is not on the review allowlist",
+                    owner,
+                    repo,
+                )
+                return "ignored"
             background_tasks.add_task(handle_thread_reject, payload, app_auth, bot_name)
             return "processing"
 

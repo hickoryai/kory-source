@@ -1,9 +1,10 @@
 """Fixed trial settings for the secondary reviewer.
 
 The noise filter does not read the dashboard override blob
-(``global_review_overrides``). The path stays off until the service env names
-the same single repository as the GitHub App installation. Nothing here turns
-the flag on.
+(``global_review_overrides``). Automatic reviews run only for repositories
+named by ``KORY_SOURCE_AUTO_REVIEW_REPOS``. The GitHub App may be installed
+on more repositories; the installation must include the named one or nothing
+is queued. Nothing here turns the flag on.
 """
 
 from __future__ import annotations
@@ -22,8 +23,9 @@ ENV_SOURCE_URL = "KORY_SOURCE_URL"
 PAUSE_SETTING = "auto_review_paused"
 
 # One owner/repo. The organization name is not compiled in: the service env
-# names the repository at enablement, and the GitHub App installation must
-# list that same single repository or nothing is queued.
+# names the repository at enablement. The GitHub App installation must
+# include that repository or nothing is queued. Repositories outside the
+# env allowlist get no automatic review.
 _ONE_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 # The seat worker runs here: the workstation that holds the logged-in router
@@ -46,9 +48,11 @@ ENABLEMENT_STEPS: tuple[str, ...] = (
     "public-image audit passes for that exact artifact and a maintainer with "
     "publishing authority has approved it.",
     "Deploy that image. Leave KORY_SOURCE_AUTO_REVIEW unset until the remaining steps are done.",
-    "Install the GitHub App on the one repository chosen for the comparison. "
-    "Confirm the installation lists that one repository and the dashboard has "
-    "it registered to that installation.",
+    "Install the GitHub App on the repositories that should be able to use it. "
+    "The App may be installed on all repositories. "
+    "KORY_SOURCE_AUTO_REVIEW_REPOS is the allowlist that decides where Kory "
+    "reviews. Confirm the installation includes the one owner/repo named by "
+    "that allowlist and the dashboard has it registered to that installation.",
     "On the Kory Source service set KORY_SOURCE_AUTO_REVIEW=1, "
     "KORY_SOURCE_AUTO_REVIEW_REPOS to that one owner/repo, "
     "KORY_SOURCE_AUTO_REVIEW_TOKEN to a shared secret, and "
@@ -167,29 +171,43 @@ def trial_repo_selected(owner: str, repo: str) -> bool:
     return selected_repo() == f"{owner}/{repo}"
 
 
+def repo_on_allowlist(owner: str, repo: str) -> bool:
+    """True when ``KORY_SOURCE_AUTO_REVIEW_REPOS`` names this repository."""
+    return f"{owner}/{repo}" in env_repos()
+
+
 def ownership(db: Any, owner: str, repo: str, installation_id: int) -> str | None:
     """How a pull_request delivery for this repo is handled.
 
-    ``None`` leaves today's webhook reviewer in place. ``enqueue`` queues one
-    secondary review and must not call that reviewer. ``ignore`` means the
-    flag is on and this delivery is the one selected repository, but the
-    pause bit or the installation does not match, so neither reviewer runs.
+    ``ignore`` means no automatic review runs. That is every repository
+    outside ``KORY_SOURCE_AUTO_REVIEW_REPOS``, whether or not the flag is on,
+    and an allowlisted repository whose pause bit, model, or installation
+    does not allow the secondary review. ``None`` means the repository is on
+    the allowlist and the flag is off, so today's webhook reviewer runs.
+    ``enqueue`` queues one secondary review and must not call that reviewer.
     """
+    if not repo_on_allowlist(owner, repo):
+        return "ignore"
     if not flag_on():
         return None
     chosen = selected_repo()
     if chosen is None or f"{owner}/{repo}" != chosen:
-        return None
-    if paused(db) or pinned_model() is None or not installation_is_only_trial(db, installation_id):
+        return "ignore"
+    if paused(db) or pinned_model() is None or not installation_includes_trial(db, installation_id):
         return "ignore"
     return "enqueue"
 
 
-def installation_is_only_trial(db: Any, installation_id: int) -> bool:
+def installation_includes_trial(db: Any, installation_id: int) -> bool:
+    """True when this installation lists the trial repository.
+
+    Other repositories on the same installation do not block the trial.
+    The env allowlist decides where reviews run.
+    """
     chosen = selected_repo()
     if chosen is None:
         return False
-    return installation_repo_names(db, installation_id) == {chosen}
+    return chosen in installation_repo_names(db, installation_id)
 
 
 def review_preamble(head_sha: str) -> str:
@@ -200,7 +218,8 @@ def switch_view(db: Any) -> dict[str, Any]:
     """Admin view of the env and pause gate.
 
     ``effective`` is that gate. Each delivery also requires the GitHub App
-    installation to list only the trial repository.
+    installation to include the trial repository. Repositories outside the
+    env allowlist are not reviewed.
     """
     enabled = flag_on()
     is_paused = paused(db)
