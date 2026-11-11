@@ -433,11 +433,12 @@ async def _handle_thread_freeform_reply(
 def _auto_review_status(payload: dict[str, Any]) -> str | None:
     """Queue one secondary review, or leave today's reviewer in place.
 
-    ``None`` means the flag is off or this repository is not the trial
-    repository, so the caller keeps the existing path. The flag is read
-    before any head sha, so deliveries that omit ``head.sha`` stay valid
-    while the path is off. Drafts are included. ``ready_for_review`` for a
-    sha that is already queued inserts nothing.
+    ``None`` means the flag is off, so the caller keeps the existing path.
+    While the flag is on, a delivery is queued or ignored and the unlabeled
+    reviewer does not run. The flag is read before any head sha, so
+    deliveries that omit ``head.sha`` stay valid while the path is off.
+    Drafts are included. ``ready_for_review`` for a sha that is already
+    queued inserts nothing.
     """
     from mira.auto_review.config import flag_on, ownership
 
@@ -450,8 +451,6 @@ def _auto_review_status(payload: dict[str, Any]) -> str | None:
     number = int(pr.get("number") or 0)
     installation_id = int((payload.get("installation") or {}).get("id") or 0)
     decision = ownership(_get_app_db(), owner, repo, installation_id)
-    if decision is None:
-        return None
     if decision != "enqueue":
         logger.info(
             "auto review ignored %s/%s#%s installation=%s",
