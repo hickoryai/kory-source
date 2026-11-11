@@ -430,6 +430,62 @@ async def _handle_thread_freeform_reply(
         logger.exception("Error handling free-form thread reply")
 
 
+def _auto_review_status(payload: dict[str, Any]) -> str | None:
+    """Queue one secondary review, or leave today's reviewer in place.
+
+    ``None`` means the flag is off or this repository is not the trial
+    repository, so the caller keeps the existing path. The flag is read
+    before any head sha, so deliveries that omit ``head.sha`` stay valid
+    while the path is off. Drafts are included. ``ready_for_review`` for a
+    sha that is already queued inserts nothing.
+    """
+    from mira.auto_review.config import flag_on, ownership
+
+    if not flag_on():
+        return None
+    repository = payload.get("repository") or {}
+    owner = str((repository.get("owner") or {}).get("login") or "")
+    repo = str(repository.get("name") or "")
+    pr = payload.get("pull_request") or {}
+    number = int(pr.get("number") or 0)
+    installation_id = int((payload.get("installation") or {}).get("id") or 0)
+    decision = ownership(_get_app_db(), owner, repo, installation_id)
+    if decision is None:
+        return None
+    if decision != "enqueue":
+        logger.info(
+            "auto review ignored %s/%s#%s installation=%s",
+            owner,
+            repo,
+            number,
+            installation_id,
+        )
+        return "ignored"
+    head_sha = str((pr.get("head") or {}).get("sha") or "").strip()
+    base_sha = str((pr.get("base") or {}).get("sha") or "").strip()
+    if not head_sha or number <= 0:
+        logger.info("auto review skipped %s/%s#%s — missing head", owner, repo, number)
+        return "ignored"
+    from mira.auto_review.runner import wake_executor
+    from mira.auto_review.store import AutoReviewStore
+
+    store = AutoReviewStore(_get_app_db())
+    _row, inserted = store.enqueue(
+        platform="github",
+        owner=owner,
+        repo=repo,
+        pr_number=number,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        installation_id=installation_id,
+        title=str(pr.get("title") or ""),
+    )
+    if inserted:
+        wake_executor()
+        logger.info("auto review queued %s/%s#%s %s", owner, repo, number, head_sha)
+    return "processing"
+
+
 def _verify_signature(payload_bytes: bytes, signature_header: str, secret: str) -> bool:
     """Verify the X-Hub-Signature-256 HMAC signature (timing-safe)."""
     if not signature_header.startswith("sha256="):
@@ -476,10 +532,16 @@ async def dispatch_github_event(
         background_tasks.add_task(handle_pr_merged, payload, app_auth, bot_name)
         return "processing"
 
-    if event == "pull_request" and action in _PR_ACTIONS:
+    if event == "pull_request" and action in (_PR_ACTIONS | {"ready_for_review"}):
         sender = payload.get("sender", {}).get("login", "")
         if sender == f"{bot_name}[bot]":
             logger.debug("Ignoring pull_request event from self (%s)", sender)
+            return "ignored"
+
+        auto_status = _auto_review_status(payload)
+        if auto_status is not None:
+            return auto_status
+        if action not in _PR_ACTIONS:
             return "ignored"
 
         # Opt out of per-push reviews: only open/reopen auto-review, later

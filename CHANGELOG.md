@@ -6,6 +6,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Secondary reviewer, off by default.** When `KORY_SOURCE_AUTO_REVIEW=1`, the service allowlist, and the GitHub App installation all name the same one repository, a pull request head is reviewed once as a `COMMENT` on that frozen commit. The review body and each comment are labeled `Kory Source (secondary reviewer)` plus the head sha. The path never requests changes, never adds a required check, and never edits branch protection. Pause and rollback are an admin setting and a process stop. The seat worker is started on `dev-kory-ai` only at enablement. With the flag unset, webhook reviews stay on today's path.
+
 ## [0.10.0] — 2026-10-26
 
 ### Security
