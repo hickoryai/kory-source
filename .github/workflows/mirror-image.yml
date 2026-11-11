@@ -1,0 +1,72 @@
+name: Mirror image
+
+# Copy one already-published GHCR tag into a private registry. The destination
+# is repository configuration, not part of this file. This workflow does not
+# build or audit an image. The release workflow still audits before it pushes.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published image tag, such as 1.2.3
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check mirror configuration
+        env:
+          HOST: ${{ vars.KORY_SOURCE_MIRROR_HOST }}
+          WIF: ${{ vars.KORY_SOURCE_MIRROR_WIF_PROVIDER }}
+          SA: ${{ vars.KORY_SOURCE_MIRROR_SERVICE_ACCOUNT }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag must be a published X.Y.Z image tag"
+            exit 1
+          fi
+          if [[ -z "$HOST" || -z "$WIF" || -z "$SA" ]]; then
+            echo "Set KORY_SOURCE_MIRROR_HOST, KORY_SOURCE_MIRROR_WIF_PROVIDER, and KORY_SOURCE_MIRROR_SERVICE_ACCOUNT on this repository."
+            exit 1
+          fi
+          if [[ ! "$HOST" =~ ^[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+$ ]]; then
+            echo "mirror host is not a registry path"
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Authenticate to the mirror project
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.KORY_SOURCE_MIRROR_WIF_PROVIDER }}
+          service_account: ${{ vars.KORY_SOURCE_MIRROR_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Copy the published tag
+        env:
+          HOST: ${{ vars.KORY_SOURCE_MIRROR_HOST }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          src="ghcr.io/${GITHUB_REPOSITORY}:${TAG}"
+          dest="${HOST}:${TAG}"
+          docker pull "$src"
+          docker tag "$src" "$dest"
+          gcloud auth configure-docker "${HOST%%/*}" --quiet
+          docker push "$dest"
+          echo "mirrored ${src} to ${dest}"
