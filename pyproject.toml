@@ -46,6 +46,8 @@ dev = [
     "graphql-core>=3.2",
 ]
 serve = [
+    "opentelemetry-sdk>=1.28,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.28,<2",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.28",
     "PyJWT[crypto]>=2.8",

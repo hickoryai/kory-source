@@ -210,14 +210,23 @@ Mount configuration and credentials at runtime; do not add them to the build con
 relied on a built-in list sets `MIRA_INDEX_REPOS="owner/one owner/two"` instead;
 an explicit `--repo` overrides it. Without either, the command exits with a usage error.
 
-The optional router provider uses a runtime-installed tracing adapter selected by
-`MIRA_TRACING_MODULE` (an importable module name). That module must export
+The optional router provider requires an explicit runtime tracing adapter selected
+by `MIRA_TRACING_MODULE` (an importable module name). The shared default remains
+unset. For an individual box to opt in to the bundled adapter, set
+`MIRA_TRACING_MODULE=mira.tracing.otlp` only in that box's Agent Settings environment
+override (or equivalent per-box runtime environment). The adapter is installed by
+the `serve` extra and included in the image; bundling it does not enable it. Do not
+set this override in shared deployment configuration during an individual dogfood.
+A selected adapter must export
 `setup_otlp_tracing(endpoint=..., service_name=..., token=..., environment=...)` and
 an async `traced_llm_call`. Set `LLM_OTLP_ENDPOINT` at runtime; `token` comes from
 `CLAUDE_OTEL_SHARED_TOKEN` and `environment` from `ENVIRONMENT` when set. An unset
 endpoint, an unset or unimportable module, or a failing setup stops router calls
 (fails closed). `MIRA_ROUTER_ACP_ALLOW_UNTRACED=1` remains
-an explicit opt-out for environments that do not require tracing.
+an explicit opt-out for environments that do not require tracing. Setup validates
+exporter construction, not collector reachability; batch delivery is best effort.
+Spans include prompts, responses, model and token usage; configure the collector
+and its access controls for that runtime data.
 
 Before distributing an image, run `python3 scripts/audit_public_image.py --source .`
 and audit its Docker-save archive with `--image /path/to/image.tar`. The audit

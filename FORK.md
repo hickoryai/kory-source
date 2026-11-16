@@ -471,3 +471,14 @@ carries a `harness` marker). Scoring is unchanged.
 
 The design, the rules, and the commands are in
 `tests/benchmarks/fixtures/hickory/README.md`.
+
+## Bundled router tracing
+
+`src/mira/tracing/` provides a generic OTLP/HTTP adapter for the router provider.
+The `serve` extra includes the SDK and exporter. `src/mira/llm/router_acp.py`
+keeps its shared default unset. Individual boxes explicitly opt in with
+`MIRA_TRACING_MODULE=mira.tracing.otlp` in their runtime environment; existing
+adapters, the required runtime endpoint, and the explicit untraced opt-out remain
+unchanged. No collector address or
+credential is bundled. `tests/test_otlp_tracing.py` exercises exported spans and
+setup failures; router and public-image tests cover the integration contract.
