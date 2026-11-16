@@ -126,10 +126,13 @@ def test_tracing_adapter_is_runtime_configuration(monkeypatch):
     import pytest
 
     from mira.llm.router_acp import _import_tracing
+    from mira.tracing.otlp import setup_otlp_tracing, traced_llm_call
 
     monkeypatch.delenv("MIRA_TRACING_MODULE", raising=False)
     with pytest.raises(ImportError, match="MIRA_TRACING_MODULE"):
         _import_tracing()
+    monkeypatch.setenv("MIRA_TRACING_MODULE", "mira.tracing.otlp")
+    assert _import_tracing() == (setup_otlp_tracing, traced_llm_call)
     import sys
     from types import SimpleNamespace
 
