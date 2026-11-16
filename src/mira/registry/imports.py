@@ -22,8 +22,9 @@ import re
 import secrets
 from collections import Counter
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from mira.registry.access import AccessContext, AccessDenied, require_import
@@ -311,7 +312,7 @@ def read_cursors(registry: Any, source_system: str) -> dict[str, dict]:
 # ── deterministic decision extraction ───────────────────────────────────
 
 EXTRACTOR = "kory-source.decision-extractor"
-EXTRACTOR_VERSION = "1"
+EXTRACTOR_VERSION = "2"
 _DECISION_HEADING = re.compile(
     r"^\s{0,3}(?:#{1,6}\s*)?(?:\*\*|__)?\s*(?:decisions?(?:\s+i\s+made)?|adr\b[^\n]*)"
     r"\s*(?:\*\*|__)?\s*:?\s*(?:\*\*|__)?\s*$",
@@ -320,6 +321,22 @@ _DECISION_HEADING = re.compile(
 _ANY_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 _ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>\S.*)$")
 _SENT = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
+# These labels occur in source prose as well as under a ``Decisions`` heading.
+# They are deliberately signals only: materialization still creates proposals,
+# never approvals.
+_EXPLICIT_DECISION = re.compile(
+    r"\b(?:the\s+)?(?:owner|case)\s+decision\s*:\s*"
+    r"|\bdecided\s+(?:on\s+)?\d{4}-\d{2}-\d{2}\b"
+    r"|\b(?:the\s+)?decision\s+(?:on\s+)?\d{4}-\d{2}-\d{2}\s*(?:is|was)?\s*:\s*"
+    r"|\bapproved\s+by\s+\S+|\bratified(?:\s+by)?\b"
+    r"|^\s*\d{4}-\d{2}-\d{2}\s*[-–:]\s*(?:the\s+)?decision\s*:\s*",
+    re.I,
+)
+_NO_DECISION = re.compile(
+    r"^(?:no|none|nothing)\b.*\b(?:decision|decided|ratified|approved)\b|"
+    r"^never\s+(?:decided|ratified|approved)\b",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -368,7 +385,14 @@ def extract_decisions(text: str) -> list[Candidate]:
         if in_section and item:
             s = start + item.start("text")
             quote = text[s : start + len(body)].rstrip()
-            if quote.strip() and quote not in seen and not quote.rstrip().endswith("?"):
+            masked = _mask(quote)
+            if (
+                quote.strip()
+                and quote not in seen
+                and not quote.rstrip().endswith("?")
+                and not _NO_DECISION.search(masked)
+                and not _HYPOTHETICAL.search(masked)
+            ):
                 seen.add(quote)
                 out.append(
                     Candidate(s, s + len(quote), quote, heading, "item under a decisions heading")
@@ -381,7 +405,7 @@ def extract_decisions(text: str) -> list[Candidate]:
             if not sentence or sentence.endswith("?"):
                 continue
             masked = _mask(sentence)
-            hit = _COMMIT.search(masked)
+            hit = _COMMIT.search(masked) or _EXPLICIT_DECISION.search(masked)
             if hit is None:
                 continue
             if _NEGATED.search(masked[: hit.end()]) or _HYPOTHETICAL.search(masked[: hit.start()]):
@@ -435,8 +459,70 @@ def materialize(
     director = next((a for a in attributions if a.role == "director"), None)
     author_row = author.row() if author else None
     tier, reasons = classify(author=author_row, director=director.row() if director else None)
+    values = author.values if author else {}
+    source_author = values.get("original_identity") or ""
+
+    def retain_source_provenance(obj: dict, decision_time: float) -> None:
+        """Backfill source facts without changing lifecycle decisions.
+
+        ``decided_by`` is lifecycle approval provenance once a reviewer has
+        acted.  The importer may replace only its own default (or a blank) and
+        writes source occurrence time only while the object remains proposed.
+        """
+        changed = False
+        missing_provenance = obj.get("decided_by") in ("", IMPORT_ACTOR_SUB)
+        legacy = obj.get("author") in ("", IMPORT_ACTOR_SUB) or missing_provenance
+        needs_time = not obj.get("decided_at") or obj.get("decided_at") == obj.get("created_at")
+        for key, value in (
+            ("author", source_author),
+            ("author_kind", "human" if values.get("actor_kind") == "human" else "agent"),
+            ("model", values.get("original_model") or ""),
+            ("authority_tier", tier),
+            ("decision_revision", 1),
+        ):
+            if (
+                (legacy or not obj.get(key))
+                and obj.get("status") == "proposed"
+                and obj.get(key) != value
+            ):
+                if key == "decision_revision" and obj.get(key, 0) > 1:
+                    continue
+                obj[key] = value
+                changed = True
+        if source_url and (
+            not obj.get("source_url")
+            or (source_system == "git" and "#L" not in obj.get("source_url", ""))
+        ):
+            obj["source_url"] = source_url
+            changed = True
+        if (
+            obj.get("decided_by") in ("", IMPORT_ACTOR_SUB)
+            and obj.get("decided_by") != source_author
+        ):
+            obj["decided_by"] = source_author
+            changed = True
+        if (
+            decision_time
+            and obj.get("status") == "proposed"
+            and (needs_time or legacy)
+            and obj.get("decided_at") != decision_time
+        ):
+            obj["decided_at"] = decision_time
+            changed = True
+        if changed:
+            registry._write(obj)
+
     ids: list[str] = []
     for cand in candidates:
+        decision_time = occurred_at
+        stated_date = re.search(
+            r"\b(?:decided|ratified|approved)(?:\s+on)?\s+(\d{4}-\d{2}-\d{2})\b", cand.quote, re.I
+        )
+        if stated_date:
+            with suppress(ValueError):
+                decision_time = (
+                    datetime.strptime(stated_date[1], "%Y-%m-%d").replace(tzinfo=UTC).timestamp()
+                )
         key = hashlib.sha256(cand.quote.encode()).hexdigest()[:16]
         sid = f"{identity}:{key}" if identity else f"{evidence_id}:{cand.start}:{key}"
         item = {
@@ -456,6 +542,7 @@ def materialize(
             continue
         oid = res["object_id"]
         if res["outcome"] != "created":
+            retain_source_provenance(registry.get(oid), decision_time)
             store.add_decision_evidence(
                 oid,
                 evidence_id,
@@ -477,16 +564,7 @@ def materialize(
             ids.append(oid)
             continue
         obj = registry.get(oid)
-        values = author.values if author else {}
-        obj.update(
-            author=values.get("original_identity") or "",
-            author_kind="human" if values.get("actor_kind") == "human" else "agent",
-            model=values.get("original_model") or "",
-            decided_by="",
-            authority_tier=tier,
-            decision_revision=1,
-        )
-        registry._write(obj)
+        retain_source_provenance(obj, decision_time)
         store.add_decision_evidence(
             oid,
             evidence_id,
@@ -510,7 +588,7 @@ def materialize(
             authority_reasons=reasons,
             scope=str(item["scope"]),
             basis="migration",
-            effective_from=occurred_at,
+            effective_from=decision_time,
         )
         store.record_attributions(
             [

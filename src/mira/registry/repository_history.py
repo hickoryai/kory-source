@@ -1,16 +1,17 @@
-"""Read-only git history import: Markdown, code comments/docstrings, commit messages.
+"""Read-only git history import: prose, data rationales, comments and commit messages.
 
 From a local checkout of a manifest repository, at a frozen commit:
 
-- every Markdown file's revisions along its history (bounded by
+- Markdown, data, SQL and template revisions along their history (bounded by
   ``max_commits``), so a passage that was later rewritten or deleted is kept;
 - comments and docstrings in supported languages at the frozen commit,
   anchored to the enclosing symbol from the deterministic extractor;
 - commit messages, whose trailers can state an agent co-author, model, or
   invoker.
 
-Git author and committer labels are stored as source accounts. Neither is
-assumed to be the decision author or the invoking person.
+Git author and committer labels are stored as source accounts. Decision authors
+fall back to the line's Git author as an explicitly inferred identity, never an
+approver or an invoking person.
 
 ``GitReader`` runs a fixed allowlist of read-only git subcommands. Nothing
 here writes to the repository.
@@ -22,6 +23,8 @@ Run: ``python -m mira.registry.repository_history import --repo owner/name
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import logging
 import re
@@ -30,10 +33,14 @@ import sys
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+
+import yaml
 
 from mira.registry import attribution as attr
 from mira.registry.access import AccessContext, AccessDenied, require_import
 from mira.registry.imports import (
+    Candidate,
     ImportRuns,
     ReadOnlyViolation,
     extract_decisions,
@@ -46,8 +53,8 @@ logger = logging.getLogger(__name__)
 
 SOURCE_SYSTEM = "git"
 IMPORTER = "kory-source.repository-history"
-IMPORTER_VERSION = "2"
-_READ_ONLY = {"log", "show", "ls-tree", "rev-parse", "cat-file", "diff"}
+IMPORTER_VERSION = "3"
+_READ_ONLY = {"log", "show", "ls-tree", "rev-parse", "cat-file", "diff", "blame"}
 _MARKDOWN = (".md", ".mdx", ".markdown")
 # Comment syntax per language. Anything else is reported as unsupported.
 _LINE_COMMENT = {
@@ -89,6 +96,11 @@ _EXT = {
     ".cpp": "cpp",
     ".cs": "csharp",
     ".swift": "swift",
+    ".sql": "sql",
+    ".css": "css",
+    ".html": "html",
+    ".svg": "html",
+    ".j2": "jinja",
 }
 _BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _DOCSTRING = re.compile(r"(?P<q>\"\"\"|''')(?P<body>.*?)(?P=q)", re.S)
@@ -99,11 +111,292 @@ def language_of(path: str) -> str:
     return _EXT.get(Path(path).suffix.lower(), "")
 
 
+_DATA = {".json", ".yaml", ".yml", ".csv", ".toml"}
+_TEMPLATE = {".j2", ".html", ".svg", ".css", ".txt"}
+_REASON_KEYS = {"reason", "rationale", "why", "decision", "_comment"}
+_SKIP_DIRS = {"node_modules", "vendor", "dist", "build", ".git", "__pycache__", ".venv"}
+_LOCKFILES = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "poetry.lock",
+    "uv.lock",
+    "cargo.lock",
+    "composer.lock",
+    "pipfile.lock",
+}
+
+
+def file_kind(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    if path.lower().endswith(_MARKDOWN):
+        return "md"
+    if suffix == ".sql":
+        return "sql"
+    if suffix in _DATA:
+        return "data"
+    if suffix in _TEMPLATE:
+        return "template"
+    return "code" if language_of(path) else ""
+
+
+def skip_reason(path: str, text: str | None = None) -> str:
+    parts = {p.lower() for p in Path(path).parts}
+    name = Path(path).name.lower()
+    if parts & _SKIP_DIRS:
+        return "dependency_or_generated_directory"
+    if name in _LOCKFILES or name.endswith((".lock", ".min.js", ".min.css", ".map")):
+        return "lockfile_or_minified"
+    if text is not None:
+        if "\x00" in text:
+            return "binary"
+        header = text[:1000].lower()
+        if any(
+            marker in header
+            for marker in (
+                "@generated",
+                "automatically generated",
+                "do not edit: generated",
+                "code generated",
+            )
+        ):
+            return "generated"
+    return ""
+
+
+def inventory(reader: GitReader, frozen: str) -> tuple[list[tuple[str, str]], Counter[str]]:
+    """Same file selection for import, dry-run and coverage reconciliation."""
+    units: list[tuple[str, str]] = []
+    skipped: Counter[str] = Counter()
+    for path in reader.files(frozen):
+        reason = skip_reason(path)
+        kind = file_kind(path)
+        if not reason and kind:
+            try:
+                body = reader.show(frozen, path)
+                reason = "unavailable" if body is None else skip_reason(path, body)
+            except UnicodeError:
+                reason = "binary"
+        if reason or not kind:
+            skipped[reason or "unsupported"] += 1
+        else:
+            units.append((kind, path))
+    return units, skipped
+
+
+def _pointer(parts: list[str]) -> str:
+    return "/" + "/".join(p.replace("~", "~0").replace("/", "~1") for p in parts)
+
+
+def data_candidates(text: str, suffix: str) -> list[Candidate]:
+    """Reason values with exact lexical quotes and JSON-pointer-style key paths.
+
+    Ordinary descriptions need an explicit commitment. Reason keys identify
+    rationale, but questions and hypothetical/negated decisions are excluded.
+    Parsing is non-executing; malformed data fails the file rather than vanishing.
+    """
+    from mira.registry.uncited import _HYPOTHETICAL
+
+    out = []
+
+    def add(key: str, value: str, start: int, end: int, parts: list[str]) -> None:
+        if not value.strip() or value.strip().endswith("?"):
+            return
+        if re.fullmatch(r"(?:none|n/?a|unknown|todo|tbd|pending)[.!]?", value.strip(), re.I):
+            return
+        explicit = extract_decisions(value)
+        if not explicit and (
+            key.lower() not in _REASON_KEYS
+            or _HYPOTHETICAL.search(value)
+            or re.search(r"\b(?:undecided|not\s+(?:yet\s+)?decided|no\s+decision)\b", value, re.I)
+        ):
+            return
+        out.append(
+            Candidate(
+                start,
+                end,
+                text[start:end],
+                _pointer(parts),
+                "decision rationale value at " + _pointer(parts),
+            )
+        )
+
+    if suffix in {".json", ".yaml", ".yml"}:
+        if suffix == ".json":
+            json.loads(text)  # YAML's permissive parser must not accept invalid JSON.
+        root = yaml.compose(text, Loader=yaml.SafeLoader)
+
+        def walk(node, parts: list[str], key: str = "", ancestors=frozenset()):
+            if node is None or id(node) in ancestors:
+                return
+            ancestors = ancestors | {id(node)}
+            if isinstance(node, yaml.ScalarNode):
+                if node.tag == "tag:yaml.org,2002:str":
+                    add(key, node.value, node.start_mark.index, node.end_mark.index, parts)
+            elif isinstance(node, yaml.MappingNode):
+                for k, v in node.value:
+                    walk(v, [*parts, k.value], k.value, ancestors)
+            elif isinstance(node, yaml.SequenceNode):
+                for i, v in enumerate(node.value):
+                    walk(v, [*parts, str(i)], key, ancestors)
+
+        walk(root, [])
+    elif suffix == ".csv":
+        # csv.reader handles quoted embedded newlines. Parse each raw field again
+        # to retain its lexical offsets (including escapes and quote delimiters).
+        fields = list(re.finditer(r'(?:"(?:[^"]|"")*"|[^,\r\n]*)(?:,|\r?\n|$)', text))
+        rows = list(csv.reader(io.StringIO(text), strict=True))
+        headers = rows[0] if rows else []
+        cursor = 0
+        for row_no, row in enumerate(rows):
+            if not row:
+                cursor += 1  # csv.reader returns [] for an empty physical record.
+                continue
+            for col, value in enumerate(row):
+                if cursor >= len(fields):
+                    raise ValueError("CSV field offsets unavailable")
+                m = fields[cursor]
+                cursor += 1
+                end = m.end()
+                if text[end - 1 : end] == ",":
+                    end -= 1
+                else:
+                    while end > m.start() and text[end - 1] in "\r\n":
+                        end -= 1
+                if row_no:
+                    key = headers[col] if col < len(headers) else str(col)
+                    parts = ["rows", str(row_no - 1), key]
+                    if headers.count(key) > 1:
+                        parts.extend(["columns", str(col)])
+                    add(key, value, m.start(), end, parts)
+    elif suffix == ".toml":
+        import tomllib
+
+        tomllib.loads(text)  # Validate before the lexical walk; never execute values.
+        position = 0
+        section: list[str] = []
+        table_counts: Counter[tuple[str, ...]] = Counter()
+
+        def whitespace():
+            nonlocal position
+            while position < len(text):
+                if text[position].isspace():
+                    position += 1
+                elif text[position] == "#":
+                    end = text.find("\n", position)
+                    position = len(text) if end < 0 else end + 1
+                else:
+                    break
+
+        def string_token():
+            nonlocal position
+            start = position
+            delimiter = text[position : position + 3]
+            if delimiter not in {'"""', "'''"}:
+                delimiter = text[position]
+            position += len(delimiter)
+            while position < len(text):
+                if text.startswith(delimiter, position):
+                    position += len(delimiter)
+                    if len(delimiter) == 3:
+                        while position < len(text) and text[position] == delimiter[0]:
+                            position += 1
+                    raw = text[start:position]
+                    return start, position, tomllib.loads("value = " + raw)["value"]
+                if delimiter[0] == '"' and text[position] == "\\":
+                    position += 1
+                position += 1
+            raise ValueError("unterminated TOML string")
+
+        def keys():
+            nonlocal position
+            parts = []
+            while True:
+                whitespace()
+                if text[position] in "\"'":
+                    _, _, part = string_token()
+                else:
+                    match = re.match(r"[A-Za-z0-9_-]+", text[position:])
+                    if not match:
+                        raise ValueError("invalid TOML key")
+                    part = match[0]
+                    position += len(part)
+                parts.append(part)
+                whitespace()
+                if text[position : position + 1] != ".":
+                    return parts
+                position += 1
+
+        def scan_value(parts, key):
+            nonlocal position
+            whitespace()
+            char = text[position : position + 1]
+            if char in {"'", '"'}:
+                start, end, decoded = string_token()
+                add(key, decoded, start, end, parts)
+            elif char == "{":
+                position += 1
+                whitespace()
+                while text[position : position + 1] != "}":
+                    nested = keys()
+                    if text[position : position + 1] != "=":
+                        raise ValueError("invalid TOML inline assignment")
+                    position += 1
+                    scan_value([*parts, *nested], nested[-1])
+                    whitespace()
+                    if text[position : position + 1] != ",":
+                        break
+                    position += 1
+                position += 1
+            elif char == "[":
+                position += 1
+                index = 0
+                whitespace()
+                while text[position : position + 1] != "]":
+                    scan_value([*parts, str(index)], key)
+                    index += 1
+                    whitespace()
+                    if text[position : position + 1] != ",":
+                        break
+                    position += 1
+                    whitespace()
+                position += 1
+            else:
+                while position < len(text) and text[position] not in ",]}\r\n#":
+                    position += 1
+
+        while position < len(text):
+            whitespace()
+            if position >= len(text):
+                break
+            if text[position] == "[":
+                array = text.startswith("[[", position)
+                position += 2 if array else 1
+                named = keys()
+                section = []
+                for index, part in enumerate(named):
+                    section.append(part)
+                    group = tuple(named[: index + 1])
+                    if index == len(named) - 1 and array:
+                        table_counts[group] += 1
+                    if table_counts[group]:
+                        section.append(str(table_counts[group] - 1))
+                position += 2 if array else 1
+            else:
+                named = keys()
+                if text[position : position + 1] != "=":
+                    raise ValueError("invalid TOML assignment")
+                position += 1
+                scan_value([*section, *named], named[-1])
+    return out
+
+
 class GitReader:
     """Allowlisted read-only git commands against one checkout."""
 
     def __init__(self, checkout: str | Path) -> None:
         self.checkout = Path(checkout)
+        self._commit_cache: dict[str, dict] = {}
 
     def git(self, *args: str) -> str:
         if not args or args[0] not in _READ_ONLY:
@@ -175,10 +468,64 @@ class GitReader:
                 pairs.append((lines[0], lines[-1]))
         return pairs
 
+    def blame(self, commit: str, path: str, line: int) -> dict:
+        raw = self.git("blame", "--line-porcelain", "-L", f"{line},{line}", commit, "--", path)
+        sha = raw.split()[0]
+        if sha not in self._commit_cache:
+            commits = self.commits(sha, max_count=1)
+            if not commits:
+                raise RuntimeError("blame origin commit metadata unavailable")
+            self._commit_cache[sha] = commits[0]
+        return self._commit_cache[sha]
+
 
 def comment_spans(text: str, language: str) -> list[tuple[int, int, int]]:
     """``(start, end, line)`` of each comment or docstring body in ``text``."""
     spans: list[tuple[int, int, int]] = []
+    if language in {"sql", "css", "html", "jinja"}:
+        delimiters = {
+            "sql": [("--", "\n"), ("/*", "*/")],
+            "css": [("/*", "*/")],
+            "html": [("<!--", "-->")],
+            "jinja": [("{#", "#}")],
+        }[language]
+        i = 0
+        while i < len(text):
+            matched = False
+            for opening, closing in delimiters:
+                if text.startswith(opening, i):
+                    end = text.find(closing, i + len(opening))
+                    if end < 0:
+                        end = len(text)
+                    spans.append((i + len(opening), end, text.count("\n", 0, i) + 1))
+                    i = end + len(closing)
+                    matched = True
+                    break
+            if matched:
+                continue
+            # SQL strings/identifiers and dollar-quoted function bodies are
+            # executable values, never comments. CSS strings are likewise inert.
+            if language in {"sql", "css"} and text[i] in "'\"":
+                q = text[i]
+                i += 1
+                while i < len(text):
+                    if text[i] == q:
+                        if i + 1 < len(text) and text[i + 1] == q:
+                            i += 2
+                            continue
+                        i += 1
+                        break
+                    if text[i] == "\\":
+                        i += 1
+                    i += 1
+            elif language == "sql" and (
+                m := re.match(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$", text[i:])
+            ):
+                end = text.find(m[0], i + len(m[0]))
+                i = len(text) if end < 0 else end + len(m[0])
+            else:
+                i += 1
+        return spans
     marker = _LINE_COMMENT.get(language)
     if marker:
         offset = 0
@@ -236,17 +583,24 @@ class RepositoryHistoryImporter:
         if not policy.admits_repository(self.repo):
             raise AccessDenied("the repository is not in the approved corpus manifest")
         frozen = self.reader.rev_parse(self.commit)
-        files = self.reader.files(frozen)
-        markdown = [p for p in files if p.lower().endswith(_MARKDOWN)]
-        code = [p for p in files if language_of(p)]
-        unsupported = len(files) - len(markdown) - len(code)
+        selected, skipped = inventory(self.reader, frozen)
         if not apply:
+            totals = Counter(kind for kind, _ in selected)
             return {
                 "apply": False,
                 "commit": frozen,
-                "markdown_files": len(markdown),
-                "code_files": len(code),
-                "unsupported_files": unsupported,
+                **{
+                    f"{label}_files": totals[kind]
+                    for kind, label in (
+                        ("md", "markdown"),
+                        ("code", "code"),
+                        ("sql", "sql"),
+                        ("data", "data"),
+                        ("template", "template"),
+                    )
+                },
+                "unsupported_files": skipped["unsupported"],
+                "skipped": dict(skipped),
             }
         run = self.runs.start(
             self.access,
@@ -254,30 +608,38 @@ class RepositoryHistoryImporter:
             stream=f"repository:{self.repo}",
             importer=IMPORTER,
             importer_version=IMPORTER_VERSION,
-            scope={"repo": self.repo, "commit": frozen, "max_commits": self.max_commits},
+            scope={
+                "repo": self.repo,
+                "commit": frozen,
+                "max_commits": self.max_commits,
+                "importer_version": IMPORTER_VERSION,
+            },
         )
         done = set((run["checkpoint"] or {}).get("done") or [])
         errors: list[str] = []
-        units = [("md", p) for p in markdown] + [("code", p) for p in code] + [("log", "")]
+        units = selected + [("log", "")]
         for kind, path in units:
             key = f"{kind}:{path}"
             if key in done:
                 continue
             done.add(key)
-            run["next_checkpoint"] = {"done": sorted(done)}
+            run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
             try:
                 with self.runs.page(run, self.access) as counts:
-                    if kind == "md":
+                    if kind in {"md", "sql", "data", "template"}:
                         self._markdown(run, frozen, path, counts)
                     elif kind == "code":
                         self._code(run, frozen, path, counts)
                     else:
                         self._log(run, frozen, counts)
-            except RuntimeError as exc:
+            except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
                 done.discard(key)
                 errors.append(f"{key}: {exc}")
         with self.runs.page(run, self.access) as counts:
-            counts["excluded_scope"] += unsupported
+            if not (run.get("checkpoint") or {}).get("skips_recorded"):
+                counts["excluded_scope"] += sum(skipped.values())
+                counts.update({f"skipped_{key}": value for key, value in skipped.items()})
+                run["next_checkpoint"] = {"done": sorted(done), "skips_recorded": True}
         final = self.runs.finish(
             run,
             complete=self.max_commits == 0,
@@ -302,7 +664,20 @@ class RepositoryHistoryImporter:
 
     def _git_attrs(self, eid: str, commit: dict) -> list[attr.Attribution]:
         found = attr.markers(commit.get("message") or "")
-        return [*attr.git_author(eid, commit), *attr.from_markers(eid, found)]
+        attributions = [*attr.git_author(eid, commit), *attr.from_markers(eid, found)]
+        if not any(a.role == "decision_author" for a in attributions):
+            account = next((a for a in attributions if a.role == "source_account"), None)
+            if account:
+                inferred = attr.Attribution(
+                    "decision_author",
+                    eid,
+                    reason="inferred from source git author; identity does not establish human approval",
+                )
+                for name in ("original_identity", "normalized_identity", "occurred_at"):
+                    if account.values.get(name):
+                        inferred.set(name, account.values[name], "inferred", pointer=f"git/{name}")
+                attributions.append(inferred)
+        return attributions
 
     def _markdown(self, run: dict, frozen: str, path: str, counts: Counter[str]) -> None:
         history = self.reader.path_at(frozen, path)
@@ -310,100 +685,92 @@ class RepositoryHistoryImporter:
             history = history[: self.max_commits]
         meta = {c["sha"]: c for c in self.reader.commits(frozen, [path], self.max_commits)}
         for sha, old_path in history:
-            text = self.reader.show(sha, old_path)
+            try:
+                text = self.reader.show(sha, old_path)
+            except UnicodeError:
+                counts["skipped_history_binary"] += 1
+                counts["excluded_scope"] += 1
+                continue
             if text is None:
                 counts["unavailable"] += 1
                 continue
+            reason = skip_reason(old_path, text)
+            if reason:
+                counts[f"skipped_history_{reason}"] += 1
+                counts["excluded_scope"] += 1
+                continue
             commit = meta.get(sha, {"sha": sha})
-            rev = SourceRevision(
-                SOURCE_SYSTEM,
-                "git_markdown",
-                f"{self.repo}:{path}",
-                text,
-                source_url=f"https://github.com/{self.repo}/blob/{sha}/{old_path}",
-                source_labels={"path": old_path, "current_path": path},
-                source_version=sha,
-                source_created_at=float(commit.get("author_date") or 0),
-                repository=self.repo,
-                commit_sha=sha,
-            )
-            self._record(
-                run,
-                rev,
-                self._git_attrs(rev.evidence_id, commit),
-                counts,
-                anchor_path=old_path,
-                commit=sha,
-                identity=f"{self.repo}:{path}",
+            self._file_record(
+                run, sha, old_path, text, commit, counts, identity=f"{self.repo}:{path}"
             )
 
     def _code(self, run: dict, frozen: str, path: str, counts: Counter[str]) -> None:
-        from mira.index.extract import extract_symbols
-
         text = self.reader.show(frozen, path)
         if text is None:
             counts["unavailable"] += 1
             return
-        language = language_of(path)
-        spans = comment_spans(text, language)
-        if not spans:
-            return
-        candidates = []
-        for start, end, _line in spans:
-            for c in extract_decisions(text[start:end]):
-                candidates.append(
-                    c.__class__(
-                        c.start + start,
-                        c.end + start,
-                        c.quote,
-                        c.section,
-                        f"{c.reason} in a code comment",
-                    )
-                )
-        if not candidates:
-            return
         commits = self.reader.commits(frozen, [path], 1)
         commit = commits[0] if commits else {"sha": frozen}
+        self._file_record(
+            run, frozen, path, text, commit, counts, identity=f"{self.repo}:{path}:code"
+        )
+
+    def _file_record(self, run, sha, path, text, commit, counts, *, identity):
+        from mira.index.extract import extract_symbols
+
+        kind = file_kind(path)
+        language = language_of(path)
+        candidates = []
+        if kind == "md" or Path(path).suffix.lower() == ".txt":
+            candidates = extract_decisions(text)
+        else:
+            for start, end, _ in comment_spans(text, language):
+                candidates.extend(
+                    Candidate(c.start + start, c.end + start, c.quote, c.section, c.reason)
+                    for c in extract_decisions(text[start:end])
+                )
+            if kind == "data":
+                candidates.extend(data_candidates(text, Path(path).suffix.lower()))
         rev = SourceRevision(
             SOURCE_SYSTEM,
-            "git_source_file",
+            "git_markdown" if kind == "md" else "git_source_file",
             f"{self.repo}:{path}",
             text,
-            source_url=f"https://github.com/{self.repo}/blob/{frozen}/{path}",
-            source_labels={"path": path, "language": language},
-            source_version=frozen,
+            source_url=f"https://github.com/{self.repo}/blob/{sha}/{quote(path, safe='/')}",
+            source_labels={"path": path, "language": language, "kind": kind},
+            source_version=sha,
             source_created_at=float(commit.get("author_date") or 0),
             repository=self.repo,
-            commit_sha=frozen,
+            commit_sha=sha,
         )
-        symbols = extract_symbols(text, language)
         eid, created = self.store.record_revision(
             rev, corpus=(run["corpus_id"], run["policy_version"]), run_id=run["run_id"]
         )
+        counts["discovered"] += 1
         counts["fetched_versions"] += 1
         counts["stored_evidence" if created else "duplicate_evidence"] += 1
-        attrs = self._git_attrs(eid, commit)
-        self.store.record_attributions(attrs, corpus_id=run["corpus_id"])
-        if not created:
-            return
+        counts[f"{kind}_versions"] += 1
+        symbols = extract_symbols(text, language) if kind == "code" else []
         for cand in candidates:
             line = text.count("\n", 0, cand.start) + 1
+            line_end = text.count("\n", 0, max(cand.start, cand.end - 1)) + 1
+            origin = self.reader.blame(sha, path, line)
+            attrs = self._git_attrs(eid, origin)
+            self.store.record_attributions(attrs, corpus_id=run["corpus_id"])
             enclosing = [s for s in symbols if s.start_line <= line <= s.end_line]
             sym = min(enclosing, key=lambda s: s.end_line - s.start_line) if enclosing else None
             anchor = {
                 "repository": self.repo,
-                "observed_commit": frozen,
+                "observed_commit": sha,
                 "path": path,
+                "heading": cand.section,
+                "line_start": line,
+                "line_end": line_end,
                 "qualified_name": (sym.qualified_name or sym.name) if sym else "",
                 "symbol_kind": sym.kind if sym else "",
-                "line_start": line,
-                "line_end": text.count("\n", 0, cand.end) + 1,
                 "resolution_method": "deterministic_extractor" if sym else "path_only",
                 "resolution_status": "exact" if sym else "path_only",
                 "resolution_confidence": "high" if sym else "medium",
-                "resolved_commit": frozen,
-                "resolved_path": path,
-                "resolved_qualified_name": (sym.qualified_name or sym.name) if sym else "",
             }
             materialize(
                 self.registry,
@@ -411,14 +778,14 @@ class RepositoryHistoryImporter:
                 ctx=self.access,
                 source_system=SOURCE_SYSTEM,
                 evidence_id=eid,
-                source_url=rev.source_url,
+                source_url=f"{rev.source_url}#L{line}-L{line_end}",
                 repo=self.repo,
                 candidates=[cand],
                 attributions=attrs,
                 counts=counts,
                 anchor=anchor,
-                occurred_at=rev.source_created_at,
-                identity=f"{self.repo}:{path}:code",
+                occurred_at=origin["author_date"],
+                identity=f"{identity}:{cand.section}" if kind == "data" else identity,
             )
 
     def _log(self, run: dict, frozen: str, counts: Counter[str]) -> None:
@@ -454,8 +821,6 @@ class RepositoryHistoryImporter:
         counts["fetched_versions"] += 1
         counts["stored_evidence" if created else "duplicate_evidence"] += 1
         self.store.record_attributions(attrs, corpus_id=run["corpus_id"])
-        if not created:
-            return
         candidates = extract_decisions(rev.original_text)
         for cand in candidates:
             anchor = None

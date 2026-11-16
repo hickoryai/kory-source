@@ -17,7 +17,7 @@ from typing import Any
 from mira.registry import linear
 from mira.registry.access import AccessContext, AccessDenied, require_import
 from mira.registry.imports import ImportRuns, read_cursors
-from mira.registry.repository_history import GitReader, language_of
+from mira.registry.repository_history import IMPORTER_VERSION, GitReader, inventory
 
 
 def inventory_ids(ids) -> dict:
@@ -182,18 +182,15 @@ class CoverageReport:
             if checkout:
                 reader = GitReader(checkout)
                 frozen = reader.rev_parse(commit or "HEAD")
-                files = reader.files(frozen)
-                units = (
-                    {"log:"}
-                    | {f"md:{p}" for p in files if p.lower().endswith((".md", ".mdx", ".markdown"))}
-                    | {f"code:{p}" for p in files if language_of(p)}
-                )
+                selected, skipped = inventory(reader, frozen)
+                units = {"log:"} | {f"{kind}:{p}" for kind, p in selected}
                 matching = [
                     r
                     for r in repo_runs
                     if r["status"] == "complete"
                     and json.loads(r["scope_manifest"]).get("commit") == frozen
                     and json.loads(r["scope_manifest"]).get("max_commits") == 0
+                    and r["importer_version"] == IMPORTER_VERSION
                 ]
                 matching.sort(key=lambda r: (r["finished_at"], r["run_id"]), reverse=True)
                 complete = matching[0] if matching else None
@@ -203,7 +200,8 @@ class CoverageReport:
                     status="reconciled" if complete else "no_complete_run",
                     commit=frozen,
                     complete_run_id=complete["run_id"] if complete else None,
-                    files=inventory_ids(files),
+                    files=inventory_ids(reader.files(frozen)),
+                    skipped=dict(skipped),
                     units=reconcile(units, done),
                     commits=reconcile(
                         commits, [r[0] for r in rows if r[1] == "git_commit_message"]

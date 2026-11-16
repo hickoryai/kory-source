@@ -482,3 +482,15 @@ adapters, the required runtime endpoint, and the explicit untraced opt-out remai
 unchanged. No collector address or
 credential is bundled. `tests/test_otlp_tracing.py` exercises exported spans and
 setup failures; router and public-image tests cover the integration contract.
+
+
+HAI-14000 extends fork-owned registry history import:
+
+- `src/mira/registry/repository_history.py`: SQL, structured rationale and template
+  history, shared inventory and Git blame provenance.
+- `src/mira/registry/source_importers.py`: runtime source interface and registry.
+- `src/mira/registry/imports.py`, `linear.py`, `coverage.py`: deterministic
+  extraction, provenance replay and shared coverage inventory.
+- `tests/test_extra_repository_decisions.py`, `test_import_provenance.py`,
+  `test_source_importers.py` and `tests/fixtures/extra_decisions/`: synthetic tests.
+- `docs/decision-history-import.md`: importer contracts and plugin usage.

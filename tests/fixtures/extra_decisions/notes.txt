@@ -1,0 +1,2 @@
+Owner decision: Keep the generic example.
+Ordinary operational note.
