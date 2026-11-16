@@ -384,3 +384,56 @@ def test_a_new_head_with_the_same_body_adds_a_revision_but_no_duplicate_decision
     d = next(d for d in _decisions(reg) if d["body"] == "Keep Linear authoritative.")
     quotes = ProvenanceStore(reg).evidence_for(d["id"], rp.reader())["quotes"]
     assert {q["evidence_role"] for q in quotes} == {"statement", "support"}
+
+
+@pytest.mark.parametrize("limit", [0, 1, 10000])
+def test_history_completion_and_cursor_use_frozen_commit(reg, checkout, limit):
+    from mira.registry.imports import read_cursors
+
+    repo, shas = checkout
+    frozen = shas[1]
+    out = RepositoryHistoryImporter(
+        reg,
+        GitReader(repo),
+        repo=REPO,
+        access=rp.operator(),
+        commit=frozen,
+        max_commits=limit,
+    ).run(apply=True)
+    cursors = read_cursors(reg, "git")
+    if limit:
+        assert out["status"] == "incomplete"
+        assert not cursors
+    else:
+        assert out["status"] == "complete"
+        assert cursors[f"repository:{REPO}"]["cursor"] == frozen
+        assert cursors[f"repository:{REPO}"]["watermark"] == float(
+            _git(repo, "show", "-s", "--format=%ct", frozen)
+        )
+        rows = list(
+            reg.db.execute(
+                "SELECT source_id FROM registry_source_revisions WHERE source_type = 'git_commit_message'"
+            )
+        )
+        assert {r[0] for r in rows} == {f"{REPO}@{sha}" for sha in shas[:2]}
+        assert len(GitReader(repo).commits(frozen, max_count=0)) == 2
+
+
+def test_failed_unbounded_walk_never_advances_cursor(reg, checkout, monkeypatch):
+    from mira.registry.imports import read_cursors
+
+    reader = GitReader(checkout[0])
+
+    def failed(*args, **kwargs):
+        raise RuntimeError("synthetic read failure")
+
+    monkeypatch.setattr(reader, "path_at", failed)
+    result = RepositoryHistoryImporter(
+        reg,
+        reader,
+        repo=REPO,
+        access=rp.operator(),
+        max_commits=0,
+    ).run(apply=True)
+    assert result["status"] == "incomplete"
+    assert read_cursors(reg, "git") == {}

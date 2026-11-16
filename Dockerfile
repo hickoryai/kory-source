@@ -27,6 +27,9 @@ LABEL org.opencontainers.image.description="Self-hostable AI code reviewer"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
 # Mount wheels so neither build inputs nor wheel archives persist in a layer.
 RUN --mount=type=bind,from=python-builder,source=/wheels,target=/wheels \
     pip install --no-cache-dir --no-index --find-links=/wheels "mira-reviewer[serve,bedrock]"
