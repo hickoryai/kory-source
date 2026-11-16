@@ -35,11 +35,26 @@ AWS_DOCUMENTATION_KEYS = (
     b"AKIAIOSFODNN7EXAMPLE",
 )
 
-# Reviewed npm @openai/codex-linux-x64 0.145.0 upstream bytes. The binary
-# contains the unrelated Hickory DNS library and concatenated token-prefix
-# literals. Only these categories for this exact path AND hash are exempt;
-# changing one byte, version, or architecture requires a new upstream review.
+# Reviewed upstream bytes: only listed categories for the exact path AND hash
+# are exempt. A changed byte, version, or architecture needs another review.
 UPSTREAM_FINDINGS = {
+    # Debian trixie libgnutls30t64 3.8.9-3+deb13u4: all seven matched
+    # private keys are public crypto self-test fixtures in upstream
+    # gnutls-3.8.9/lib/crypto-selftests-pk.c, not runtime credentials.
+    "usr/lib/x86_64-linux-gnu/libgnutls.so.30.40.3": (
+        "4b14edde42e7cbeefd8a6d88d035e096f2e6412a535388bb1d073a1c196e2822",
+        frozenset({"private-key"}),
+    ),
+    # Debian trixie libunistring5 1.3-2: concatenated uppercase Unicode
+    # character-name fragments incidentally match the AWS credential regex.
+    # Both libraries arrive through Git's HTTPS transport. Paths and hashes
+    # were verified against official Debian packages; any update fails closed.
+    "usr/lib/x86_64-linux-gnu/libunistring.so.5.2.0": (
+        "9c200ec975ff24c0a259d4f6cf0d0fc1736d0c86da30fff3d499ad3d9a368b65",
+        frozenset({"credential"}),
+    ),
+    # npm @openai/codex-linux-x64 0.145.0 includes the unrelated Hickory DNS
+    # library and concatenated token-prefix literals.
     "usr/local/lib/node_modules/@openai/codex/node_modules/@openai/"
     "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex": (
         "a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14",

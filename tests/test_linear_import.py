@@ -115,6 +115,17 @@ class FakeLinear:
         return node
 
     @staticmethod
+    def _project_match(project: dict | None, cond: dict) -> bool:
+        """``accessibleTeams`` with ``length.gt`` and ``every.key.in``, as the importer sends."""
+        if not project:
+            return False
+        keys = [t["key"] for t in ((project.get("teams") or {}).get("nodes") or [])]
+        teams = cond.get("accessibleTeams") or {}
+        if "length" in teams and not len(keys) > teams["length"]["gt"]:
+            return False
+        return "every" not in teams or all(k in teams["every"]["key"]["in"] for k in keys)
+
+    @staticmethod
     def _match(node: dict, f: dict) -> bool:
         for key, cond in f.items():
             if key == "and" and not all(FakeLinear._match(node, c) for c in cond):
@@ -130,6 +141,8 @@ class FakeLinear:
             ):
                 return False
             if key == "updatedAt" and lin.to_epoch(node["updatedAt"]) < lin.to_epoch(cond["gte"]):
+                return False
+            if key == "project" and not FakeLinear._project_match(node.get("project"), cond):
                 return False
         return True
 
@@ -796,7 +809,20 @@ def seed_inventory(fake: FakeLinear) -> None:
     fake.comments["cm-doc"] = {**fake.comments["cm-1"], "id": "cm-doc", "issue": None}
     fake.document("doc-1", "HAI-2", t=T0 - 30, title="HAI-2 design")
     fake.document("doc-2", "OPS-1", t=T0 - 20, archivedAt=iso(T0 - 20))
-    fake.document("doc-3", None, t=T0 - 10, project={"id": "proj-1"})
+    fake.document("doc-3", None, t=T0 - 10, project=project("proj-1", "HAI"))
+    # Workspace document approval includes mixed-team projects.
+    fake.document("doc-4", None, t=T0 - 5, project=project("proj-2", "HAI", "SECRET"))
+
+
+def project(pid: str, *teams: str) -> dict:
+    return {
+        "id": pid,
+        "name": pid,
+        "teams": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [{"id": f"team-{t}", "key": t} for t in teams],
+        },
+    }
 
 
 def test_inventory_counts_every_manifest_team(client, fake):
@@ -809,12 +835,12 @@ def test_inventory_counts_every_manifest_team(client, fake):
     assert (out["issues"]["archived"], out["issues"]["trashed"]) == (1, 1)
     # Comments are read only on manifest-team issues, so none off an issue is seen.
     assert out["comments"] == {"on_issues": 3, "archived": 0}
-    # Only documents on manifest-team issues are counted; doc-3 sits on a project.
+    # Documents are workspace-wide, including mixed-team projects.
     assert out["documents"] == {
-        "total": 2,
+        "total": 4,
         "archived": 1,
         "on_issue": 2,
-        "on_project": 0,
+        "on_project": 2,
         "on_initiative": 0,
     }
     assert out["documents_linked_to_issues"] == ["HAI-2: HAI-2 design", "OPS-1: doc-2"]
@@ -822,7 +848,7 @@ def test_inventory_counts_every_manifest_team(client, fake):
     joined = "\n".join(out["exceptions"])
     assert "projects: 1 referenced" in joined
     assert "of type 'similar'" in joined
-    assert "documents: 2 (2 linked to an issue)" in joined
+    assert "counted here, not imported" not in joined
     assert "not attached to an issue of a manifest team" in joined
 
 
@@ -832,8 +858,8 @@ def test_inventory_narrowed_to_a_team(client, fake):
     assert [t["key"] for t in out["teams"]] == ["HAI"]
     assert out["issues"]["total"] == 5
     assert out["comments"] == {"on_issues": 2, "archived": 0}
-    assert out["documents"]["total"] == 1
-    assert out["documents_linked_to_issues"] == ["HAI-2: HAI-2 design"]
+    assert out["documents"]["total"] == 4  # documents remain workspace-wide
+    assert out["documents_linked_to_issues"] == ["HAI-2: HAI-2 design", "OPS-1: doc-2"]
     assert "not attached to an issue of a manifest team" in "\n".join(out["exceptions"])
 
 
@@ -1046,3 +1072,117 @@ def test_a_node_whose_team_id_mismatches_its_key_is_dropped(reg, client, fake, c
     out = importer(reg, client, clock).run(apply=True)
     assert out["issues"]["totals"]["excluded_outside_manifest"] == 1
     assert reg.by_source("linear", "uuid-HAI-1") is None
+
+
+# ── documents and decision extraction (HAI-13964) ───────────────────────
+
+
+def _decisions(reg) -> list[tuple]:
+    return sorted((o["body"], o["status"]) for o in reg._select() if o["kind"] == "decision")
+
+
+def test_documents_import_as_revisions_and_propose_cited_decisions(reg, client, fake, clock):
+    seed_inventory(fake)
+    fake.documents["doc-1"]["content"] = "## Decisions\n- Keep Linear authoritative.\n"
+    fake.documents["doc-3"]["content"] = "Plan notes. We decided to backfill first.\n"
+    fake.documents["doc-4"]["content"] = "We decided something private."
+    out = importer(reg, client, clock, teams=("HAI", "OPS")).run(apply=True)
+    assert out["documents"]["run_status"] == "complete"
+    stored = {r[0] for r in _revisions(reg, "linear_document")}
+    assert stored == {"doc-1", "doc-2", "doc-3", "doc-4"}
+    texts = json.dumps(reg.db.execute("SELECT original_text FROM registry_source_revisions"))
+    assert "private" in texts
+    decisions = _decisions(reg)
+    assert ("Keep Linear authoritative.", "proposed") in decisions
+    assert all(status == "proposed" for _, status in decisions)
+    quotes = [
+        q
+        for (q,) in reg.db.execute(
+            "SELECT quote FROM registry_decision_evidence WHERE evidence_role = 'statement'"
+        )
+    ]
+    assert "Keep Linear authoritative." in quotes
+    # A replay adds no rows: same revisions, same decisions.
+    before = (_revisions(reg, "linear_document"), _decisions(reg))
+    reg.db.execute("DELETE FROM registry_sync_state")
+    importer(reg, client, clock, teams=("HAI", "OPS")).run(apply=True)
+    assert (_revisions(reg, "linear_document"), _decisions(reg)) == before
+
+
+def test_issue_and_comment_decisions_are_proposed_not_approved(reg, client, fake, clock):
+    fake.issue("HAI-1", t=T0 - 50, description="Decision: imports never approve.")
+    fake.comment("cm-1", "HAI-1", "We decided to keep revisions immutable.", t=T0 - 40)
+    importer(reg, client, clock).run(apply=True)
+    decisions = _decisions(reg)
+    assert len(decisions) == 2
+    assert {status for _, status in decisions} == {"proposed"}
+
+
+def test_every_stream_records_its_cursor_and_the_next_run_reads_only_changes(
+    reg, client, fake, clock
+):
+    seed_inventory(fake)
+    importer(reg, client, clock).run(apply=True)
+    for stream in lin.STREAMS:
+        assert importer(reg, client, clock).state(stream)["watermark"] == T0
+    clock.now = T0 + 3600
+    fake.requests.clear()
+    importer(reg, client, clock).run(apply=True)
+    docs = [r for r in fake.requests if "RegistryDocuments" in r["query"]]
+    since = docs[0]["variables"]["filter"]["updatedAt"]["gte"]
+    assert lin.to_epoch(since) == T0 - lin.WATERMARK_OVERLAP
+
+
+def test_workspace_documents_include_all_parents_and_ignore_team_narrowing(
+    reg, client, fake, clock
+):
+    fake.issue("HAI-1", t=T0 - 10)
+    fake.issue("OPS-1", t=T0 - 10)
+    fake.issue("SECRET-1", t=T0 - 10)
+    for did, fields in {
+        "initiative": {"initiative": {"id": "initiative-1"}},
+        "cycle": {"cycle": {"id": "cycle-1"}},
+        "release": {"release": {"id": "release-1"}},
+        "unattached": {},
+        "shared-project": {"project": project("p", "HAI", "SECRET")},
+    }.items():
+        fake.document(did, None, t=T0 - 5, content="Decision: retain history.", **fields)
+    fake.document("other-team-issue", "SECRET-1", t=T0 - 5, content="Decision: retain source text.")
+    importer(reg, client, clock, teams=("HAI",)).run(apply=True)
+    assert {r[0] for r in _revisions(reg, "linear_document")} == set(fake.documents)
+    assert {r[0] for r in _revisions(reg, "linear_issue_description")} == {"uuid-HAI-1"}
+    doc_requests = [r for r in fake.requests if "RegistryDocuments" in r["query"]]
+    assert all(set(r["variables"]["filter"]) == {"updatedAt"} for r in doc_requests)
+
+
+def test_upgrade_revisits_old_unchanged_evidence_to_extract_decisions(
+    reg, client, fake, clock, monkeypatch
+):
+    fake.issue("HAI-1", t=T0 - 3600, description="Decision: retain history.")
+    with monkeypatch.context() as old:
+        old.setattr(lin, "IMPORTER_VERSION", "2")
+        old.setattr(lin, "extract_decisions", lambda text: [])
+        importer(reg, client, clock).run(apply=True)
+    assert _decisions(reg) == []
+    clock.now += 7200
+    importer(reg, client, clock).run(apply=True)
+    assert _decisions(reg) == [("Decision: retain history.", "proposed")]
+
+
+def test_upgraded_backfill_resumes_its_saved_page_cursor(reg, client, fake, clock, monkeypatch):
+    for i in range(5):
+        fake.issue(f"HAI-{i}", t=T0 - 3600 + i, description="Decision: preserve source text.")
+    with monkeypatch.context() as old:
+        old.setattr(lin, "IMPORTER_VERSION", "2")
+        old.setattr(lin, "extract_decisions", lambda text: [])
+        importer(reg, client, clock).run(apply=True)
+    clock.now += 7200
+    fake.crash_after_pages = fake.pages_served + 1
+    with pytest.raises(LinearError):
+        importer(reg, client, clock).run(apply=True)
+    assert importer(reg, client, clock).state("issues")["after_cursor"] == "c2"
+    fake.crash_after_pages = None
+    fake.requests.clear()
+    importer(reg, client, clock).run(apply=True)
+    assert fake.requests[0]["variables"]["after"] == "c2"
+    assert len(_decisions(reg)) == 5
