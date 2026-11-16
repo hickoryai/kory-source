@@ -274,6 +274,40 @@ class ImportRuns:
         return out
 
 
+# ── durable per-source cursors ──────────────────────────────────────────
+# One ``registry_sync_state`` row per (source system, stream). A completed
+# backfill records where it reached, so an incremental run reads only what
+# changed after it and never rescans the source. Linear's walks keep their own
+# rows (``linear.LinearImporter``); GitHub and git record theirs here when a run
+# completes. ``watermark`` is an epoch: the earliest source time a later run must
+# read again. ``cursor`` is the source's own position, such as a commit SHA.
+
+
+def record_cursor(
+    registry: Any, source_system: str, stream: str, *, watermark: float, cursor: str = ""
+) -> None:
+    registry.db.execute(
+        "INSERT INTO registry_sync_state (source_system, stream, watermark, walk_since, "  # noqa: S608
+        "walk_started_at, after_cursor, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (source_system, stream) DO UPDATE SET watermark = excluded.watermark, "
+        "after_cursor = excluded.after_cursor, updated_at = excluded.updated_at",
+        (source_system, stream, float(watermark), 0.0, 0.0, cursor, registry.clock()),
+    )
+
+
+def read_cursors(registry: Any, source_system: str) -> dict[str, dict]:
+    """Every stream's cursor for ``source_system``: ``{stream: {watermark, cursor, updated_at}}``."""
+    rows = registry.db.execute(
+        "SELECT stream, watermark, after_cursor, updated_at FROM registry_sync_state "  # noqa: S608
+        "WHERE source_system = ? ORDER BY stream",
+        (source_system,),
+    )
+    return {
+        r[0]: {"watermark": float(r[1] or 0), "cursor": r[2] or "", "updated_at": float(r[3] or 0)}
+        for r in rows
+    }
+
+
 # ── deterministic decision extraction ───────────────────────────────────
 
 EXTRACTOR = "kory-source.decision-extractor"

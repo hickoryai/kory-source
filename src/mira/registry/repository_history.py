@@ -33,14 +33,20 @@ from typing import Any
 
 from mira.registry import attribution as attr
 from mira.registry.access import AccessContext, AccessDenied, require_import
-from mira.registry.imports import ImportRuns, ReadOnlyViolation, extract_decisions, materialize
+from mira.registry.imports import (
+    ImportRuns,
+    ReadOnlyViolation,
+    extract_decisions,
+    materialize,
+    record_cursor,
+)
 from mira.registry.provenance import ProvenanceStore, SourceRevision
 
 logger = logging.getLogger(__name__)
 
 SOURCE_SYSTEM = "git"
 IMPORTER = "kory-source.repository-history"
-IMPORTER_VERSION = "1"
+IMPORTER_VERSION = "2"
 _READ_ONLY = {"log", "show", "ls-tree", "rev-parse", "cat-file", "diff"}
 _MARKDOWN = (".md", ".mdx", ".markdown")
 # Comment syntax per language. Anything else is reported as unsupported.
@@ -131,7 +137,7 @@ class GitReader:
         fmt = _SEP.join(["%H", "%an", "%ae", "%at", "%cn", "%ce", "%ct", "%B"]) + "\x1d"
         args = [
             "log",
-            f"--max-count={max_count}",
+            f"--max-count={max_count}" if max_count else "",
             "--follow" if paths and len(paths) == 1 else "",
             f"--format={fmt}",
             commit,
@@ -219,6 +225,8 @@ class RepositoryHistoryImporter:
         self.repo = repo
         self.access = access
         self.commit = commit
+        if max_commits < 0:
+            raise ValueError("max_commits must be nonnegative (0 means unbounded)")
         self.max_commits = max_commits
         self.store = ProvenanceStore(registry)
         self.runs = ImportRuns(registry)
@@ -272,10 +280,19 @@ class RepositoryHistoryImporter:
             counts["excluded_scope"] += unsupported
         final = self.runs.finish(
             run,
-            complete=self.max_commits >= 10_000,
+            complete=self.max_commits == 0,
             errors=errors,
-            unknown_totals=["history_before_max_commits"],
+            unknown_totals=["history_before_max_commits"] if self.max_commits else [],
         )
+        if final["status"] == "complete":
+            watermark = float(self.reader.git("show", "-s", "--format=%ct", frozen).strip())
+            record_cursor(
+                self.registry,
+                SOURCE_SYSTEM,
+                f"repository:{self.repo}",
+                watermark=watermark,
+                cursor=frozen,
+            )
         return {
             "run_id": final["run_id"],
             "status": final["status"],
@@ -288,7 +305,9 @@ class RepositoryHistoryImporter:
         return [*attr.git_author(eid, commit), *attr.from_markers(eid, found)]
 
     def _markdown(self, run: dict, frozen: str, path: str, counts: Counter[str]) -> None:
-        history = self.reader.path_at(frozen, path)[: self.max_commits]
+        history = self.reader.path_at(frozen, path)
+        if self.max_commits:
+            history = history[: self.max_commits]
         meta = {c["sha"]: c for c in self.reader.commits(frozen, [path], self.max_commits)}
         for sha, old_path in history:
             text = self.reader.show(sha, old_path)
@@ -476,7 +495,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--checkout", required=True)
     parser.add_argument("--commit", default="HEAD")
-    parser.add_argument("--max-commits", type=int, default=200)
+    parser.add_argument(
+        "--max-commits", type=int, default=200, help="Commit limit; 0 walks all history"
+    )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)

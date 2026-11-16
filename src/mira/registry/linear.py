@@ -8,10 +8,12 @@ Linear: the client refuses any GraphQL mutation. It has three parts:
   retries 429, 5xx, and transport errors.
 - ``inventory()``: counts what exists in Linear (teams, issues, comments, and
   documents) and names what the importer will not carry yet.
-- ``LinearImporter``: resumable walks over issues and comments. Each page's
-  cursor is saved after the page is imported, so a restart resumes where it
-  stopped and a replayed page is a no-op. Issues still waiting on a link target
-  are re-read at the end of each issue walk.
+- ``LinearImporter``: resumable walks over issues, comments and documents. Each
+  page's cursor is saved after the page is imported, so a restart resumes where
+  it stopped and a replayed page is a no-op. Issues still waiting on a link
+  target are re-read at the end of each issue walk. A completed walk advances
+  its stream's ``updatedAt`` watermark, so the next run reads only what changed
+  since: the first run is the backfill, every later run is incremental.
 
 Run with ``python -m mira.registry.linear inventory|import``. It covers every
 team the corpus access policy enumerates and every state, archived
@@ -21,9 +23,16 @@ never fetched or stored: a new team needs approval first. ``import`` is a dry
 run unless ``--apply`` is given. Both need ``REGISTRY_IMPORT_OPERATOR`` to name
 an operator the policy approves.
 
-Each issue description and comment is also kept as an immutable source
-revision with its author, bot, and invoker attribution (``provenance.py``), so
-a later edit adds a revision instead of erasing what was there.
+Each issue description, comment and document is also kept as an immutable
+source revision with its author, bot, and invoker attribution
+(``provenance.py``), so a later edit adds a revision instead of erasing what was
+there. Explicit decision statements in that text become ``proposed`` decisions
+that cite the exact quote (``imports.extract_decisions``); nothing is approved.
+
+Documents are workspace-wide, including initiative, cycle, release and mixed-team
+project documents. ``--team`` narrows issues and issue comments only; it never
+narrows documents. The deployment must approve workspace document access for
+the sync credential and corpus before running this importer.
 """
 
 from __future__ import annotations
@@ -42,7 +51,13 @@ import httpx
 
 from mira.registry import attribution as attr
 from mira.registry.access import AccessContext, AccessDenied, CorpusPolicy, require_import
-from mira.registry.imports import ImportRuns, ReadOnlyViolation, assert_read_only_graphql
+from mira.registry.imports import (
+    ImportRuns,
+    ReadOnlyViolation,
+    assert_read_only_graphql,
+    extract_decisions,
+    materialize,
+)
 from mira.registry.model import Actor
 from mira.registry.provenance import ProvenanceStore, SourceRevision
 from mira.registry.service import Registry
@@ -51,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 SOURCE_SYSTEM = "linear"
 IMPORTER = "kory-source.linear"
-IMPORTER_VERSION = "2"
+IMPORTER_VERSION = "3"
 DEFAULT_ENDPOINT = "https://api.linear.app/graphql"
 IMPORT_ACTOR = Actor("human", "linear-import")
 PAGE_SIZE = 50
@@ -72,6 +87,7 @@ STATE_DELIVERY = {
     "duplicate": "canceled",
 }
 RELATIONS_PAGE = 50  # the relations(first:) in ISSUES_QUERY
+STREAMS = ("issues", "comments", "documents")
 PENDING_BATCH = 50  # ids per ``id: {in: [...]}`` re-read of pending issues
 
 # Request only the fields required for read-only imports.
@@ -125,9 +141,10 @@ query RegistryDocuments($filter: DocumentFilter!, $after: String, $first: Int!) 
   documents(filter: $filter, after: $after, first: $first, orderBy: updatedAt, includeArchived: true) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      id title url updatedAt archivedAt
-      issue { id identifier team { key } }
-      project { id }
+      id title content url createdAt updatedAt archivedAt trashed
+      creator { id displayName email app }
+      issue { id identifier team { id key } }
+      project { id name teams(first: 50) { pageInfo { hasNextPage } nodes { id key } } }
       initiative { id }
     }
   }
@@ -393,7 +410,7 @@ def inventory(
                 comments["archived"] += bool(node.get("archivedAt"))
     documents: Counter[str] = Counter()
     linked: list[str] = []
-    for nodes, _ in client.pages(DOCUMENTS_QUERY, "documents", _on_issue(teams)):
+    for nodes, _ in client.pages(DOCUMENTS_QUERY, "documents", {}):
         for node in nodes:
             documents["total"] += 1
             documents["archived"] += bool(node.get("archivedAt"))
@@ -416,11 +433,6 @@ def inventory(
             f"relations: {len(truncated)} issues hold more than {RELATIONS_PAGE}; only the "
             f"first {RELATIONS_PAGE} import ({', '.join(truncated[:20])})"
         )
-    if documents["total"]:
-        exceptions.append(
-            f"documents: {documents['total']} ({documents['on_issue']} linked to an issue); "
-            "counted here, not imported yet"
-        )
     if comments["not_on_issue"]:
         exceptions.append(
             f"comments: {comments['not_on_issue']} on documents, projects or updates; not imported"
@@ -428,10 +440,10 @@ def inventory(
     if unapproved:
         exceptions.append(
             f"teams: {len(unapproved)} workspace teams are not in the approved corpus manifest; "
-            "they were not read and need data-owner approval before import"
+            "their issues and issue comments were not read; team import needs approval"
         )
     exceptions.append(
-        "documents and comments not attached to an issue of a manifest team are not counted"
+        "comments not attached to an issue of a manifest team are not read or counted"
     )
     return {
         "corpus_id": policy.corpus_id,
@@ -507,16 +519,32 @@ class LinearImporter:
         self.policy = require_import(self.access)
         self.teams = manifest_teams(self.policy, self.requested_teams)
         out: dict = {"apply": apply, "corpus_id": self.policy.corpus_id}
-        for stream in ("issues", "comments"):
+        for stream in STREAMS:
             self._run = None
             if apply:
+                # Reset before opening the first upgraded run. A subsequent
+                # resume must keep that run's page cursor, even after a crash.
+                if self._needs_extraction_backfill(stream):
+                    self._save(
+                        stream,
+                        {
+                            "watermark": 0.0,
+                            "walk_since": 0.0,
+                            "walk_started_at": 0.0,
+                            "after_cursor": "",
+                        },
+                    )
                 self._run = self.runs.start(
                     self.access,
                     source_system=SOURCE_SYSTEM,
                     stream=stream,
                     importer=IMPORTER,
                     importer_version=IMPORTER_VERSION,
-                    scope={"teams": sorted(self.teams), "manifest": self.policy.manifest_sha256},
+                    scope={
+                        "teams": sorted(self.teams),
+                        "manifest": self.policy.manifest_sha256,
+                        "importer_version": IMPORTER_VERSION,
+                    },
                 )
             try:
                 out[stream] = self._walk(stream, apply)
@@ -564,15 +592,30 @@ class LinearImporter:
 
     # walking
 
+    def _needs_extraction_backfill(self, stream: str) -> bool:
+        # Version 2 stored evidence without extracting decisions. Its old
+        # watermark must not hide unchanged evidence from the upgraded walk.
+        versions = self.registry.db.execute(
+            "SELECT importer_version FROM registry_import_runs WHERE corpus_id = ? "
+            "AND importer = ? AND stream = ?",
+            (self._policy().corpus_id, IMPORTER, stream),
+        )
+        return bool(versions) and not any(row[0] == IMPORTER_VERSION for row in versions)
+
     def _walk(self, stream: str, apply: bool) -> dict:
         st = self.state(stream)
+        if not apply and self._needs_extraction_backfill(stream):
+            st = {"watermark": 0.0, "walk_since": 0.0, "walk_started_at": 0.0, "after_cursor": ""}
         if not st["after_cursor"]:
             st["walk_since"] = max(st["watermark"] - WATERMARK_OVERLAP, 0.0)
             st["walk_started_at"] = self.clock()
         since = {"updatedAt": {"gte": to_iso(st["walk_since"])}}
-        scope = _team_filter(self.teams) if stream == "issues" else _on_issue(self.teams)
+        scope, document = {
+            "issues": (_team_filter(self.teams), ISSUES_QUERY),
+            "comments": (_on_issue(self.teams), COMMENTS_QUERY),
+            "documents": ({}, DOCUMENTS_QUERY),
+        }[stream]
         filt = _and(scope, since)
-        document = ISSUES_QUERY if stream == "issues" else COMMENTS_QUERY
         totals: Counter[str] = Counter()
         errors: list[dict] = []
         after = st["after_cursor"] or None
@@ -639,6 +682,14 @@ class LinearImporter:
                 results = self.registry.import_items(
                     SOURCE_SYSTEM, [issue_item(n) for n in kept], IMPORT_ACTOR, corpus=self.corpus
                 )
+            elif stream == "documents":
+                # Documents are evidence only: no work object or comment row.
+                kept = nodes
+                totals["read"] += len(kept)
+                if apply:
+                    with self.runs.page(self._active_run(), self.access) as counts:
+                        self._document_evidence(kept, counts)
+                results = []
             else:
                 kept = [
                     n
@@ -687,6 +738,27 @@ class LinearImporter:
                     "unknown_fields" if state["state"] == "unknown" else "attributed_fields"
                 ] += 1
         self.provenance.record_attributions([*attrs, tool], corpus_id=self.corpus[0])
+        if not created and self.registry.db.execute(
+            "SELECT 1 FROM registry_decision_evidence WHERE evidence_id = ? LIMIT 1", (eid,)
+        ):
+            return  # this observation already has extracted decisions
+        candidates = extract_decisions(rev.original_text)
+        if candidates:
+            materialize(
+                self.registry,
+                run=self._run,
+                ctx=self.access,
+                source_system=SOURCE_SYSTEM,
+                evidence_id=eid,
+                source_url=rev.source_url,
+                repo="",
+                candidates=candidates,
+                attributions=[*attrs, tool],
+                counts=counts,
+                occurred_at=rev.source_created_at,
+                # One decision per passage per Linear record, across edits.
+                identity=f"{rev.source_type}:{rev.source_id}",
+            )
 
     def _issue_evidence(self, nodes: list[dict], counts: Counter[str]) -> None:
         for node in nodes:
@@ -705,6 +777,39 @@ class LinearImporter:
                     "team_key": team.get("key"),
                 },
                 payload={k: node.get(k) for k in ("creator", "botActor", "archivedAt", "trashed")},
+                source_version=str(version(node.get("updatedAt"))),
+                source_created_at=to_epoch(node.get("createdAt")),
+                source_updated_at=to_epoch(node.get("updatedAt")),
+            )
+            counts["discovered"] += 1
+            found = attr.markers(text)
+            attrs = attr.linear_actor(rev.evidence_id, node, user_key="creator")
+            attrs += attr.from_markers(rev.evidence_id, found)
+            author = attr.author_from_account(attrs[0], found)
+            if author is not None:
+                attrs.append(author)
+            self._store(rev, attrs, counts)
+
+    def _document_evidence(self, nodes: list[dict], counts: Counter[str]) -> None:
+        for node in nodes:
+            text = node.get("content") or ""
+            issue = node.get("issue") or {}
+            project = node.get("project") or {}
+            rev = SourceRevision(
+                SOURCE_SYSTEM,
+                "linear_document",
+                node["id"],
+                text,
+                parent_source_id=issue.get("id") or project.get("id") or "",
+                source_url=node.get("url") or "",
+                source_labels={
+                    "title": node.get("title"),
+                    "issue": issue.get("identifier"),
+                    "initiative_id": (node.get("initiative") or {}).get("id"),
+                    "project_id": project.get("id"),
+                    "project_name": project.get("name"),
+                },
+                payload={k: node.get(k) for k in ("creator", "archivedAt", "trashed")},
                 source_version=str(version(node.get("updatedAt"))),
                 source_created_at=to_epoch(node.get("createdAt")),
                 source_updated_at=to_epoch(node.get("updatedAt")),
