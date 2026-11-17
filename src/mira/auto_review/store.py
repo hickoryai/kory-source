@@ -6,11 +6,13 @@ head_sha)``. A second delivery of the same head updates nothing.
 ``close``, so the public ``review_api_work`` schema stays unchanged.
 
 States: ``queued``, ``running``, ``superseded``, ``posted``, ``skipped``.
-A newer head marks older queued or running heads superseded. A posted head
-is left on the commit it reviewed. A running head whose lease lapses, or
-whose process is shutting down, goes back to ``queued`` unless a newer head
-superseded it or posting has started. After three interruptions the head is
-skipped instead, so a head that keeps stopping the service is not retried forever.
+A newer head does not cancel a review that is already running. That review
+finishes and posts on its own head. At most one newer head of the same pull
+request stays queued behind it, and a later push replaces that queued head.
+A posted head is left on the commit it reviewed. A running head whose lease
+lapses, or whose process is shutting down, goes back to ``queued`` unless
+posting has started. After three interruptions the head is skipped instead,
+so a head that keeps stopping the service is not retried forever.
 """
 
 from __future__ import annotations
@@ -258,8 +260,9 @@ class AutoReviewStore:
     ) -> tuple[AutoReviewRequest, bool]:
         """Insert one row per head. A duplicate delivery returns the existing row.
 
-        When the insert is new, older queued or running heads of this PR that
-        have not started posting are marked superseded. Posted heads stay.
+        When the insert is new, other queued heads of this pull request are
+        marked superseded, so one queued head waits. A running head is left
+        running and posts on its own sha. Posted heads stay.
         """
         request_id = "ar_" + uuid.uuid4().hex
         now = time.time()
@@ -288,8 +291,7 @@ class AutoReviewStore:
                 cur.execute(
                     "UPDATE auto_review_requests SET state = 'superseded', lease_owner = '', "
                     "lease_expires_at = 0, updated_at = ? WHERE platform = ? AND owner = ? "
-                    "AND repo = ? AND pr_number = ? AND head_sha != ? "
-                    "AND state IN ('queued', 'running') AND posted_review_id = ''",
+                    "AND repo = ? AND pr_number = ? AND head_sha != ? AND state = 'queued'",
                     (now, platform, owner, repo, pr_number, head_sha),
                 )
         row = self.get_by_head(owner, repo, pr_number, head_sha, platform)
@@ -302,15 +304,20 @@ class AutoReviewStore:
     ) -> AutoReviewRequest | None:
         """Move the newest queued head to running within the executor limit.
 
-        Older heads stay queued. ``deadline_seconds`` is the caller's budget.
-        A negative budget claims nothing. The executor enforces the real
-        deadline with ``wait_for``.
+        Older heads stay queued. A queued head whose pull request already has
+        a running review stays queued until that review leaves ``running``.
+        ``deadline_seconds`` is the caller's budget. A negative budget claims
+        nothing. The executor enforces the real deadline with ``wait_for``.
         """
         if deadline_seconds < 0 or max_running < 1:
             return None
         candidate = self._one(
-            f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests WHERE state = 'queued' "
-            "ORDER BY created_at DESC, id DESC LIMIT 1"
+            f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests AS queued "
+            "WHERE queued.state = 'queued' AND NOT EXISTS ("
+            "SELECT 1 FROM auto_review_requests AS running WHERE running.state = 'running' "
+            "AND running.platform = queued.platform AND running.owner = queued.owner "
+            "AND running.repo = queued.repo AND running.pr_number = queued.pr_number) "
+            "ORDER BY queued.created_at DESC, queued.id DESC LIMIT 1"
         )
         if candidate is None:
             return None
