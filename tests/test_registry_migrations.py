@@ -28,6 +28,7 @@ NEW_TABLES = (
     "registry_anchor_evidence",
     "registry_corpus_policy",
     "registry_corpus_members",
+    "registry_decision_classifications",
 )
 
 
@@ -47,12 +48,14 @@ def test_fresh_database_applies_once_and_rerun_is_a_no_op(tmp_path):
     path = tmp_path / "r.db"
     db = RegistryDB(path=str(path))
     assert set(NEW_TABLES) <= _tables(path)
-    assert migrations.applied(db).keys() == {1}
+    assert migrations.applied(db).keys() == {m.version for m in migrations.available()}
     assert migrations.migrate(db) == []
     db.close()
-    RegistryDB(path=str(path)).close()  # restart: still one ledger row
+    RegistryDB(path=str(path)).close()  # restart: still one ledger row per migration
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM registry_schema_migrations").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM registry_schema_migrations").fetchone() == (
+            len(migrations.available()),
+        )
 
 
 def test_upgrade_from_todays_schema_keeps_rows(tmp_path):
@@ -104,6 +107,8 @@ def _stamp(path: Path, sha: str) -> None:
     db = RegistryDB(path=str(path))
     db.close()
     with sqlite3.connect(path) as conn:
+        conn.execute("DELETE FROM registry_schema_migrations WHERE version > 1")
+        conn.execute("DROP TABLE IF EXISTS registry_decision_classifications")
         conn.execute("UPDATE registry_schema_migrations SET sha256 = ? WHERE version = 1", (sha,))
 
 
@@ -120,14 +125,20 @@ def test_database_stamped_by_v0_11_0_starts_without_rewriting_the_ledger(tmp_pat
     _stamp(path, RELEASED_001_SHA256)
     db = RegistryDB(path=str(path))
     assert migrations.migrate(db) == []
-    assert migrations.applied(db) == {1: ("provenance", RELEASED_001_SHA256)}
+    assert migrations.applied(db)[1] == ("provenance", RELEASED_001_SHA256)
+    assert migrations.applied(db).keys() == {m.version for m in migrations.available()}
     db.close()
 
 
-def test_fresh_database_records_the_released_checksum_so_rollback_still_starts(tmp_path):
+def test_released_checksum_stays_compatible_but_new_schema_blocks_old_binary(tmp_path):
     db = RegistryDB(path=str(tmp_path / "fresh.db"))
     assert migrations.applied(db)[1][1] == RELEASED_001_SHA256
-    migrations._check([_released_001()], migrations.applied(db))  # v0.11.0's own check
+    # The historical checksum stays valid for a historical ledger. As designed,
+    # a genuinely newer migration requires disabling features with current code
+    # rather than starting an older binary that cannot understand its schema.
+    migrations._check([_released_001()], {1: migrations.applied(db)[1]})
+    with pytest.raises(MigrationError, match="does not know"):
+        migrations._check([_released_001()], migrations.applied(db))
     db.close()
 
 
@@ -178,11 +189,15 @@ def test_failed_migration_rolls_back_whole_file(tmp_path):
     db = RegistryDB(path=str(tmp_path / "r.db"))
     bad = [
         *migrations.available(),
-        Migration(2, "broken", "CREATE TABLE ok_table (a TEXT);\nTHIS IS NOT SQL;\n"),
+        Migration(
+            len(migrations.available()) + 1,
+            "broken",
+            "CREATE TABLE ok_table (a TEXT);\nTHIS IS NOT SQL;\n",
+        ),
     ]
     with pytest.raises(sqlite3.OperationalError):
         migrations.migrate(db, known=bad)
-    assert migrations.applied(db).keys() == {1}
+    assert migrations.applied(db).keys() == {m.version for m in migrations.available()}
     assert db.execute("SELECT name FROM sqlite_master WHERE name = 'ok_table'") == []
 
 
@@ -205,7 +220,9 @@ def test_concurrent_sqlite_startups_apply_once(tmp_path):
         t.join()
     assert errors == []
     with sqlite3.connect(path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM registry_schema_migrations").fetchone() == (1,)
+        assert conn.execute("SELECT COUNT(*) FROM registry_schema_migrations").fetchone() == (
+            len(migrations.available()),
+        )
 
 
 def test_built_wheel_contains_the_migration_sql():
@@ -214,7 +231,11 @@ def test_built_wheel_contains_the_migration_sql():
     if not wheels:
         pytest.skip("no built wheel; `uv build --wheel` then rerun")
     with zipfile.ZipFile(wheels[-1]) as zf:
-        assert "mira/registry/migrations/001_provenance.sql" in zf.namelist()
+        for migration in migrations.available():
+            assert (
+                f"mira/registry/migrations/{migration.version:03}_{migration.name}.sql"
+                in zf.namelist()
+            )
 
 
 @pg_only
@@ -237,8 +258,10 @@ def test_postgres_concurrent_startups_apply_once():
         t.join()
     try:
         assert errors == []
-        assert migrations.applied(dbs[0]).keys() == {1}
-        assert dbs[0].execute("SELECT COUNT(*) FROM registry_schema_migrations") == [(1,)]
+        assert migrations.applied(dbs[0]).keys() == {m.version for m in migrations.available()}
+        assert dbs[0].execute("SELECT COUNT(*) FROM registry_schema_migrations") == [
+            (len(migrations.available()),)
+        ]
     finally:
         rp.drop_registry_tables(dbs[0])
         for db in dbs:

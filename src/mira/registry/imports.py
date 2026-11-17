@@ -348,6 +348,12 @@ class Candidate:
     quote: str
     section: str
     reason: str
+    statement: str = ""
+    rationale: str = ""
+    model_confidence: float = -1.0
+    extractor_model: str = ""
+    extractor_name: str = ""
+    extractor_version: str = ""
 
 
 def extract_decisions(text: str) -> list[Candidate]:
@@ -529,33 +535,72 @@ def materialize(
             "source_id": sid,
             "source_version": 1,
             "kind": "decision",
-            "title": " ".join(cand.quote.split())[:120],
-            "body": cand.quote,
+            "title": " ".join((cand.statement or cand.quote).split())[:120],
+            "body": cand.statement or cand.quote,
+            "rationale": cand.rationale,
             "repo": repo,
             "scope": "repo" if repo else "org",
             "source_url": source_url,
         }
-        actor = Actor("agent", IMPORT_ACTOR_SUB, f"{EXTRACTOR}/{EXTRACTOR_VERSION}")
+        extractor = cand.extractor_name or EXTRACTOR
+        extractor_version = cand.extractor_version or EXTRACTOR_VERSION
+        support_confidence = (
+            "high"
+            if cand.model_confidence >= 0.8
+            else "low"
+            if 0 <= cand.model_confidence < 0.5
+            else "medium"
+        )
+        actor = Actor("agent", IMPORT_ACTOR_SUB, f"{extractor}/{extractor_version}")
         [res] = registry.import_items(source_system, [item], actor, corpus=corpus)
         if res.get("outcome") == "error":
             counts["extraction_errors"] += 1
             continue
         oid = res["object_id"]
+        if cand.extractor_model:
+            obj = registry.get(oid)
+            if obj.get("model") != cand.extractor_model:
+                obj["model"] = cand.extractor_model
+                registry._write(obj)
+        store.record_attributions(
+            [
+                tool_attribution(
+                    "extractor",
+                    evidence_id,
+                    identity=extractor,
+                    version=extractor_version,
+                    model=cand.extractor_model,
+                    object_id=oid,
+                    revision=1,
+                )
+            ],
+            corpus_id=corpus[0],
+        )
         if res["outcome"] != "created":
-            retain_source_provenance(registry.get(oid), decision_time)
-            store.add_decision_evidence(
-                oid,
-                evidence_id,
-                role="support",
-                quote=cand.quote,
-                start=cand.start,
-                end=cand.end,
-                section=cand.section,
-                corpus_id=corpus[0],
-                confidence="medium",
-                reason="same passage in another revision",
-                run_id=run["run_id"],
+            existing = registry.get(oid)
+            retain_source_provenance(existing, decision_time)
+            if cand.extractor_model and existing.get("model") != cand.extractor_model:
+                existing["model"] = cand.extractor_model
+                registry._write(existing)
+            already_supported = registry.db.execute(
+                "SELECT 1 FROM registry_decision_evidence WHERE object_id = ? AND evidence_id = ? "
+                "AND quote_start = ? AND quote_end = ? AND section = ? LIMIT 1",
+                (oid, evidence_id, cand.start, cand.end, cand.section),
             )
+            if not already_supported:
+                store.add_decision_evidence(
+                    oid,
+                    evidence_id,
+                    role="support",
+                    quote=cand.quote,
+                    start=cand.start,
+                    end=cand.end,
+                    section=cand.section,
+                    corpus_id=corpus[0],
+                    confidence=support_confidence,
+                    reason="same passage in another revision",
+                    run_id=run["run_id"],
+                )
             if anchor:
                 store.add_anchor_evidence(
                     oid, corpus_id=corpus[0], evidence_id=evidence_id, **anchor
@@ -565,6 +610,9 @@ def materialize(
             continue
         obj = registry.get(oid)
         retain_source_provenance(obj, decision_time)
+        if cand.extractor_model:
+            obj["model"] = cand.extractor_model
+            registry._write(obj)
         store.add_decision_evidence(
             oid,
             evidence_id,
@@ -575,33 +623,21 @@ def materialize(
             section=cand.section,
             corpus_id=corpus[0],
             stated_or_inferred="stated",
-            confidence="medium",
-            reason=cand.reason,
+            confidence=support_confidence,
+            reason=cand.reason
+            + (f"; model confidence={cand.model_confidence}" if cand.extractor_model else ""),
             run_id=run["run_id"],
         )
         store.add_decision_version(
             oid,
             revision=1,
-            claim_text=cand.quote,
+            claim_text=cand.statement or cand.quote,
             corpus_id=corpus[0],
             authority_tier=tier,
             authority_reasons=reasons,
             scope=str(item["scope"]),
             basis="migration",
             effective_from=decision_time,
-        )
-        store.record_attributions(
-            [
-                tool_attribution(
-                    "extractor",
-                    evidence_id,
-                    identity=EXTRACTOR,
-                    version=EXTRACTOR_VERSION,
-                    object_id=oid,
-                    revision=1,
-                )
-            ],
-            corpus_id=corpus[0],
         )
         if anchor:
             store.add_anchor_evidence(oid, corpus_id=corpus[0], evidence_id=evidence_id, **anchor)

@@ -30,7 +30,10 @@ import logging
 import re
 import subprocess
 import sys
-from collections import Counter
+import time
+from bisect import bisect_right
+from collections import Counter, OrderedDict
+from itertools import chain
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -38,7 +41,9 @@ from urllib.parse import quote
 import yaml
 
 from mira.registry import attribution as attr
+from mira.registry import decision_llm
 from mira.registry.access import AccessContext, AccessDenied, require_import
+from mira.registry.decision_passages import Passage, nominate
 from mira.registry.imports import (
     Candidate,
     ImportRuns,
@@ -53,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 SOURCE_SYSTEM = "git"
 IMPORTER = "kory-source.repository-history"
-IMPORTER_VERSION = "3"
+IMPORTER_VERSION = "4"
 _READ_ONLY = {"log", "show", "ls-tree", "rev-parse", "cat-file", "diff", "blame"}
 _MARKDOWN = (".md", ".mdx", ".markdown")
 # Comment syntax per language. Anything else is reported as unsupported.
@@ -102,6 +107,9 @@ _EXT = {
     ".svg": "html",
     ".j2": "jinja",
 }
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+_TOML_KEY = re.compile(r"[A-Za-z0-9_-]+")
+_DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
 _BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _DOCSTRING = re.compile(r"(?P<q>\"\"\"|''')(?P<body>.*?)(?P=q)", re.S)
 _SEP = "\x1e"
@@ -164,11 +172,18 @@ def skip_reason(path: str, text: str | None = None) -> str:
     return ""
 
 
-def inventory(reader: GitReader, frozen: str) -> tuple[list[tuple[str, str]], Counter[str]]:
+def inventory(
+    reader: GitReader, frozen: str, *, paths: list[str] | None = None
+) -> tuple[list[tuple[str, str]], Counter[str]]:
     """Same file selection for import, dry-run and coverage reconciliation."""
     units: list[tuple[str, str]] = []
     skipped: Counter[str] = Counter()
     for path in reader.files(frozen):
+        if paths and not any(
+            path == chosen or path.startswith(chosen.rstrip("/") + "/") for chosen in paths
+        ):
+            skipped["excluded_path_filter"] += 1
+            continue
         reason = skip_reason(path)
         kind = file_kind(path)
         if not reason and kind:
@@ -188,7 +203,7 @@ def _pointer(parts: list[str]) -> str:
     return "/" + "/".join(p.replace("~", "~0").replace("/", "~1") for p in parts)
 
 
-def data_candidates(text: str, suffix: str) -> list[Candidate]:
+def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) -> list[Candidate]:
     """Reason values with exact lexical quotes and JSON-pointer-style key paths.
 
     Ordinary descriptions need an explicit commitment. Reason keys identify
@@ -200,6 +215,12 @@ def data_candidates(text: str, suffix: str) -> list[Candidate]:
     out = []
 
     def add(key: str, value: str, start: int, end: int, parts: list[str]) -> None:
+        if nominate_values:
+            if value.strip() and (key.lower() in _REASON_KEYS or nominate(value)):
+                out.append(
+                    Candidate(start, end, text[start:end], _pointer(parts), "nominated data value")
+                )
+            return
         if not value.strip() or value.strip().endswith("?"):
             return
         if re.fullmatch(r"(?:none|n/?a|unknown|todo|tbd|pending)[.!]?", value.strip(), re.I):
@@ -224,7 +245,7 @@ def data_candidates(text: str, suffix: str) -> list[Candidate]:
     if suffix in {".json", ".yaml", ".yml"}:
         if suffix == ".json":
             json.loads(text)  # YAML's permissive parser must not accept invalid JSON.
-        root = yaml.compose(text, Loader=yaml.SafeLoader)
+        root = yaml.compose(text, Loader=_YAML_LOADER)
 
         def walk(node, parts: list[str], key: str = "", ancestors=frozenset()):
             if node is None or id(node) in ancestors:
@@ -245,10 +266,11 @@ def data_candidates(text: str, suffix: str) -> list[Candidate]:
         # csv.reader handles quoted embedded newlines. Parse each raw field again
         # to retain its lexical offsets (including escapes and quote delimiters).
         fields = list(re.finditer(r'(?:"(?:[^"]|"")*"|[^,\r\n]*)(?:,|\r?\n|$)', text))
-        rows = list(csv.reader(io.StringIO(text), strict=True))
-        headers = rows[0] if rows else []
+        rows = csv.reader(io.StringIO(text), strict=True)
+        headers = next(rows, [])
+        header_counts = Counter(headers)
         cursor = 0
-        for row_no, row in enumerate(rows):
+        for row_no, row in enumerate(chain([headers], rows)):
             if not row:
                 cursor += 1  # csv.reader returns [] for an empty physical record.
                 continue
@@ -266,7 +288,7 @@ def data_candidates(text: str, suffix: str) -> list[Candidate]:
                 if row_no:
                     key = headers[col] if col < len(headers) else str(col)
                     parts = ["rows", str(row_no - 1), key]
-                    if headers.count(key) > 1:
+                    if header_counts[key] > 1:
                         parts.extend(["columns", str(col)])
                     add(key, value, m.start(), end, parts)
     elif suffix == ".toml":
@@ -316,7 +338,7 @@ def data_candidates(text: str, suffix: str) -> list[Candidate]:
                 if text[position] in "\"'":
                     _, _, part = string_token()
                 else:
-                    match = re.match(r"[A-Za-z0-9_-]+", text[position:])
+                    match = _TOML_KEY.match(text, position)
                     if not match:
                         raise ValueError("invalid TOML key")
                     part = match[0]
@@ -391,12 +413,37 @@ def data_candidates(text: str, suffix: str) -> list[Candidate]:
     return out
 
 
+def candidate_passages(text: str, path: str) -> list[Passage]:
+    """High-recall nominations only; classification determines decisions."""
+    kind = file_kind(path)
+    if kind == "md":
+        return nominate(text, markdown=True)
+    if Path(path).suffix.lower() == ".txt":
+        return nominate(text)
+    out = []
+    grouped: list[tuple[int, int]] = []
+    for start, end, _ in sorted(comment_spans(text, language_of(path))):
+        if grouped and text[grouped[-1][1] : start].strip() in {"#", "//", "--"}:
+            grouped[-1] = (grouped[-1][0], end)
+        else:
+            grouped.append((start, end))
+    for start, end in grouped:
+        out.extend(nominate(text[start:end], offset=start))
+    if kind == "data":
+        for cand in data_candidates(text, Path(path).suffix.lower(), nominate_values=True):
+            # A rationale-keyed value is nominated in its entirety, even when
+            # it contains no explicit decision marker or is ultimately rejected.
+            out.extend(nominate(cand.quote, force=True, section=cand.section, offset=cand.start))
+    return out
+
+
 class GitReader:
     """Allowlisted read-only git commands against one checkout."""
 
     def __init__(self, checkout: str | Path) -> None:
         self.checkout = Path(checkout)
         self._commit_cache: dict[str, dict] = {}
+        self._blame_cache: OrderedDict[tuple[str, str], dict[int, dict]] = OrderedDict()
 
     def git(self, *args: str) -> str:
         if not args or args[0] not in _READ_ONLY:
@@ -456,11 +503,15 @@ class GitReader:
                     "message": body,
                 }
             )
+        self._commit_cache.update({str(entry["sha"]): entry for entry in out})
         return out
 
-    def path_at(self, commit: str, path: str) -> list[tuple[str, str]]:
+    def path_at(self, commit: str, path: str, max_count: int = 0) -> list[tuple[str, str]]:
         """``(commit, path)`` pairs for a file's history, following renames."""
-        out = self.git("log", "--follow", "--name-only", "--format=%x1e%H", commit, "--", path)
+        args = ["log", "--follow", "--name-only", "--format=%x1e%H"]
+        if max_count:
+            args.append(f"--max-count={max_count}")
+        out = self.git(*args, commit, "--", path)
         pairs: list[tuple[str, str]] = []
         for block in out.split("\x1e"):
             lines = [line for line in block.strip().splitlines() if line]
@@ -468,20 +519,48 @@ class GitReader:
                 pairs.append((lines[0], lines[-1]))
         return pairs
 
+    def blame_many(self, commit: str, path: str, lines: set[int]) -> dict[int, dict]:
+        """One blame invocation for all decision lines in a file revision."""
+        key = (commit, path)
+        cached = self._blame_cache.setdefault(key, {})
+        self._blame_cache.move_to_end(key)
+        missing = sorted(lines - cached.keys())
+        if missing:
+            ranges: list[tuple[int, int]] = []
+            for line in missing:
+                if ranges and line == ranges[-1][1] + 1:
+                    ranges[-1] = (ranges[-1][0], line)
+                else:
+                    ranges.append((line, line))
+            args = ["blame", "--line-porcelain"]
+            for start, end in ranges:
+                args += ["-L", f"{start},{end}"]
+            raw = self.git(*args, commit, "--", path)
+            sha, final_line = "", 0
+            for entry in raw.splitlines():
+                header = re.match(r"^([0-9a-f]{40,64}) (\d+) (\d+)(?: \d+)?$", entry)
+                if header:
+                    sha, final_line = header[1], int(header[3])
+                elif entry.startswith("\t"):
+                    if sha not in self._commit_cache:
+                        found = self.commits(sha, max_count=1)
+                        if not found:
+                            raise RuntimeError("blame origin commit metadata unavailable")
+                    cached[final_line] = self._commit_cache[sha]
+            if not lines <= cached.keys():
+                raise RuntimeError("blame omitted requested decision lines")
+        while len(self._blame_cache) > 64:
+            self._blame_cache.popitem(last=False)
+        return {line: cached[line] for line in lines}
+
     def blame(self, commit: str, path: str, line: int) -> dict:
-        raw = self.git("blame", "--line-porcelain", "-L", f"{line},{line}", commit, "--", path)
-        sha = raw.split()[0]
-        if sha not in self._commit_cache:
-            commits = self.commits(sha, max_count=1)
-            if not commits:
-                raise RuntimeError("blame origin commit metadata unavailable")
-            self._commit_cache[sha] = commits[0]
-        return self._commit_cache[sha]
+        return self.blame_many(commit, path, {line})[line]
 
 
 def comment_spans(text: str, language: str) -> list[tuple[int, int, int]]:
     """``(start, end, line)`` of each comment or docstring body in ``text``."""
     spans: list[tuple[int, int, int]] = []
+    newlines = [m.start() for m in re.finditer("\n", text)]
     if language in {"sql", "css", "html", "jinja"}:
         delimiters = {
             "sql": [("--", "\n"), ("/*", "*/")],
@@ -497,7 +576,7 @@ def comment_spans(text: str, language: str) -> list[tuple[int, int, int]]:
                     end = text.find(closing, i + len(opening))
                     if end < 0:
                         end = len(text)
-                    spans.append((i + len(opening), end, text.count("\n", 0, i) + 1))
+                    spans.append((i + len(opening), end, bisect_right(newlines, i - 1) + 1))
                     i = end + len(closing)
                     matched = True
                     break
@@ -518,9 +597,7 @@ def comment_spans(text: str, language: str) -> list[tuple[int, int, int]]:
                     if text[i] == "\\":
                         i += 1
                     i += 1
-            elif language == "sql" and (
-                m := re.match(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$", text[i:])
-            ):
+            elif language == "sql" and text[i] == "$" and (m := _DOLLAR_QUOTE.match(text, i)):
                 end = text.find(m[0], i + len(m[0]))
                 i = len(text) if end < 0 else end + len(m[0])
             else:
@@ -549,10 +626,12 @@ def comment_spans(text: str, language: str) -> list[tuple[int, int, int]]:
         "swift",
     ):
         for m in _BLOCK.finditer(text):
-            spans.append((m.start() + 2, m.end() - 2, text.count("\n", 0, m.start()) + 1))
+            spans.append((m.start() + 2, m.end() - 2, bisect_right(newlines, m.start() - 1) + 1))
     if language == "python":
         for m in _DOCSTRING.finditer(text):
-            spans.append((m.start("body"), m.end("body"), text.count("\n", 0, m.start()) + 1))
+            spans.append(
+                (m.start("body"), m.end("body"), bisect_right(newlines, m.start() - 1) + 1)
+            )
     return spans
 
 
@@ -566,7 +645,15 @@ class RepositoryHistoryImporter:
         access: AccessContext,
         commit: str = "HEAD",
         max_commits: int = 200,
+        classifier: Any = None,
+        paths: list[str] | None = None,
+        max_seconds: float = 0,
     ) -> None:
+        if max_seconds < 0:
+            raise ValueError("max_seconds must be nonnegative")
+        self.max_seconds = max_seconds
+        self.paths = sorted(set(paths or []))
+        self.classifier = classifier
         self.registry = registry
         self.reader = reader
         self.repo = repo
@@ -579,13 +666,34 @@ class RepositoryHistoryImporter:
         self.runs = ImportRuns(registry)
 
     def run(self, *, apply: bool = False) -> dict:
+        started_run = time.monotonic()
         policy = require_import(self.access)
         if not policy.admits_repository(self.repo):
             raise AccessDenied("the repository is not in the approved corpus manifest")
         frozen = self.reader.rev_parse(self.commit)
-        selected, skipped = inventory(self.reader, frozen)
+        selected, skipped = inventory(self.reader, frozen, paths=self.paths)
+        if self.classifier is None:
+            self.classifier = decision_llm.default_classifier(
+                self.registry, corpus_id=policy.corpus_id
+            )
+        self.classifier.deadline = started_run + self.max_seconds if self.max_seconds else None
+        if self.classifier.corpus_id != policy.corpus_id:
+            raise AccessDenied("classifier cache belongs to another corpus")
         if not apply:
             totals = Counter(kind for kind, _ in selected)
+            estimates: Counter[str] = Counter()
+            seen: set[str] = set()
+            planning_errors: list[str] = []
+            for number, (kind, path) in enumerate(selected + [("log", "")], 1):
+                if self.max_seconds and time.monotonic() - started_run >= self.max_seconds:
+                    planning_errors.append("time budget reached; estimate is incomplete")
+                    break
+                logger.info("Preview unit %s/%s: %s:%s", number, len(selected) + 1, kind, path)
+                try:
+                    _, counts = self._prepare_unit(frozen, kind, path, apply=False, seen=seen)
+                    estimates.update(counts)
+                except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
+                    planning_errors.append(f"{kind}:{path}: {exc}")
             return {
                 "apply": False,
                 "commit": frozen,
@@ -599,41 +707,97 @@ class RepositoryHistoryImporter:
                         ("template", "template"),
                     )
                 },
+                "candidate_passages": estimates["candidate_passages"],
+                "uncached_passages": estimates["uncached_passages"],
+                "estimated_llm_calls": estimates["estimated_llm_calls"],
+                "extractor_model": self.classifier.model,
+                "paths": self.paths,
+                "max_commits_per_file": self.max_commits,
+                "errors": planning_errors,
+                "estimate_complete": not planning_errors,
+                "history_skipped": {k: v for k, v in estimates.items() if k.startswith("skipped_")},
                 "unsupported_files": skipped["unsupported"],
                 "skipped": dict(skipped),
             }
+        scope = {
+            "repo": self.repo,
+            "paths": self.paths,
+            "commit": frozen,
+            "max_commits": self.max_commits,
+            "importer_version": IMPORTER_VERSION,
+            "extractor_version": decision_llm.EXTRACTOR_VERSION,
+            "extractor_model": self.classifier.model,
+        }
+        previous = self.registry.db.execute(
+            "SELECT run_id FROM registry_import_runs WHERE corpus_id = ? AND policy_version = ? "
+            "AND source_system = ? AND stream = ? AND importer_version = ? AND status = 'complete' "
+            "ORDER BY finished_at DESC",
+            (
+                policy.corpus_id,
+                policy.policy_version,
+                SOURCE_SYSTEM,
+                f"repository:{self.repo}",
+                IMPORTER_VERSION,
+            ),
+        )
+        for (run_id,) in previous:
+            prior = self.runs.get(run_id)
+            if json.loads(prior["scope_manifest"]) == scope:
+                return {
+                    "run_id": run_id,
+                    "status": "complete",
+                    "commit": frozen,
+                    "coverage": prior["coverage"],
+                    "reused_completed_run": True,
+                }
         run = self.runs.start(
             self.access,
             source_system=SOURCE_SYSTEM,
             stream=f"repository:{self.repo}",
             importer=IMPORTER,
             importer_version=IMPORTER_VERSION,
-            scope={
-                "repo": self.repo,
-                "commit": frozen,
-                "max_commits": self.max_commits,
-                "importer_version": IMPORTER_VERSION,
-            },
+            scope=scope,
+            extractor=decision_llm.EXTRACTOR,
+            extractor_version=decision_llm.EXTRACTOR_VERSION,
+            extractor_model=self.classifier.model,
         )
         done = set((run["checkpoint"] or {}).get("done") or [])
         errors: list[str] = []
         units = selected + [("log", "")]
-        for kind, path in units:
+        for number, (kind, path) in enumerate(units, 1):
             key = f"{kind}:{path}"
             if key in done:
                 continue
+            if self.max_seconds and time.monotonic() - started_run >= self.max_seconds:
+                errors.append("time budget reached; resume this scope to continue")
+                break
             done.add(key)
             run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
             try:
+                logger.info("Import unit %s/%s: %s", number, len(units), key)
+                started = time.monotonic()
+                prepared, observations = self._prepare_unit(frozen, kind, path, apply=True)
                 with self.runs.page(run, self.access) as counts:
-                    if kind in {"md", "sql", "data", "template"}:
-                        self._markdown(run, frozen, path, counts)
-                    elif kind == "code":
-                        self._code(run, frozen, path, counts)
-                    else:
-                        self._log(run, frozen, counts)
+                    counts.update(observations)
+                    for sha, old_path, text, commit, candidates in prepared:
+                        if kind == "log":
+                            self._log_record(run, commit, candidates, counts)
+                        else:
+                            identity = f"{self.repo}:{path}" + (":code" if kind == "code" else "")
+                            self._file_record(
+                                run,
+                                sha,
+                                old_path,
+                                text,
+                                commit,
+                                counts,
+                                identity=identity,
+                                candidates=candidates,
+                            )
+                logger.info("Finished %s in %.3fs", key, time.monotonic() - started)
             except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
                 done.discard(key)
+                run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
                 errors.append(f"{key}: {exc}")
         with self.runs.page(run, self.access) as counts:
             if not (run.get("checkpoint") or {}).get("skips_recorded"):
@@ -642,9 +806,10 @@ class RepositoryHistoryImporter:
                 run["next_checkpoint"] = {"done": sorted(done), "skips_recorded": True}
         final = self.runs.finish(
             run,
-            complete=self.max_commits == 0,
+            complete=self.max_commits == 0 and not self.paths,
             errors=errors,
-            unknown_totals=["history_before_max_commits"] if self.max_commits else [],
+            unknown_totals=(["history_before_max_commits"] if self.max_commits else [])
+            + (["unselected_paths"] if self.paths else []),
         )
         if final["status"] == "complete":
             watermark = float(self.reader.git("show", "-s", "--format=%ct", frozen).strip())
@@ -679,58 +844,99 @@ class RepositoryHistoryImporter:
                 attributions.append(inferred)
         return attributions
 
-    def _markdown(self, run: dict, frozen: str, path: str, counts: Counter[str]) -> None:
-        history = self.reader.path_at(frozen, path)
-        if self.max_commits:
-            history = history[: self.max_commits]
-        meta = {c["sha"]: c for c in self.reader.commits(frozen, [path], self.max_commits)}
-        for sha, old_path in history:
+    def _prepare_unit(self, frozen, kind, path, *, apply, seen=None):
+        """Classify/cache outside the atomic evidence page transaction."""
+        observations: Counter[str] = Counter()
+        prepared = []
+        if kind == "log":
+            versions = [
+                (c["sha"], "", c) for c in self.reader.commits(frozen, None, self.max_commits)
+            ]
+        elif kind == "code":
+            if frozen not in self.reader._commit_cache:
+                self.reader.commits(frozen, max_count=1)
+            versions = [(frozen, path, self.reader._commit_cache.get(frozen, {"sha": frozen}))]
+        else:
+            history = self.reader.path_at(frozen, path, self.max_commits)
+            if self.max_commits:
+                history = history[: self.max_commits]
+            meta = {c["sha"]: c for c in self.reader.commits(frozen, [path], self.max_commits)}
+            versions = [(sha, old, meta.get(sha, {"sha": sha})) for sha, old in history]
+        for sha, old_path, commit in versions:
+            if (
+                self.classifier.deadline is not None
+                and time.monotonic() >= self.classifier.deadline
+            ):
+                raise RuntimeError("nomination time budget reached; resume this scope")
             try:
-                text = self.reader.show(sha, old_path)
+                text = commit["message"] if kind == "log" else self.reader.show(sha, old_path)
             except UnicodeError:
-                counts["skipped_history_binary"] += 1
-                counts["excluded_scope"] += 1
+                observations["skipped_history_binary"] += 1
+                observations["excluded_scope"] += 1
                 continue
             if text is None:
-                counts["unavailable"] += 1
-                continue
-            reason = skip_reason(old_path, text)
+                raise RuntimeError("source revision unavailable")
+            reason = skip_reason(old_path, text) if kind != "log" else ""
             if reason:
-                counts[f"skipped_history_{reason}"] += 1
-                counts["excluded_scope"] += 1
+                observations[f"skipped_history_{reason}"] += 1
+                observations["excluded_scope"] += 1
                 continue
-            commit = meta.get(sha, {"sha": sha})
-            self._file_record(
-                run, sha, old_path, text, commit, counts, identity=f"{self.repo}:{path}"
-            )
+            passages = nominate(text) if kind == "log" else candidate_passages(text, old_path)
+            prepared.append((sha, old_path, text, commit, passages))
+        # Translate offsets into one disjoint virtual file for classification,
+        # so all historical revisions share bounded batches and identical text
+        # is classified only once. Then restore each revision's real offsets.
+        from dataclasses import replace
 
-    def _code(self, run: dict, frozen: str, path: str, counts: Counter[str]) -> None:
-        text = self.reader.show(frozen, path)
-        if text is None:
-            counts["unavailable"] += 1
-            return
-        commits = self.reader.commits(frozen, [path], 1)
-        commit = commits[0] if commits else {"sha": frozen}
-        self._file_record(
-            run, frozen, path, text, commit, counts, identity=f"{self.repo}:{path}:code"
+        flat = []
+        bases = []
+        base = 0
+        for _, _, text, _, passages in prepared:
+            bases.append(base)
+            flat.extend(replace(p, start=p.start + base, end=p.end + base) for p in passages)
+            base += len(text) + 1
+        estimate = self.classifier.estimate(flat, seen=seen)
+        observations.update(
+            {
+                key: estimate[key]
+                for key in ("candidate_passages", "uncached_passages", "estimated_llm_calls")
+            }
         )
+        extracted = self.classifier.classify(flat) if apply else []
+        result = []
+        for (sha, old_path, text, commit, _passages), base in zip(prepared, bases, strict=True):
+            candidates = [
+                replace(c, start=c.start - base, end=c.end - base)
+                for c in extracted
+                if base <= c.start and c.end <= base + len(text)
+            ]
+            values = (
+                data_candidates(text, Path(old_path).suffix.lower(), nominate_values=True)
+                if candidates and file_kind(old_path) == "data"
+                else []
+            )
+            for index, cand in enumerate(candidates):
+                value = next(
+                    (
+                        p
+                        for p in values
+                        if p.section == cand.section and p.start <= cand.start and cand.end <= p.end
+                    ),
+                    None,
+                )
+                if value:
+                    candidates[index] = replace(
+                        cand, start=value.start, end=value.end, quote=value.quote
+                    )
+            result.append((sha, old_path, text, commit, candidates))
+        prepared = result
+        return prepared, observations
 
-    def _file_record(self, run, sha, path, text, commit, counts, *, identity):
+    def _file_record(self, run, sha, path, text, commit, counts, *, identity, candidates):
         from mira.index.extract import extract_symbols
 
         kind = file_kind(path)
         language = language_of(path)
-        candidates = []
-        if kind == "md" or Path(path).suffix.lower() == ".txt":
-            candidates = extract_decisions(text)
-        else:
-            for start, end, _ in comment_spans(text, language):
-                candidates.extend(
-                    Candidate(c.start + start, c.end + start, c.quote, c.section, c.reason)
-                    for c in extract_decisions(text[start:end])
-                )
-            if kind == "data":
-                candidates.extend(data_candidates(text, Path(path).suffix.lower()))
         rev = SourceRevision(
             SOURCE_SYSTEM,
             "git_markdown" if kind == "md" else "git_source_file",
@@ -751,10 +957,20 @@ class RepositoryHistoryImporter:
         counts["stored_evidence" if created else "duplicate_evidence"] += 1
         counts[f"{kind}_versions"] += 1
         symbols = extract_symbols(text, language) if kind == "code" else []
+        newlines = [m.start() for m in re.finditer("\n", text)]
+
+        def line_of(offset: int) -> int:
+            return bisect_right(newlines, offset - 1) + 1
+
+        origins = (
+            self.reader.blame_many(sha, path, {line_of(c.start) for c in candidates})
+            if candidates
+            else {}
+        )
         for cand in candidates:
-            line = text.count("\n", 0, cand.start) + 1
-            line_end = text.count("\n", 0, max(cand.start, cand.end - 1)) + 1
-            origin = self.reader.blame(sha, path, line)
+            line = line_of(cand.start)
+            line_end = line_of(max(cand.start, cand.end - 1))
+            origin = origins[line]
             attrs = self._git_attrs(eid, origin)
             self.store.record_attributions(attrs, corpus_id=run["corpus_id"])
             enclosing = [s for s in symbols if s.start_line <= line <= s.end_line]
@@ -788,20 +1004,21 @@ class RepositoryHistoryImporter:
                 identity=f"{identity}:{cand.section}" if kind == "data" else identity,
             )
 
-    def _log(self, run: dict, frozen: str, counts: Counter[str]) -> None:
-        for commit in self.reader.commits(frozen, None, self.max_commits):
-            rev = SourceRevision(
-                SOURCE_SYSTEM,
-                "git_commit_message",
-                f"{self.repo}@{commit['sha']}",
-                commit["message"],
-                source_url=f"https://github.com/{self.repo}/commit/{commit['sha']}",
-                source_version=commit["sha"],
-                source_created_at=commit["author_date"],
-                repository=self.repo,
-                commit_sha=commit["sha"],
-            )
-            self._record(run, rev, self._git_attrs(rev.evidence_id, commit), counts)
+    def _log_record(self, run, commit, candidates, counts):
+        rev = SourceRevision(
+            SOURCE_SYSTEM,
+            "git_commit_message",
+            f"{self.repo}@{commit['sha']}",
+            commit["message"],
+            source_url=f"https://github.com/{self.repo}/commit/{commit['sha']}",
+            source_version=commit["sha"],
+            source_created_at=commit["author_date"],
+            repository=self.repo,
+            commit_sha=commit["sha"],
+        )
+        self._record(
+            run, rev, self._git_attrs(rev.evidence_id, commit), counts, candidates=candidates
+        )
 
     def _record(
         self,
@@ -813,6 +1030,7 @@ class RepositoryHistoryImporter:
         anchor_path: str = "",
         commit: str = "",
         identity: str = "",
+        candidates: list[Candidate] | None = None,
     ) -> None:
         eid, created = self.store.record_revision(
             rev, corpus=(run["corpus_id"], run["policy_version"]), run_id=run["run_id"]
@@ -821,7 +1039,7 @@ class RepositoryHistoryImporter:
         counts["fetched_versions"] += 1
         counts["stored_evidence" if created else "duplicate_evidence"] += 1
         self.store.record_attributions(attrs, corpus_id=run["corpus_id"])
-        candidates = extract_decisions(rev.original_text)
+        candidates = candidates if candidates is not None else extract_decisions(rev.original_text)
         for cand in candidates:
             anchor = None
             if anchor_path:
@@ -863,6 +1081,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--max-commits", type=int, default=200, help="Commit limit; 0 walks all history"
     )
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=0,
+        help="Optional run budget; incomplete apply runs resume",
+    )
+    parser.add_argument("--path", action="append", help="Limit to a file or directory; repeatable")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
@@ -879,6 +1104,8 @@ def main(argv: list[str] | None = None) -> int:
         access=access,
         commit=args.commit,
         max_commits=args.max_commits,
+        paths=args.path,
+        max_seconds=args.max_seconds,
     ).run(apply=args.apply)
     json.dump(out, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")

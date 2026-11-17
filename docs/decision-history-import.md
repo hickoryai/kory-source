@@ -41,13 +41,53 @@ Without `--apply` each command is a dry run that writes nothing.
 
 ## Extraction
 
-`imports.extract_decisions` is deterministic (`kory-source.decision-extractor/2`,
-no model): explicit commitments ("we decided", "the decision was to",
-"Decision:") and items under a "Decisions" / ADR heading, skipping questions,
-negations, hypotheticals, fenced code and blockquotes. Offsets slice the
-original text exactly. Every extracted decision is `proposed`, cites its
-quote, carries an `extractor` attribution separate from the author, and gets
-an authority tier from its `decision_author` / `director` attributions.
+Repository history uses a two-stage extractor. `decision_passages.nominate`
+only selects candidates: every Markdown paragraph/list item in every section,
+every rationale-keyed data value, and comments/text with broad choice,
+constraint or rationale cues (including because, instead of, we use/keep/chose,
+do not, never, always, must, trade-off, rationale, why, decided and ratified).
+Adjacent line comments retain their choice/rationale context. Nomination never
+creates a decision by itself.
+
+`decision_llm.DecisionClassifier` batches nominated passages from all revisions
+of one file (16 passages or 24,000 source characters per logical completion).
+It uses `mira.llm.router_acp.RouterAcpProvider` with tracing required, regardless
+of `MIRA_ROUTER_ACP_ALLOW_UNTRACED`. The runtime needs the relay settings and
+tracing endpoint described by that provider; no provider API keys are used.
+`REGISTRY_EXTRACTION_MODEL` selects a pinned router candidate; otherwise the
+runtime indexing model, then runtime model is used. Unpinned/auto models are
+refused so model-specific cache entries have stable meaning.
+
+Each structured result has `is_decision`, `statement`, `quote`, `rationale` and
+`confidence`. A positive result requires nonempty statement/rationale and a
+verbatim supporting substring; unsupported quotes are rejected and the
+rejection is cached. Malformed responses fail the unit without advancing its
+checkpoint. Model statements populate decision bodies, and exact supporting
+quotes/offsets remain in immutable evidence. Model identity is recorded on the
+row and in a separate extractor attribution; source author/model attribution
+stays separate. The model's numeric confidence is retained in the classification
+cache and evidence reason, independently of the registry's computed confidence.
+
+The additive `002_decision_classifications.sql` cache is scoped by corpus and
+keyed by passage SHA-256, extractor version and pinned model. Positive, negative
+and invalid-quote rejection results persist before evidence materialization,
+so retrying a failed evidence transaction does not repeat model calls. Unchanged
+passages reuse cache entries across files and imports. Exact completed scopes
+reuse their completed run, and replays do not add classification, decision,
+evidence or attribution rows. Changing content, extractor version or model
+requires new classification. An older binary that does not know migration 002
+refuses that database, as required by the migration ledger contract.
+
+Dry runs report candidate passages, unique uncached passages, estimated logical
+LLM calls, model and whether estimation completed. They do not construct a
+provider, call a seat, write cache entries or materialize decisions. Estimates
+exclude transport retries and are explicitly incomplete if source reads/parsing
+fail. Tests use fake router transport/tracing, with no live calls in CI.
+
+Linear and GitHub source extraction retains the existing deterministic
+`imports.extract_decisions` path; the reusable classifier is available to other
+source plugins. All extracted interpretations remain `proposed` with exact
+cited evidence; source wording never grants registry approval.
 
 ## Anchors
 
@@ -118,25 +158,24 @@ artifact and package-history audits and recorded maintainer approval in AGENTS.m
 
 ## Extra repository decisions and source plugins
 
-Repository importer version 3 adds SQL `--` and `/* */` comments, JSON/YAML/CSV/TOML
+Repository importer version 4 includes SQL `--` and `/* */` comments, JSON/YAML/CSV/TOML
 reason values, Jinja `{# #}`, HTML/SVG `<!-- -->`, CSS `/* */`, and plain `.txt`
 passages. All these file types walk their revisions, including migration seed
 and registry data in arbitrary directories. YAML retains `#` comments as well
 as value scanning. Other supported code languages retain frozen-head scanning.
 
-Reason/rationale/why/decision/_comment keys identify candidate rationale values;
-ordinary descriptions need explicit decision wording. The deterministic extractor
-also recognizes owner/case decisions, dated decisions, ratification, and approval
-statements. Questions, hypothetical choices and undecided statements are excluded.
-There is no LLM import extraction path. Imported text is never executed.
+Reason/rationale/why/decision/_comment keys nominate rationale values regardless
+of explicit decision wording. Other values need broad rationale/choice cues.
+The model distinguishes actual adopted decisions from questions, descriptions,
+hypothetical options and undecided statements. Imported text is never executed.
 A data quote is the exact source slice (including lexical quoting or multiline
 syntax), with its escaped key path in the evidence `section` field; CSV paths
 use `/rows/<zero-based-data-row>/<column>`. Identical values at distinct key paths
 are distinct decisions. SQL strings and dollar-quoted values are not comments.
 
 The same inventory powers dry runs, import and coverage reconciliation. Dry runs
-report markdown/code/sql/data/template file counts and skipped reasons, without
-extracting or storing decisions. Dependency/generated directories, lockfiles,
+report markdown/code/sql/data/template file counts, skipped reasons, candidate
+passages and estimated uncached LLM calls, without classifying or storing decisions. Dependency/generated directories, lockfiles,
 minified files, generated-file markers, non-text encodings and NUL-containing
 files are skipped explicitly. Malformed structured data and failed Git reads
 leave an incomplete run with recorded errors. Positive commit limits remain
@@ -178,9 +217,34 @@ agent markers remain separate from source accounts. Linear retains issue,
 comment or document author/time and source URL. Unknown identities remain
 unknown instead of being replaced with the importer.
 
-Replaying repository v3 or Linear v4 revisits existing evidence and backfills
+Replaying repository v4 or Linear v4 revisits existing evidence and backfills
 missing provenance without approving decisions. Existing lifecycle approvers
 and statuses are preserved; after a registry lifecycle action `decided_by` and
 `decided_at` retain their lifecycle meaning, while source attribution and
 immutable evidence retain the original author/time. Upgraded importer versions
 use fresh scopes so old checkpoints cannot suppress the new extraction.
+
+
+## Bounded planning and resumable execution
+
+Use repeatable `--path <file-or-directory>` filters and `--max-commits 2` for a
+bounded preview before estimating a large backfill. Git receives the history
+limit before walking, rather than reading all history and slicing afterward.
+`--max-seconds 900` optionally limits an execution attempt. Completed file pages
+remain checkpointed; completed classification batches remain cached even when
+a file page has not materialized. Resuming the same scope skips completed pages
+and classifications. Path-filtered and positive-commit-limit runs remain
+incomplete and never advance the full repository cursor.
+
+Code at the frozen commit shares one commit metadata lookup. Provenance lookup
+runs one Git blame command for all extracted decision lines in each file revision,
+with cached origins and commit metadata, instead of one command per decision.
+Nomination uses indexed newline positions, position-based SQL/TOML scanning and
+the safe C YAML loader when available, with a portable safe-loader fallback.
+
+The runtime job must set `MIRA_TRACING_MODULE=mira.tracing.otlp` together with its
+OTLP endpoint and relay configuration. Live runtime estimates must distinguish
+cold-cache seat work from source/Git processing time: the initial backfill can
+require many bounded executions, whereas unchanged passages require no further
+model calls. A bounded sample is not a complete history inventory or permission
+to run a shared-environment import.

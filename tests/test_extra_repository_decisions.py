@@ -16,6 +16,8 @@ from mira.registry.repository_history import (
 from mira.registry.service import Registry
 from tests import registry_policy as rp
 
+pytestmark = pytest.mark.usefixtures("fake_history_classifier")
+
 FIX = Path(__file__).parent / "fixtures" / "extra_decisions"
 REPO = "example/sample"
 

@@ -198,9 +198,18 @@ def repository_history_factory(registry: Any, config: Mapping[str, Any]) -> Sour
         )
     commit = values.pop("commit", "HEAD")
     max_commits = values.pop("max_commits", 200)
+    optional = {
+        key: values.pop(key) for key in ("paths", "max_seconds", "classifier") if key in values
+    }
     _reject_options("repository-history", values)
     return RepositoryHistoryImporter(
-        registry, reader, repo=repo, access=access, commit=commit, max_commits=max_commits
+        registry,
+        reader,
+        repo=repo,
+        access=access,
+        commit=commit,
+        max_commits=max_commits,
+        **optional,
     )
 
 

@@ -494,3 +494,13 @@ HAI-14000 extends fork-owned registry history import:
 - `tests/test_extra_repository_decisions.py`, `test_import_provenance.py`,
   `test_source_importers.py` and `tests/fixtures/extra_decisions/`: synthetic tests.
 - `docs/decision-history-import.md`: importer contracts and plugin usage.
+
+
+HAI-14000 extraction correction adds `src/mira/registry/decision_passages.py`
+(high-recall nomination), `decision_llm.py` (mandatory traced router classification,
+strict support validation and replay cache), and
+`migrations/002_decision_classifications.sql` (additive classification cache).
+`tests/test_decision_passages.py`, `test_decision_llm.py` and
+`tests/history_classifier.py` cover fake-provider extraction and legacy fixtures;
+`tests/conftest.py` exposes the explicit offline fixture, and migration tests now
+verify every packaged migration and the older-binary refusal for schema 002.

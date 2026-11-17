@@ -119,3 +119,16 @@ def sample_walkthrough_result() -> WalkthroughResult:
             ),
         ],
     )
+
+
+@pytest.fixture
+def fake_history_classifier(monkeypatch):
+    """Legacy fixtures use an offline fake; production defaults remain LLM based."""
+    from mira.registry import decision_llm
+    from tests.history_classifier import LegacyFixtureClassifier
+
+    monkeypatch.setattr(
+        decision_llm,
+        "default_classifier",
+        lambda registry, *, corpus_id: LegacyFixtureClassifier(corpus_id),
+    )
