@@ -6,6 +6,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Automatic reviews survive a process restart and prefer a fresh head.** A running head that has not started posting is queued again when its lease lapses or the process shuts down, unless a newer head superseded it. A replacement process waits 60 seconds before taking a lease that just lapsed. The service claims the newest queued head first and leaves older heads queued. The default service concurrency is 8 reviews, and the default seat-worker call concurrency is 16, both still inside their existing caps.
+
 ### Added
 
 - **Secondary reviewer, off by default.** When `KORY_SOURCE_AUTO_REVIEW=1`, every pull request delivered for a repository the GitHub App is installed on is reviewed once as a `COMMENT` on that frozen commit. The review body and each comment are labeled `Kory Source (secondary reviewer)` plus the head sha. The path never requests changes, never adds a required check, and never edits branch protection. While the flag is on, the unlabeled reviewer does not run. A pause or a missing account skips that delivery. Pause and rollback are an admin setting and a process stop. The seat worker is started only at enablement, on the workstation that holds the logged-in router account pool. Name that host at runtime with `KORY_SOURCE_WORKER_HOST`; leave it unset for generic wording. With the flag unset, webhook reviews stay on today's path. The review model is `grok-4.7`. `KORY_SOURCE_AUTO_REVIEW_ACCOUNT` supplies the router account id; an unset account does not select another model.

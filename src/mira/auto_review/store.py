@@ -7,7 +7,9 @@ head_sha)``. A second delivery of the same head updates nothing.
 
 States: ``queued``, ``running``, ``superseded``, ``posted``, ``skipped``.
 A newer head marks older queued or running heads superseded. A posted head
-is left on the commit it reviewed.
+is left on the commit it reviewed. A running head whose lease lapses, or
+whose process is shutting down, goes back to ``queued`` unless a newer head
+superseded it or posting has started.
 """
 
 from __future__ import annotations
@@ -284,16 +286,17 @@ class AutoReviewStore:
     def claim_next(
         self, worker: str, *, lease_seconds: float, deadline_seconds: float, max_running: int = 1
     ) -> AutoReviewRequest | None:
-        """Move the oldest queued head to running within the executor limit.
+        """Move the newest queued head to running within the executor limit.
 
-        ``deadline_seconds`` is the caller's budget. A negative budget claims
-        nothing. The executor enforces the real deadline with ``wait_for``.
+        Older heads stay queued. ``deadline_seconds`` is the caller's budget.
+        A negative budget claims nothing. The executor enforces the real
+        deadline with ``wait_for``.
         """
         if deadline_seconds < 0 or max_running < 1:
             return None
         candidate = self._one(
             f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests WHERE state = 'queued' "
-            "ORDER BY created_at LIMIT 1"
+            "ORDER BY created_at DESC, id DESC LIMIT 1"
         )
         if candidate is None:
             return None
@@ -321,19 +324,44 @@ class AutoReviewStore:
             )
             return cur.rowcount == 1
 
-    def interrupt_expired(self, now: float | None = None) -> int:
-        """A lapsed running lease is skipped and never re-queued."""
-        now = time.time() if now is None else now
+    def requeue_unposted(self, request_id: str) -> bool:
+        """Put one interrupted running head back on the queue.
+
+        A superseded head stays superseded. A head that has started posting
+        stays running so a second comment is not sent. Returns True when the
+        row moved back to ``queued``.
+        """
+        now = time.time()
         with self._cursor() as cur:
             cur.execute(
-                "UPDATE auto_review_requests SET state = 'skipped', error_code = 'interrupted', "
-                "error_message = 'The worker stopped before this head was posted.', "
-                "lease_owner = '', lease_expires_at = 0, finished_at = ?, updated_at = ? "
-                "WHERE state = 'running' AND lease_expires_at < ? AND posted_review_id = ''",
-                (now, now, now),
+                "UPDATE auto_review_requests SET state = 'queued', error_code = '', "
+                "error_message = '', lease_owner = '', lease_expires_at = 0, "
+                "started_at = 0, finished_at = 0, updated_at = ? "
+                "WHERE id = ? AND state = 'running' AND posted_review_id = ''",
+                (now, request_id),
             )
-            interrupted = cur.rowcount
-        return interrupted
+            return cur.rowcount == 1
+
+    def interrupt_expired(self, now: float | None = None, *, grace_seconds: float = 0) -> int:
+        """Requeue running heads whose lease lapsed and that have not posted.
+
+        A lease that lapsed inside ``grace_seconds`` stays with its owner so
+        a replacement process does not take it during shutdown. The shutting
+        down process requeues its own head immediately. A superseded head is
+        not running, so it is left superseded. A head that already started
+        posting is left running.
+        """
+        now = time.time() if now is None else now
+        cutoff = now - max(0.0, grace_seconds)
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE auto_review_requests SET state = 'queued', error_code = '', "
+                "error_message = '', lease_owner = '', lease_expires_at = 0, "
+                "started_at = 0, finished_at = 0, updated_at = ? "
+                "WHERE state = 'running' AND posted_review_id = '' AND lease_expires_at < ?",
+                (now, cutoff),
+            )
+            return cur.rowcount
 
     def begin_post(self, request_id: str) -> bool:
         """True when this running head may post. A second caller loses."""

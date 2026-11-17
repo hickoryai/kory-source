@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 
 WORK_POLL_SECONDS = 0.5
 LEASE_SECONDS = 120.0
+# A replacement instance waits this long before adopting a lapsed lease, so
+# shutdown can requeue the head itself. Measured rollouts overlap for about
+# 15 seconds; the lease itself is 120 seconds.
+ROLLOUT_GRACE_SECONDS = 60.0
 DEADLINE_SECONDS = 3 * 60 * 60
 POLL_SECONDS = 2.0
 
@@ -224,7 +228,7 @@ async def execute_request(
         else:
             await poster(store, req.id, snapshot.pr_info(), result, req.head_sha)
     except asyncio.CancelledError:
-        store.mark_skipped(req.id, "interrupted", "the server stopped while this head was running")
+        store.requeue_unposted(req.id)
         raise
     except SnapshotError as exc:
         store.mark_skipped(req.id, exc.code, str(exc))
@@ -267,14 +271,14 @@ class AutoReviewExecutor:
         self.worker_id = "arw_" + uuid.uuid4().hex[:12]
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
-        self.max_running = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", 4, 8)
+        self.max_running = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", 8, 8)
         self._tasks: set[asyncio.Task[None]] = set()
         self._stopping = False
 
     async def start(self) -> None:
-        interrupted = self.store.interrupt_expired()
+        interrupted = self.store.interrupt_expired(grace_seconds=ROLLOUT_GRACE_SECONDS)
         if interrupted:
-            logger.warning("auto review: skipped %d head(s) with a lapsed lease", interrupted)
+            logger.warning("auto review: requeued %d head(s) with a lapsed lease", interrupted)
         self._loop_task = asyncio.create_task(self._loop())
 
     def wake(self) -> None:
@@ -294,7 +298,7 @@ class AutoReviewExecutor:
     async def _loop(self) -> None:
         while not self._stopping:
             try:
-                self.store.interrupt_expired()
+                self.store.interrupt_expired(grace_seconds=ROLLOUT_GRACE_SECONDS)
                 while len(self._tasks) < self.max_running:
                     job = self.store.claim_next(
                         self.worker_id,
@@ -350,9 +354,7 @@ class AutoReviewExecutor:
                 job.id, "deadline_exceeded", "the review did not finish in time"
             )
         except asyncio.CancelledError:
-            self.store.mark_skipped(
-                job.id, "interrupted", "the server stopped while this head was running"
-            )
+            self.store.requeue_unposted(job.id)
             raise
         except Exception:
             logger.exception("auto review executor crashed on %s", job.id)
