@@ -15,20 +15,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import BackgroundTasks, FastAPI
 from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
+from scripts.audit_public_image import scan
 
 from mira.auto_review.config import (
-    ENABLEMENT_STEPS,
     ENV_ACCOUNT,
+    ENV_WORKER_HOST,
     MODEL_NAME,
     REVIEW_EVENT,
     SECONDARY_LABEL,
-    WORKER_HOST,
+    enablement_steps,
     ownership,
     pinned_model,
     review_preamble,
     set_paused,
     trial_filter,
     trial_mira_config,
+    worker_host,
 )
 from mira.auto_review.poster import post_if_current
 from mira.auto_review.routes import router as auto_review_router
@@ -287,10 +289,19 @@ async def _run(
     return engine, poster
 
 
-def test_enablement_steps_need_no_code_reconstruction() -> None:
-    text = "\n".join(ENABLEMENT_STEPS)
-    assert WORKER_HOST == "dev-kory-ai"
-    assert "dev-kory-ai" in text
+def test_enablement_steps_need_no_code_reconstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(ENV_WORKER_HOST, raising=False)
+    text = "\n".join(enablement_steps())
+    assert worker_host() == "the workstation with the logged-in router account pool"
+    assert worker_host() in text
+    assert "workstation-hostname" not in scan(text.encode())
+    monkeypatch.setenv(ENV_WORKER_HOST, "seat.example")
+    named = "\n".join(enablement_steps())
+    assert worker_host() == "seat.example"
+    assert "seat.example" in named
+    assert "workstation-hostname" not in scan(named.encode())
     assert "0.11.0" in text
     assert "KORY_SOURCE_AUTO_REVIEW" in text
     assert "KORY_SOURCE_AUTO_REVIEW_REPOS" not in text
@@ -844,10 +855,17 @@ async def test_admin_switch_and_worker_routes(
             cookies={SESSION_COOKIE: member},
         )
         assert denied.status_code == 403
+        monkeypatch.delenv(ENV_WORKER_HOST, raising=False)
         opened = await client.get("/api/auto-review/switch", cookies={SESSION_COOKIE: admin})
         assert opened.status_code == 200
         assert opened.json()["paused"] is False
-        assert opened.json()["worker_host"] == "dev-kory-ai"
+        assert (
+            opened.json()["worker_host"] == "the workstation with the logged-in router account pool"
+        )
+        monkeypatch.setenv(ENV_WORKER_HOST, "seat.example")
+        named = await client.get("/api/auto-review/switch", cookies={SESSION_COOKIE: admin})
+        assert named.status_code == 200
+        assert named.json()["worker_host"] == "seat.example"
         assert opened.json()["review_event"] == "COMMENT"
         paused = await client.post(
             "/api/auto-review/switch",

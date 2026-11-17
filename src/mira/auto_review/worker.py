@@ -1,8 +1,9 @@
 """Seat worker for the secondary reviewer.
 
-Run this on dev-kory-ai, the workstation with the logged-in router account
-pool. It stays stopped unless ``KORY_SOURCE_AUTO_REVIEW=1``. A box outage
-stops Kory only; it does not touch Greptile.
+Run this on the workstation with the logged-in router account pool. Set
+``KORY_SOURCE_WORKER_HOST`` to name that host in logs; leave it unset for
+generic wording. It stays stopped unless ``KORY_SOURCE_AUTO_REVIEW=1``. A box
+outage stops Kory only; it does not touch Greptile.
 
     python -m mira.auto_review.worker
 """
@@ -21,9 +22,9 @@ from mira.auto_review.config import (
     ENV_FLAG,
     ENV_SOURCE_URL,
     ENV_TOKEN,
-    WORKER_HOST,
     concurrency_limit,
     flag_on,
+    worker_host,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
         logger.info(
             "%s is unset; seat worker staying stopped (enablement host: %s)",
             ENV_FLAG,
-            WORKER_HOST,
+            worker_host(),
         )
         return 0
     source = _source_url()
@@ -78,7 +79,7 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
         logger.error("seat worker needs %s and %s", ENV_SOURCE_URL, ENV_TOKEN)
         return 2
     relay = _relay_url()
-    logger.info("seat worker polling %s via %s on %s", source, relay, WORKER_HOST)
+    logger.info("seat worker polling %s via %s on %s", source, relay, worker_host())
     limit = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", 8, 20)
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=httpx.Timeout(CALL_TIMEOUT, connect=10.0))

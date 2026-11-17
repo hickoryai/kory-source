@@ -61,6 +61,14 @@ def test_clean_image_passes(tmp_path):
     assert audit_image(path) == []
 
 
+def test_workstation_hostname_is_flagged():
+    assert "workstation-hostname" in scan(b"worker host dev-kory-ai")
+    assert "workstation-hostname" in scan(b"DEV-KORY-AI")
+    assert "workstation-hostname" not in scan(
+        b"the workstation with the logged-in router account pool"
+    )
+
+
 def test_legal_attribution_preserved_but_not_credentials():
     assert not scan(b"Copyright Hickory AI")
     assert "private-key" in scan(b"Copyright -----BEGIN PRIVATE KEY-----\n" + b"A" * 64)

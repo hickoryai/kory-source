@@ -205,6 +205,10 @@ Apache 2.0. See [LICENSE](LICENSE).
 
 The image includes no organization repository selection or deployment configuration.
 Mount configuration and credentials at runtime; do not add them to the build context.
+The seat worker reads its host from `KORY_SOURCE_WORKER_HOST`. Leave that variable
+unset and logs, operator steps, and the admin switch stay generic
+("the workstation with the logged-in router account pool"). Set it only in the
+worker process environment.
 `mira index-repos` requires one or more explicit `--repo owner/repo` arguments
 (or `--repo owner/repo=/checkout` for local rename detection). A deployment that
 relied on a built-in list sets `MIRA_INDEX_REPOS="owner/one owner/two"` instead;
@@ -230,7 +234,7 @@ and its access controls for that runtime data.
 
 Before distributing an image, run `python3 scripts/audit_public_image.py --source .`
 and audit its Docker-save archive with `--image /path/to/image.tar`. The audit
-checks known organization markers, internal ticket IDs, credential patterns,
+checks known organization markers, internal hostnames, internal ticket IDs, credential patterns,
 configuration/history and every layer, including subsequently deleted files.
 It prints categories and hashed locators, never matching contents. It preserves
 copyright attribution and the public repository provenance labels. Known AWS
