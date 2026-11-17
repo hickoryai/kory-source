@@ -401,6 +401,17 @@ class AutoReviewStore:
             )
         return work_id
 
+    def work_for_request(self, request_id: str) -> list[AutoReviewWork]:
+        """Seat calls for one head, oldest first."""
+        with self._cursor() as cur:
+            cur.execute(
+                f"SELECT {_WORK_COLUMNS} FROM auto_review_work WHERE request_id = ? "
+                "ORDER BY created_at, id",
+                (request_id,),
+            )
+            rows = cur.fetchall()
+        return [AutoReviewWork(*row) for row in rows]
+
     def get_work(self, work_id: str) -> AutoReviewWork | None:
         with self._cursor() as cur:
             cur.execute(

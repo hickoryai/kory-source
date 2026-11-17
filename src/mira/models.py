@@ -405,6 +405,9 @@ class ReviewResult:
     # filter/critique stage, so a benchmark run can show whether a missed
     # finding was never drafted or drafted-then-dropped. Not posted anywhere.
     audit: list[dict] = field(default_factory=list)
+    # Seat-reported model ids that produced this review, in report order.
+    # Never the requested model. Empty when nothing was reported.
+    actual_models: list[str] = field(default_factory=list)
 
 
 @dataclass
