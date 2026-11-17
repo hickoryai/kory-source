@@ -447,7 +447,7 @@ def test_duplicate_delivery_and_supersede_keep_posted_heads(db: AppDatabase) -> 
     _drain(store)
 
     running_old = _running(store, sha="d" * 40, number=8)
-    store.enqueue(
+    queued, queued_insert = store.enqueue(
         platform="github",
         owner="hickoryai",
         repo="hickory-ai",
@@ -456,7 +456,22 @@ def test_duplicate_delivery_and_supersede_keep_posted_heads(db: AppDatabase) -> 
         base_sha=BASE,
         installation_id=42,
     )
-    assert store.get(running_old.id).state == "superseded"
+    assert queued_insert
+    assert store.get(running_old.id).state == "running"
+    assert queued.state == "queued"
+    replaced, replaced_insert = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=8,
+        head_sha="f" * 40,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    assert replaced_insert
+    assert store.get(running_old.id).state == "running"
+    assert store.get(queued.id).state == "superseded"
+    assert replaced.state == "queued"
 
 
 def test_lapsed_lease_is_requeued_unless_superseded_or_posting(db: AppDatabase) -> None:
@@ -493,7 +508,15 @@ def test_lapsed_lease_is_requeued_unless_superseded_or_posting(db: AppDatabase) 
     assert posting.posted_review_id == "pending"
     assert store.mark_skipped(again.id, "test_slot", "free the only running slot")
 
-    running_old = _running(store, sha="d" * 40, number=8)
+    waiting, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=8,
+        head_sha="d" * 40,
+        base_sha=BASE,
+        installation_id=42,
+    )
     store.enqueue(
         platform="github",
         owner="hickoryai",
@@ -503,9 +526,9 @@ def test_lapsed_lease_is_requeued_unless_superseded_or_posting(db: AppDatabase) 
         base_sha=BASE,
         installation_id=42,
     )
-    assert store.get(running_old.id).state == "superseded"
-    assert store.requeue_unposted(running_old.id) is False
-    assert store.get(running_old.id).state == "superseded"
+    assert store.get(waiting.id).state == "superseded"
+    assert store.requeue_unposted(waiting.id) is False
+    assert store.get(waiting.id).state == "superseded"
     assert store.interrupt_expired(now=time.time() + 3600) == 0
 
 
@@ -601,7 +624,15 @@ def test_third_interruption_skips_the_head(db: AppDatabase) -> None:
     assert posting.interrupt_count == 2
     assert store.mark_skipped(other.id, "test_slot", "free the only running slot")
 
-    running_old = _running(store, sha="d" * 40, number=8)
+    waiting, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=8,
+        head_sha="d" * 40,
+        base_sha=BASE,
+        installation_id=42,
+    )
     store.enqueue(
         platform="github",
         owner="hickoryai",
@@ -611,9 +642,9 @@ def test_third_interruption_skips_the_head(db: AppDatabase) -> None:
         base_sha=BASE,
         installation_id=42,
     )
-    assert store.get(running_old.id).state == "superseded"
-    assert store.requeue_unposted(running_old.id) is False
-    assert store.get(running_old.id).state == "superseded"
+    assert store.get(waiting.id).state == "superseded"
+    assert store.requeue_unposted(waiting.id) is False
+    assert store.get(waiting.id).state == "superseded"
 
 
 def test_claim_takes_the_newest_head_and_keeps_the_backlog(db: AppDatabase) -> None:
@@ -654,6 +685,55 @@ def test_claim_takes_the_newest_head_and_keeps_the_backlog(db: AppDatabase) -> N
     nxt = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
     assert nxt is not None and nxt.id == middle.id
     assert store.get(oldest.id).state == "queued"
+
+
+def test_running_head_is_not_cancelled_and_one_newer_head_waits(db: AppDatabase) -> None:
+    store = _store(db)
+    running = _running(store, sha="a" * 40, number=7)
+    first_wait, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha="b" * 40,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    second_wait, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha="c" * 40,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    other, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=9,
+        head_sha="d" * 40,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    assert store.get(running.id).state == "running"
+    assert store.get(running.id).head_sha == "a" * 40
+    assert store.get(first_wait.id).state == "superseded"
+    assert second_wait.state == "queued"
+
+    # The running review holds this pull request. Another pull request can start.
+    claimed = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30, max_running=4)
+    assert claimed is not None
+    assert claimed.id == other.id
+    assert store.get(second_wait.id).state == "queued"
+
+    store.mark_skipped(running.id, "test_done", "the running head posted")
+    store.mark_skipped(other.id, "test_done", "the other pull request posted")
+    nxt = store.claim_next("worker-c", lease_seconds=30, deadline_seconds=30, max_running=4)
+    assert nxt is not None
+    assert nxt.id == second_wait.id
+    assert store.get(first_wait.id).state == "superseded"
 
 
 def test_pinned_model_rejects_substitution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -869,12 +949,12 @@ async def test_execute_posts_frozen_sha_once(
     assert poster.calls == [HEAD]
 
 
-async def test_execute_does_not_post_superseded_or_paused_or_writes(
+async def test_execute_posts_running_head_and_skips_paused_or_writes(
     db: AppDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(db)
     job = _running(store, sha=HEAD, number=9)
-    store.enqueue(
+    newer, _ = store.enqueue(
         platform="github",
         owner="hickoryai",
         repo="hickory-ai",
@@ -884,9 +964,13 @@ async def test_execute_does_not_post_superseded_or_paused_or_writes(
         installation_id=42,
     )
     engine, poster = await _run(store, job, monkeypatch)
-    assert engine.snapshot_calls == 0
-    assert poster.calls == []
-    assert store.get(job.id).state == "superseded"
+    assert engine.snapshot_calls == 1
+    assert poster.calls == [HEAD]
+    posted = store.get(job.id)
+    assert posted is not None
+    assert posted.state == "posted"
+    assert posted.head_sha == HEAD
+    assert store.get(newer.id).state == "queued"
     _drain(store)
 
     current = _running(store, sha=HEAD, number=10)

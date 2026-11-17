@@ -276,8 +276,11 @@ Deploy the service before upgrading/restarting the worker. An upgraded worker
 against an older service safely continues serially if the service ignores its
 exclusion list. Both processes must be upgraded to get the full throughput gain.
 Set both limits to `1` to restore serial execution. Invalid limits fail startup.
-Shutdown puts an unposted head back on the queue unless a newer head of that
-pull request superseded it. A head that has started posting is left alone.
+A newer push does not cancel a review that is already running. That review
+posts on the head it started, and at most one newer head of the same pull
+request stays queued behind it. A later push replaces that queued head.
+Shutdown puts an unposted running head back on the queue. A head that has
+started posting is left alone.
 The third interruption skips the head with error code `interrupted_retry_cap`
 instead of queueing it again, so a head that keeps stopping the service is not
 retried forever.

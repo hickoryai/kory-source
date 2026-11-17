@@ -8,7 +8,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Automatic reviews survive a process restart and prefer a fresh head.** A running head that has not started posting is queued again when its lease lapses or the process shuts down, unless a newer head superseded it. A replacement process waits 60 seconds before taking a lease that just lapsed. The service claims the newest queued head first and leaves older heads queued. The default service concurrency is 8 reviews, and the default seat-worker call concurrency is 16, both still inside their existing caps.
+- **A running automatic review is not cancelled by a newer push.** The review finishes and posts on the head it started. At most one newer head of that pull request stays queued, and a later push replaces the queued head. A second head of a pull request does not start while one is running.
+- **Automatic reviews survive a process restart and prefer a fresh head.** A running head that has not started posting is queued again when its lease lapses or the process shuts down. A replacement process waits 60 seconds before taking a lease that just lapsed. The service claims the newest queued head first and leaves older heads queued. The default service concurrency is 8 reviews, and the default seat-worker call concurrency is 16, both still inside their existing caps.
 - **An automatic-review head stops after three interruptions.** The third lapsed lease or shutdown marks that head skipped with `interrupted_retry_cap` instead of queueing it again. A newer head, and a head that already started posting, are unchanged.
 
 ### Added
