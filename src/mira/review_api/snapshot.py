@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -110,6 +111,7 @@ class SnapshotReader:
         return httpx.AsyncClient(transport=self._transport, timeout=30, follow_redirects=True)
 
     async def _get(self, path: str, *, params: dict[str, Any] | None = None) -> httpx.Response:
+        started = time.monotonic()
         token = await self._token()
         headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
         url = f"{_api_url()}/repos/{self.owner}/{self.repo}{path}"
@@ -118,6 +120,10 @@ class SnapshotReader:
                 return await client.get(url, headers=headers, params=params)
         except httpx.HTTPError as exc:
             raise SnapshotError("github_unavailable", f"GitHub request failed: {exc}") from exc
+        finally:
+            logger.info(
+                "review GitHub fetch path=%s seconds=%.3f", path, time.monotonic() - started
+            )
 
     async def get_pull(self, number: int) -> PullMeta:
         resp = await self._get(f"/pulls/{number}")

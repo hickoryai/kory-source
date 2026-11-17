@@ -10,9 +10,10 @@ from __future__ import annotations
 import hmac
 import logging
 import os
-from typing import Any
+import time
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -83,11 +84,13 @@ async def post_switch(request: Request) -> JSONResponse:
 
 
 @router.get("/work")
-def poll_work(request: Request) -> Response:
+def poll_work(
+    request: Request, exclude: Annotated[list[str] | None, Query(max_length=20)] = None
+) -> Response:
     """The seat worker's next relay body, or 204 when there is nothing to run."""
     if not getattr(request.state, "auto_review_worker", False):
         return _error(401, "worker_token_required", "The seat worker token is required.")
-    work = _store().next_pending()
+    work = _store().next_pending(tuple(exclude or ()))
     if work is None:
         return Response(status_code=204)
     return JSONResponse(
@@ -97,6 +100,7 @@ def poll_work(request: Request) -> Response:
             "close": work.is_close,
             "body": work.seat_body(),
             "timeout_seconds": work.timeout_seconds,
+            "queue_wait_seconds": max(0, time.time() - work.created_at),
         }
     )
 

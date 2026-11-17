@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import BackgroundTasks, FastAPI
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 
 from mira.auto_review.config import (
     ENABLEMENT_STEPS,
@@ -32,7 +32,12 @@ from mira.auto_review.config import (
 )
 from mira.auto_review.poster import post_if_current
 from mira.auto_review.routes import router as auto_review_router
-from mira.auto_review.runner import build_trial_engine, execute_request, seat_transport
+from mira.auto_review.runner import (
+    AutoReviewExecutor,
+    build_trial_engine,
+    execute_request,
+    seat_transport,
+)
 from mira.auto_review.store import AutoReviewStore
 from mira.auto_review.worker import run_worker
 from mira.config import load_config
@@ -925,3 +930,206 @@ async def test_auto_review_routes_are_mounted() -> None:
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/api/auto-review/switch")
     assert response.status_code == 401
+
+
+async def test_executor_runs_bounded_reviews_and_cancels_all_on_stop(
+    db: AppDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(db)
+    for number in range(6):
+        store.enqueue(
+            platform="github",
+            owner="example",
+            repo="project",
+            pr_number=number,
+            head_sha=HEAD,
+            base_sha=BASE,
+            installation_id=1,
+        )
+    started: list[str] = []
+    cancelled: list[str] = []
+    full = asyncio.Event()
+
+    async def execute(store, job, reader_factory):
+        started.append(job.id)
+        if len(started) == 3:
+            full.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(job.id)
+
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", "3")
+    monkeypatch.setattr("mira.auto_review.runner.execute_request", execute)
+    executor = AutoReviewExecutor(store, AsyncMock())
+    await executor.start()
+    try:
+        await asyncio.wait_for(full.wait(), 2)
+        assert len(executor._tasks) == 3
+        assert (
+            store.claim_next("other", lease_seconds=30, deadline_seconds=30, max_running=3) is None
+        )
+    finally:
+        await executor.stop()
+    assert len(started) == 3
+    assert set(cancelled) == set(started)
+    assert all(store.get(job).error_code == "interrupted" for job in started)
+
+
+async def test_executor_refills_after_one_review_finishes(
+    db: AppDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(db)
+    for number in range(3):
+        store.enqueue(
+            platform="github",
+            owner="example",
+            repo="project",
+            pr_number=number,
+            head_sha=HEAD,
+            base_sha=BASE,
+            installation_id=1,
+        )
+    started = []
+    first_done = asyncio.Event()
+    full = asyncio.Event()
+    refilled = asyncio.Event()
+
+    async def execute(store, job, reader_factory):
+        started.append(job.id)
+        if len(started) == 2:
+            full.set()
+        if len(started) == 3:
+            refilled.set()
+        if len(started) == 1:
+            await first_done.wait()
+            store.mark_skipped(job.id, "test_complete", "completed")
+        else:
+            await asyncio.Event().wait()
+
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", "2")
+    monkeypatch.setattr("mira.auto_review.runner.execute_request", execute)
+    executor = AutoReviewExecutor(store, AsyncMock())
+    await executor.start()
+    try:
+        await asyncio.wait_for(full.wait(), 2)
+        first_done.set()
+        await asyncio.wait_for(refilled.wait(), 2)
+        assert len(started) == 3
+        assert len(executor._tasks) == 2
+    finally:
+        await executor.stop()
+
+
+async def test_worker_overlaps_calls_without_duplicate_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
+    monkeypatch.setenv("KORY_SOURCE_URL", "https://source.test")
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", "test-secret")
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", "2")
+    monkeypatch.setattr("mira.auto_review.worker.POLL_SECONDS", 0.01)
+    pending = ["first", "second", "third"]
+    calls = []
+    running = set()
+    answers = []
+    overlap = asyncio.Event()
+    third = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(request: Request) -> Response:
+        if request.url.path == "/api/auto-review/work":
+            exclude = request.url.params.get_list("exclude")
+            assert running <= set(exclude)
+            item = next((key for key in pending if key not in exclude), None)
+            if item is None:
+                return Response(204)
+            return Response(
+                200, json={"work_id": item, "body": {"prompt": item}, "timeout_seconds": 30}
+            )
+        if request.url.path == "/api/agent/llm-complete":
+            key = json.loads(request.content)["prompt"]
+            calls.append(key)
+            running.add(key)
+            assert len(running) <= 2
+            try:
+                if key == "first":
+                    await release.wait()
+                elif key == "second":
+                    assert "first" in running
+                    overlap.set()
+                else:
+                    third.set()
+                    await release.wait()
+                return Response(200, json={"text": "review", "actual_model": ROUTEABLE_MODEL})
+            finally:
+                running.remove(key)
+        key = request.url.path.rsplit("/", 1)[-1]
+        pending.remove(key)
+        answers.append(key)
+        return Response(200, json={})
+
+    async with AsyncClient(transport=MockTransport(handle)) as client:
+        worker = asyncio.create_task(run_worker(client=client))
+        try:
+            await asyncio.wait_for(overlap.wait(), 2)
+            await asyncio.wait_for(third.wait(), 2)
+            assert calls == ["first", "second", "third"]
+            assert answers == ["second"]
+        finally:
+            worker.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await worker
+        assert not running
+        assert not client.is_closed
+
+
+async def test_poll_excludes_in_flight_work_without_mutating_it(
+    db: AppDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable(monkeypatch, db)
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", "seat-secret")
+    store = _store(db)
+    job = _running(store)
+    first = store.create_work(job.id, prompt="one", model=ROUTEABLE_MODEL, timeout_seconds=30)
+    second = store.create_work(job.id, prompt="two", model=ROUTEABLE_MODEL, timeout_seconds=30)
+    async with AsyncClient(transport=ASGITransport(app=_api(db)), base_url="http://test") as client:
+        headers = {"Authorization": "Bearer seat-secret"}
+        response = await client.get(
+            "/api/auto-review/work", headers=headers, params={"exclude": first}
+        )
+        assert response.status_code == 200
+        assert response.json()["work_id"] == second
+        assert response.json()["queue_wait_seconds"] >= 0
+        response = await client.get(
+            "/api/auto-review/work",
+            headers=headers,
+            params=[("exclude", first), ("exclude", second)],
+        )
+        assert response.status_code == 204
+    assert store.get_work(first).state == "pending"
+    assert store.get_work(second).state == "pending"
+
+
+@pytest.mark.parametrize("value", ["0", "9", "-1", "invalid"])
+def test_executor_rejects_unbounded_concurrency(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", value)
+    with pytest.raises(ValueError):
+        AutoReviewExecutor(_store(db), AsyncMock())
+
+
+@pytest.mark.parametrize("value", ["0", "21", "-1", "invalid"])
+async def test_worker_rejects_unbounded_concurrency(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
+    monkeypatch.setenv("KORY_SOURCE_URL", "https://source.test")
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", "test-secret")
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", value)
+    with pytest.raises(ValueError):
+        await run_worker()

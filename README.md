@@ -254,3 +254,40 @@ ids it only lists the package; a real run needs the package name typed to confir
 the exact live version id set, and it deletes the whole package and then checks that
 it is gone. A restore within GitHub's 30-day window would bring the audited contents
 back.
+
+### Automatic review throughput
+
+When automatic reviews are enabled, the service and the seat worker have separate
+runtime concurrency limits:
+
+| Variable | Process | Default | Allowed range |
+| --- | --- | --- | --- |
+| `KORY_SOURCE_AUTO_REVIEW_CONCURRENCY` | Service | 4 reviews | 1–8 |
+| `KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY` | Seat worker | 8 relay calls | 1–20 |
+
+Run one service process and one seat worker. The worker polls sequentially and
+excludes its in-flight work IDs, then dispatches distinct calls concurrently.
+The exclusion list is local to that worker; it is not a distributed work lease.
+Deploy the service before upgrading/restarting the worker. An upgraded worker
+against an older service safely continues serially if the service ignores its
+exclusion list. Both processes must be upgraded to get the full throughput gain.
+Set both limits to `1` to restore serial execution. Invalid limits fail startup.
+Shutdown cancels all in-flight reviews and worker calls using the existing
+interruption behavior.
+
+These limits change scheduling only. Model selection, prompts, chunk limits,
+filters, head eligibility, posting guards, and the tracing requirement are
+unchanged. Each model call still uses the router provider's tracing adapter;
+configure `MIRA_TRACING_MODULE=mira.tracing.otlp` and its collector at runtime.
+The automatic-review store uses the existing application connection, and the
+Postgres index store shares its process-wide connection. Concurrency adds no
+connection pool or database connection per review. Keep the deployment's existing
+database connection budget and instance limit when adjusting these values.
+
+Service logs record review queue wait, snapshot duration, each seat-call duration
+(including its wait for the worker), and final review state/duration. Snapshot
+reader logs time each GitHub fetch. Worker logs record each call's queue wait,
+active count, and relay duration, correlated by request/work ID. Use these with
+the model-call traces to distinguish queue delay, GitHub fetching, and model time;
+prompts and completions are not copied into the timing logs. Validate real queue
+and posting latency after rollout before increasing the limits further.

@@ -17,7 +17,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
-from mira.auto_review.config import CALL_TIMEOUT_SECONDS, flag_on, paused, trial_mira_config
+from mira.auto_review.config import (
+    CALL_TIMEOUT_SECONDS,
+    concurrency_limit,
+    flag_on,
+    paused,
+    trial_mira_config,
+)
 from mira.auto_review.poster import post_if_current
 from mira.auto_review.store import AutoReviewRequest, AutoReviewStore, AutoReviewWork
 from mira.review_api.snapshot import (
@@ -62,6 +68,7 @@ def seat_transport(
             close=close,
             priority=str(body.get("priority") or "review"),
         )
+        started = time.monotonic()
         try:
             while True:
                 parent = store.get(request_id)
@@ -86,6 +93,14 @@ def seat_transport(
         except asyncio.CancelledError:
             store.expire_work(work_id)
             raise
+        finally:
+            logger.info(
+                "auto review seat call request=%s work=%s close=%s seconds=%.3f",
+                request_id,
+                work_id,
+                close,
+                time.monotonic() - started,
+            )
 
     return transport
 
@@ -159,9 +174,19 @@ async def execute_request(
     if current is None or current.state != "running":
         return
     engine: Any = None
+    started = time.monotonic()
+    logger.info(
+        "auto review started request=%s queue_wait_seconds=%.3f",
+        req.id,
+        max(0, time.time() - req.created_at),
+    )
     try:
         reader = await reader_factory(req.owner, req.repo, req.installation_id)
+        fetch_started = time.monotonic()
         snapshot = await capture(reader, req)
+        logger.info(
+            "auto review snapshot request=%s seconds=%.3f", req.id, time.monotonic() - fetch_started
+        )
         fresh = store.get(req.id)
         if fresh is None or fresh.state != "running":
             return
@@ -209,6 +234,13 @@ async def execute_request(
     finally:
         if engine is not None:
             await _close_seats(engine)
+        final = store.get(req.id)
+        logger.info(
+            "auto review finished request=%s seconds=%.3f state=%s",
+            req.id,
+            time.monotonic() - started,
+            final.state if final else "missing",
+        )
 
 
 def _posting_provider(req: AutoReviewRequest) -> Any:
@@ -235,7 +267,8 @@ class AutoReviewExecutor:
         self.worker_id = "arw_" + uuid.uuid4().hex[:12]
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
-        self._task: asyncio.Task[None] | None = None
+        self.max_running = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", 4, 8)
+        self._tasks: set[asyncio.Task[None]] = set()
         self._stopping = False
 
     async def start(self) -> None:
@@ -253,26 +286,34 @@ class AutoReviewExecutor:
             self._loop_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._loop_task
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._task
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _loop(self) -> None:
         while not self._stopping:
             try:
                 self.store.interrupt_expired()
-                if self._task is None:
+                while len(self._tasks) < self.max_running:
                     job = self.store.claim_next(
                         self.worker_id,
                         lease_seconds=LEASE_SECONDS,
                         deadline_seconds=DEADLINE_SECONDS,
+                        max_running=self.max_running,
                     )
-                    if job is not None:
-                        self._task = asyncio.create_task(self._run(job))
+                    if job is None:
+                        break
+                    task = asyncio.create_task(self._run(job))
+                    self._tasks.add(task)
+                    task.add_done_callback(self._finished)
             except Exception:
                 logger.exception("auto review executor poll failed")
             await self._wait()
+
+    def _finished(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        self.wake()
 
     async def _wait(self) -> None:
         self._wake.clear()
@@ -318,7 +359,8 @@ class AutoReviewExecutor:
             self.store.mark_skipped(job.id, "internal_error", "internal_error")
         finally:
             pulse.cancel()
-            self._task = None
+            with contextlib.suppress(asyncio.CancelledError):
+                await pulse
 
 
 def _reader_factory(app_auth: Any) -> ReaderFactory:
@@ -354,7 +396,9 @@ async def start_auto_review(app_auth: Any) -> None:
         return
     _executor = AutoReviewExecutor(store, _reader_factory(app_auth))
     await _executor.start()
-    logger.info("auto review executor %s started on one frozen head at a time", _executor.worker_id)
+    logger.info(
+        "auto review executor %s started concurrency=%d", _executor.worker_id, _executor.max_running
+    )
 
 
 async def stop_auto_review() -> None:

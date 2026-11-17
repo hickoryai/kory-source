@@ -63,6 +63,14 @@ ENABLEMENT_STEPS: tuple[str, ...] = (
 )
 
 
+def concurrency_limit(env: str, default: int, maximum: int) -> int:
+    """Bound runtime concurrency without changing the review configuration."""
+    value = int(os.environ.get(env, str(default)))
+    if not 1 <= value <= maximum:
+        raise ValueError(f"{env} must be between 1 and {maximum}")
+    return value
+
+
 def flag_on() -> bool:
     """True only when the process env explicitly enables the path."""
     return os.environ.get(ENV_FLAG) == "1"

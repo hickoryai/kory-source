@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from typing import Any
 
 import httpx
@@ -21,6 +22,7 @@ from mira.auto_review.config import (
     ENV_SOURCE_URL,
     ENV_TOKEN,
     WORKER_HOST,
+    concurrency_limit,
     flag_on,
 )
 
@@ -77,18 +79,61 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
         return 2
     relay = _relay_url()
     logger.info("seat worker polling %s via %s on %s", source, relay, WORKER_HOST)
+    limit = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", 8, 20)
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=httpx.Timeout(CALL_TIMEOUT, connect=10.0))
+    active: dict[str, asyncio.Task[None]] = {}
     try:
         while True:
             try:
-                await _one_turn(http, source, relay)
+                for work_id, task in list(active.items()):
+                    if task.done():
+                        del active[work_id]
+                        try:
+                            task.result()
+                        except Exception:
+                            logger.exception("seat work %s failed", work_id)
+                if len(active) < limit:
+                    response = await http.get(
+                        f"{source}/api/auto-review/work",
+                        headers=_source_headers(),
+                        params=[("exclude", work_id) for work_id in active],
+                    )
+                    if response.status_code != 204:
+                        response.raise_for_status()
+                        item = response.json()
+                        work_id = item["work_id"]
+                        # Also safe during a rolling upgrade with an old service
+                        # that ignores the exclusion query parameter.
+                        if work_id not in active:
+                            logger.info(
+                                "auto review work received request=%s work=%s queue_wait_seconds=%.3f active=%d",
+                                item.get("request_id"),
+                                work_id,
+                                item.get("queue_wait_seconds", 0),
+                                len(active) + 1,
+                            )
+                            active[work_id] = asyncio.create_task(
+                                _process_item(http, source, relay, item)
+                            )
+                            continue
+                if active:
+                    await asyncio.wait(
+                        active.values(),
+                        timeout=POLL_SECONDS,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                else:
+                    await asyncio.sleep(POLL_SECONDS)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("seat worker turn failed")
+                logger.exception("seat worker poll failed")
                 await asyncio.sleep(POLL_SECONDS)
     finally:
+        for task in active.values():
+            task.cancel()
+        await asyncio.gather(*active.values(), return_exceptions=True)
         if owns_client:
             await http.aclose()
 
@@ -97,13 +142,25 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
 CALL_TIMEOUT = 1860.0
 
 
-async def _one_turn(http: httpx.AsyncClient, source: str, relay: str) -> None:
-    response = await http.get(f"{source}/api/auto-review/work", headers=_source_headers())
-    if response.status_code == 204:
-        await asyncio.sleep(POLL_SECONDS)
-        return
-    response.raise_for_status()
-    item = response.json()
+async def _process_item(
+    http: httpx.AsyncClient, source: str, relay: str, item: dict[str, Any]
+) -> None:
+    started = time.monotonic()
+    try:
+        await _complete_item(http, source, relay, item)
+    finally:
+        logger.info(
+            "auto review relay request=%s work=%s close=%s seconds=%.3f",
+            item.get("request_id"),
+            item["work_id"],
+            bool(item.get("close")),
+            time.monotonic() - started,
+        )
+
+
+async def _complete_item(
+    http: httpx.AsyncClient, source: str, relay: str, item: dict[str, Any]
+) -> None:
     body = item.get("body") or {}
     timeout = float(item.get("timeout_seconds") or 30) + 30
     try:
