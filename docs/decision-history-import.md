@@ -192,7 +192,9 @@ report markdown/code/sql/data/template file counts, skipped reasons, candidate
 passages and estimated uncached LLM calls, without classifying or storing decisions. Dependency/generated directories, lockfiles,
 minified files, generated-file markers, non-text encodings and NUL-containing
 files are skipped explicitly. Malformed structured data and failed Git reads
-leave an incomplete run with recorded errors. Positive commit limits remain
+leave an incomplete run with recorded errors. Each recorded error is logged at
+WARNING as it is stored. Apply and dry-run stdout include `error_count` and the
+first 20 errors, each truncated to 300 characters; the run row keeps the full list. Positive commit limits remain
 incomplete; zero walks all reachable file revisions for the selected files.
 The inventory selects files present at the frozen commit; files deleted before
 that snapshot are outside this walk. Historical revisions of selected files

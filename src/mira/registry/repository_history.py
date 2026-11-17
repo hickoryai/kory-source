@@ -56,6 +56,24 @@ from mira.registry.provenance import ProvenanceStore, SourceRevision
 
 logger = logging.getLogger(__name__)
 
+_ERROR_PREVIEW_COUNT = 20
+_ERROR_PREVIEW_CHARS = 300
+
+
+def _record_error(errors: list[str], message: str) -> None:
+    """Append the full error and log it. Stdout later shows only a short preview."""
+    text = str(message)
+    errors.append(text)
+    logger.warning("%s", text)
+
+
+def _error_preview(errors: list[str]) -> dict[str, Any]:
+    return {
+        "error_count": len(errors),
+        "errors": [item[:_ERROR_PREVIEW_CHARS] for item in errors[:_ERROR_PREVIEW_COUNT]],
+    }
+
+
 SOURCE_SYSTEM = "git"
 IMPORTER = "kory-source.repository-history"
 IMPORTER_VERSION = "5"
@@ -729,7 +747,7 @@ class RepositoryHistoryImporter:
                 "max_concurrency": getattr(self.classifier, "max_concurrency", 2),
                 "paths": self.paths,
                 "max_commits_per_file": self.max_commits,
-                "errors": planning_errors,
+                **_error_preview(planning_errors),
                 "estimate_complete": not planning_errors,
                 "history_skipped": {k: v for k, v in estimates.items() if k.startswith("skipped_")},
                 "unsupported_files": skipped["unsupported"],
@@ -765,6 +783,7 @@ class RepositoryHistoryImporter:
                     "commit": frozen,
                     "coverage": prior["coverage"],
                     "reused_completed_run": True,
+                    **_error_preview([]),
                 }
         run = self.runs.start(
             self.access,
@@ -785,7 +804,7 @@ class RepositoryHistoryImporter:
             try:
                 classified, estimates = self._classify_prepared(prepared, apply=True)
             except (RuntimeError, ValueError) as exc:
-                errors.append(f"classification group: {exc}")
+                _record_error(errors, f"classification group: {exc}")
                 continue
             offset = 0
             for index, (kind, path, revisions, observations) in enumerate(group):
@@ -819,7 +838,7 @@ class RepositoryHistoryImporter:
                 except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
                     done.discard(key)
                     run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
-                    errors.append(f"{key}: {exc}")
+                    _record_error(errors, f"{key}: {exc}")
         with self.runs.page(run, self.access) as counts:
             counts.update(Counter(getattr(self.classifier, "stats", {})) - stats_before)
             if not (run.get("checkpoint") or {}).get("skips_recorded"):
@@ -851,6 +870,7 @@ class RepositoryHistoryImporter:
             "status": final["status"],
             "commit": frozen,
             "coverage": final["coverage"],
+            **_error_preview(errors),
         }
 
     def _git_attrs(self, eid: str, commit: dict) -> list[attr.Attribution]:
@@ -980,13 +1000,13 @@ class RepositoryHistoryImporter:
                 self.classifier.deadline is not None
                 and time.monotonic() >= self.classifier.deadline
             ):
-                errors.append("time budget reached; resume this scope")
+                _record_error(errors, "time budget reached; resume this scope")
                 break
             logger.info("Nominate unit %s/%s: %s", number, len(units), key)
             try:
                 prepared, observations = self._collect_unit(frozen, kind, path)
             except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
-                errors.append(f"{key}: {exc}")
+                _record_error(errors, f"{key}: {exc}")
                 continue
             group.append((kind, path, prepared, observations))
             count += sum(len(passages) for _, _, _, _, passages in prepared)
