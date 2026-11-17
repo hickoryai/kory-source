@@ -482,3 +482,38 @@ adapters, the required runtime endpoint, and the explicit untraced opt-out remai
 unchanged. No collector address or
 credential is bundled. `tests/test_otlp_tracing.py` exercises exported spans and
 setup failures; router and public-image tests cover the integration contract.
+
+
+HAI-14000 extends fork-owned registry history import:
+
+- `src/mira/registry/repository_history.py`: SQL, structured rationale and template
+  history, shared inventory and Git blame provenance.
+- `src/mira/registry/source_importers.py`: runtime source interface and registry.
+- `src/mira/registry/imports.py`, `linear.py`, `coverage.py`: deterministic
+  extraction, provenance replay and shared coverage inventory.
+- `tests/test_extra_repository_decisions.py`, `test_import_provenance.py`,
+  `test_source_importers.py` and `tests/fixtures/extra_decisions/`: synthetic tests.
+- `docs/decision-history-import.md`: importer contracts and plugin usage.
+
+
+HAI-14000 extraction correction adds `src/mira/registry/decision_passages.py`
+(high-recall nomination), `decision_llm.py` (mandatory traced router classification,
+strict support validation and replay cache), and
+`migrations/002_decision_classifications.sql` (additive classification cache).
+`tests/test_decision_passages.py`, `test_decision_llm.py` and
+`tests/history_classifier.py` cover fake-provider extraction and legacy fixtures;
+`tests/conftest.py` exposes the explicit offline fixture, and migration tests now
+verify every packaged migration and the older-binary refusal for schema 002.
+
+
+The HAI-14000 cost gate makes nomination selective for every source, skips
+boilerplate, packs and deduplicates across source files/revisions, and adds a
+runtime-configurable low concurrency limit. `tests/test_decision_llm_concurrency.py`
+verifies the cap, traced calls, partial-batch cache persistence and replay.
+
+Timeout adaptation defaults to configurable 16-passage/12,000-character packs.
+Timed-out packs split under the existing concurrency cap; completed halves are
+cached immediately. Singleton timeouts remain auditable skips in import
+coverage, while execution-budget expiry leaves unfinished work resumable.
+`tests/test_decision_llm_timeouts.py` covers splitting, singleton skip replay,
+partial success, configuration and budget expiry.

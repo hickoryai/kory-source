@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 SOURCE_SYSTEM = "linear"
 IMPORTER = "kory-source.linear"
-IMPORTER_VERSION = "3"
+IMPORTER_VERSION = "4"
 DEFAULT_ENDPOINT = "https://api.linear.app/graphql"
 IMPORT_ACTOR = Actor("human", "linear-import")
 PAGE_SIZE = 50
@@ -738,10 +738,9 @@ class LinearImporter:
                     "unknown_fields" if state["state"] == "unknown" else "attributed_fields"
                 ] += 1
         self.provenance.record_attributions([*attrs, tool], corpus_id=self.corpus[0])
-        if not created and self.registry.db.execute(
-            "SELECT 1 FROM registry_decision_evidence WHERE evidence_id = ? LIMIT 1", (eid,)
-        ):
-            return  # this observation already has extracted decisions
+        # Replay frozen observations during an importer upgrade.  Materialize
+        # is idempotent and adds support evidence where applicable; an existing
+        # evidence row must not hide provenance fields added by a newer importer.
         candidates = extract_decisions(rev.original_text)
         if candidates:
             materialize(

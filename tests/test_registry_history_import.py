@@ -20,6 +20,8 @@ from mira.registry.repository_history import GitReader, RepositoryHistoryImporte
 from mira.registry.service import Registry
 from tests import registry_policy as rp
 
+pytestmark = pytest.mark.usefixtures("fake_history_classifier")
+
 FIX = Path(__file__).parent / "fixtures" / "decision_history"
 GH = json.loads((FIX / "github.json").read_text())
 EXPECTED = json.loads((FIX / "expected.json").read_text())

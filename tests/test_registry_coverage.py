@@ -13,6 +13,8 @@ from tests import registry_policy as rp
 from tests import test_registry_history_import as history_tests
 from tests.test_linear_import import T0, Clock, FakeLinear, iso, project
 
+pytestmark = pytest.mark.usefixtures("fake_history_classifier")
+
 REPO = history_tests.REPO
 checkout = history_tests.checkout
 

@@ -1,0 +1,6 @@
+# Decision: Preserve the fallback.
+policy:
+  rationale: >-
+    Preserve stable labels because old clients use them.
+  description: "Owner decision: Keep the old defaults."
+  ordinary: "Sample text"
