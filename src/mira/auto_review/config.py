@@ -19,11 +19,11 @@ ENV_FLAG = "KORY_SOURCE_AUTO_REVIEW"
 ENV_TOKEN = "KORY_SOURCE_AUTO_REVIEW_TOKEN"
 ENV_ACCOUNT = "KORY_SOURCE_AUTO_REVIEW_ACCOUNT"
 ENV_SOURCE_URL = "KORY_SOURCE_URL"
+ENV_WORKER_HOST = "KORY_SOURCE_WORKER_HOST"
 PAUSE_SETTING = "auto_review_paused"
 
-# The seat worker runs here: the workstation that holds the logged-in router
-# account pool. It is not started by this process.
-WORKER_HOST = "dev-kory-ai"
+# No organization default. Deployments name the seat-worker machine at runtime.
+GENERIC_WORKER_HOST = "the workstation with the logged-in router account pool"
 
 # The model stays this name. The account id is local to the worker's router
 # and is supplied at enablement. Nothing here fills in another account or model.
@@ -33,34 +33,55 @@ CALL_TIMEOUT_SECONDS = 1800
 REVIEW_EVENT = "COMMENT"
 SECONDARY_LABEL = "Kory Source (secondary reviewer)"
 
-# Operator steps. Pause and rollback are flag and process changes; they do
-# not require reconstructing this code. None of these steps run at import.
-ENABLEMENT_STEPS: tuple[str, ...] = (
-    "Build and publish a new image from this change. Image 0.11.0 does not "
-    "contain this path and must not be enabled. Publish only after the "
-    "public-image audit passes for that exact artifact and a maintainer with "
-    "publishing authority has approved it.",
-    "Deploy that image. Leave KORY_SOURCE_AUTO_REVIEW unset until the remaining steps are done.",
-    "Install the GitHub App on the repositories Kory should review. "
-    "The installation is the scope: Kory reviews every repository the App "
-    "is installed on.",
-    "On the Kory Source service set KORY_SOURCE_AUTO_REVIEW=1, "
-    "KORY_SOURCE_AUTO_REVIEW_TOKEN to a shared secret, and "
-    "KORY_SOURCE_AUTO_REVIEW_ACCOUNT to the routeable grok@ account on the "
-    "worker host. The model is grok-4.7. An unset account does not select "
-    "another model. Restart the service.",
-    "On dev-kory-ai (the workstation with the logged-in router account pool) "
-    "start the seat worker with KORY_SOURCE_AUTO_REVIEW=1, the same token, "
-    "KORY_SOURCE_URL pointing at the service, and the local relay credentials. "
-    "Run `python -m mira.auto_review.worker`. A worker outage stops Kory only.",
-    "Pause without a deploy: as an admin, POST /api/auto-review/switch with "
-    '{"paused": true}. New heads are not queued and a review that has not '
-    "posted yet does not post. Stop the worker and unset "
-    "KORY_SOURCE_AUTO_REVIEW for a full stop.",
-    "Rollback the same way: pause, stop the worker on dev-kory-ai, and unset "
-    "the flag. No code reconstruction and no branch-protection change. Posted "
-    "comments stay on the frozen commit they reviewed. Greptile is untouched.",
-)
+
+def worker_host() -> str:
+    """Seat-worker host from the process environment.
+
+    Unset or blank stays generic. This process does not start the worker.
+    """
+    return os.environ.get(ENV_WORKER_HOST, "").strip() or GENERIC_WORKER_HOST
+
+
+def _worker_place() -> str:
+    host = worker_host()
+    if host == GENERIC_WORKER_HOST:
+        return host
+    return f"{host} (the workstation with the logged-in router account pool)"
+
+
+def enablement_steps() -> tuple[str, ...]:
+    """Operator steps. Pause and rollback are flag and process changes.
+
+    They do not require reconstructing this code. None of these steps run at
+    import. The seat-worker place is read from the environment on each call.
+    """
+    place = _worker_place()
+    return (
+        "Build and publish a new image from this change. Image 0.11.0 does not "
+        "contain this path and must not be enabled. Publish only after the "
+        "public-image audit passes for that exact artifact and a maintainer with "
+        "publishing authority has approved it.",
+        "Deploy that image. Leave KORY_SOURCE_AUTO_REVIEW unset until the remaining steps are done.",
+        "Install the GitHub App on the repositories Kory should review. "
+        "The installation is the scope: Kory reviews every repository the App "
+        "is installed on.",
+        "On the Kory Source service set KORY_SOURCE_AUTO_REVIEW=1, "
+        "KORY_SOURCE_AUTO_REVIEW_TOKEN to a shared secret, and "
+        "KORY_SOURCE_AUTO_REVIEW_ACCOUNT to the routeable grok@ account on the "
+        "worker host. The model is grok-4.7. An unset account does not select "
+        "another model. Restart the service.",
+        f"On {place} start the seat worker with KORY_SOURCE_AUTO_REVIEW=1, the same "
+        "token, KORY_SOURCE_URL pointing at the service, and the local relay "
+        "credentials. Run `python -m mira.auto_review.worker`. A worker outage "
+        "stops Kory only.",
+        "Pause without a deploy: as an admin, POST /api/auto-review/switch with "
+        '{"paused": true}. New heads are not queued and a review that has not '
+        "posted yet does not post. Stop the worker and unset "
+        "KORY_SOURCE_AUTO_REVIEW for a full stop.",
+        f"Rollback the same way: pause, stop the worker on {place}, and unset "
+        "the flag. No code reconstruction and no branch-protection change. Posted "
+        "comments stay on the frozen commit they reviewed. Greptile is untouched.",
+    )
 
 
 def concurrency_limit(env: str, default: int, maximum: int) -> int:
@@ -173,7 +194,7 @@ def switch_view(db: Any) -> dict[str, Any]:
         "env_enabled": enabled,
         "paused": is_paused,
         "effective": enabled and not is_paused and model is not None,
-        "worker_host": WORKER_HOST,
+        "worker_host": worker_host(),
         "model": model,
         "timeout_seconds": CALL_TIMEOUT_SECONDS,
         "review_event": REVIEW_EVENT,

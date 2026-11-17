@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 
 PATTERNS = {
     "organization-reference": re.compile(rb"hickory", re.I),
+    "workstation-hostname": re.compile(rb"dev-kory-ai", re.I),
     "internal-ticket": re.compile(rb"\bHAI-\d+\b"),
     "private-key": re.compile(
         rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\r\n]+[A-Za-z0-9+/=\r\n]{64,}"

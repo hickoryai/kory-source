@@ -1,6 +1,6 @@
 """Admin pause switch and the seat worker's poll/answer routes.
 
-The worker on dev-kory-ai authenticates with ``KORY_SOURCE_AUTO_REVIEW_TOKEN``.
+The seat worker authenticates with ``KORY_SOURCE_AUTO_REVIEW_TOKEN``.
 An admin session pauses the path without a deploy. Neither route turns the
 env flag on.
 """
