@@ -282,14 +282,14 @@ class AutoReviewStore:
         return row, inserted
 
     def claim_next(
-        self, worker: str, *, lease_seconds: float, deadline_seconds: float
+        self, worker: str, *, lease_seconds: float, deadline_seconds: float, max_running: int = 1
     ) -> AutoReviewRequest | None:
-        """Move the oldest queued head to running. One review at a time.
+        """Move the oldest queued head to running within the executor limit.
 
         ``deadline_seconds`` is the caller's budget. A negative budget claims
         nothing. The executor enforces the real deadline with ``wait_for``.
         """
-        if deadline_seconds < 0:
+        if deadline_seconds < 0 or max_running < 1:
             return None
         candidate = self._one(
             f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests WHERE state = 'queued' "
@@ -302,9 +302,9 @@ class AutoReviewStore:
             cur.execute(
                 "UPDATE auto_review_requests SET state = 'running', lease_owner = ?, "
                 "lease_expires_at = ?, started_at = ?, updated_at = ? "
-                "WHERE id = ? AND state = 'queued' AND NOT EXISTS ("
-                "SELECT 1 FROM auto_review_requests WHERE state = 'running')",
-                (worker, now + lease_seconds, now, now, candidate.id),
+                "WHERE id = ? AND state = 'queued' AND ("
+                "SELECT COUNT(*) FROM auto_review_requests WHERE state = 'running') < ?",
+                (worker, now + lease_seconds, now, now, candidate.id, max_running),
             )
             claimed = cur.rowcount == 1
         if not claimed:
@@ -410,15 +410,19 @@ class AutoReviewStore:
             row = cur.fetchone()
         return AutoReviewWork(*row) if row else None
 
-    def next_pending(self) -> AutoReviewWork | None:
+    def next_pending(self, exclude: tuple[str, ...] = ()) -> AutoReviewWork | None:
         """Oldest unanswered seat call whose head is still running."""
+        exclusions = ""
+        if exclude:
+            exclusions = "AND id NOT IN (" + ",".join("?" for _ in exclude) + ") "
         with self._cursor() as cur:
             cur.execute(
                 f"SELECT {_WORK_COLUMNS} FROM auto_review_work WHERE state = 'pending' "
                 "AND deadline_at >= ? AND EXISTS (SELECT 1 FROM auto_review_requests r "
                 "WHERE r.id = auto_review_work.request_id AND r.state = 'running') "
-                "ORDER BY created_at, id LIMIT 1",
-                (time.time(),),
+                + exclusions
+                + "ORDER BY created_at, id LIMIT 1",
+                (time.time(), *exclude),
             )
             row = cur.fetchone()
         return AutoReviewWork(*row) if row else None

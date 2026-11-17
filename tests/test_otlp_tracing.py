@@ -1,5 +1,6 @@
 """Exercise the bundled adapter without a network collector."""
 
+import asyncio
 import json
 
 import pytest
@@ -122,3 +123,43 @@ def test_exporter_setup_failure_keeps_router_closed(monkeypatch):
     assert raised.value.code == "router_acp_tracing_unavailable"
     assert router._tracing_ready is False
     assert otlp._provider is None
+
+
+async def test_concurrent_router_calls_each_export_an_isolated_span(tracing, monkeypatch):
+    from mira.config import LLMConfig
+    from mira.llm import router_acp as router
+
+    exporter, _ = tracing
+    monkeypatch.delenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", raising=False)
+    monkeypatch.setenv("MIRA_TRACING_MODULE", "mira.tracing.otlp")
+    monkeypatch.setenv("LLM_OTLP_ENDPOINT", "https://collector.example/v1/traces")
+    # The fixture already initialized the adapter with its in-memory exporter.
+    monkeypatch.setattr(router, "_tracing_ready", True)
+    ready = asyncio.Event()
+    entered = []
+
+    async def transport(request):
+        prompt = request["body"]["prompt"]
+        entered.append(prompt)
+        trace.get_current_span().set_attribute("example.call", prompt)
+        if len(entered) == 2:
+            ready.set()
+        await asyncio.wait_for(ready.wait(), 2)
+        return {"text": prompt, "actual_model": "example/model"}
+
+    async def complete(text):
+        provider = router.RouterAcpProvider(
+            LLMConfig(provider="router-acp", model="auto"), transport=transport, relay=False
+        )
+        return await provider.complete([{"role": "user", "content": text}], json_mode=False)
+
+    results = await asyncio.gather(complete("first"), complete("second"))
+    assert len(set(results)) == 2
+    assert otlp._provider.force_flush()
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 2
+    assert len({span.context.span_id for span in spans}) == 2
+    assert {span.attributes["example.call"] for span in spans} == set(entered)
+    for span in spans:
+        assert span.attributes["example.call"] == span.attributes["mira.response_text"]
+        assert span.status.status_code is not trace.StatusCode.ERROR
