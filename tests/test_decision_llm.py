@@ -137,9 +137,9 @@ def test_batch_bounds_and_content_deduplication(tmp_path):
     classifier = DecisionClassifier(reg, corpus_id="sample", model="test/pinned", provider=provider)
     texts = [f"We use approach {i} because it fits." for i in range(35)]
     passages = [Passage(0, len(t), t) for t in texts]
-    assert classifier.estimate(passages + passages)["estimated_llm_calls"] == 3
+    assert classifier.estimate(passages + passages)["estimated_llm_calls"] == 1
     assert len(classifier.classify(passages + passages)) == 70
-    assert len(provider.calls) == 3
+    assert len(provider.calls) == 1
 
 
 def test_required_tracing_ignores_general_opt_out(tmp_path, monkeypatch):
@@ -183,7 +183,7 @@ def test_real_importer_dry_run_has_no_calls_and_cache_prevents_duplicate_rows(tm
             classifier=classifier,
         )
         plan = importer.run()
-        assert plan["candidate_passages"] == 4 and plan["estimated_llm_calls"] == 3
+        assert plan["candidate_passages"] == 3 and plan["estimated_llm_calls"] == 1
         assert not provider.calls
         assert reg.db.execute("SELECT COUNT(*) FROM registry_decision_classifications") == [(0,)]
         assert not reg._select("kind = 'decision'")
@@ -290,13 +290,13 @@ def test_history_revisions_share_batches_and_failed_checkpoint_retries(tmp_path)
         )
         plan = importer.run()
         assert plan["candidate_passages"] == 4
-        assert plan["estimated_llm_calls"] == 2  # three README revisions + one log unit
+        assert plan["estimated_llm_calls"] == 1  # README revisions and log packed together
         assert importer.run(apply=True)["status"] == "incomplete"
-        assert len(provider.calls) == 1 and len(provider.calls[0]) == 3
+        assert not provider.calls
         assert importer.run(apply=True)["status"] == "incomplete"
         assert importer.run(apply=True)["status"] == "complete"
-        assert len(provider.calls) == 2
-        assert provider.traces == 4  # two successful batches, two failed attempts
+        assert len(provider.calls) == 1 and len(provider.calls[0]) == 4
+        assert provider.traces == 3  # one packed success, two failed attempts
 
 
 def test_blame_is_batched_and_bounded_paths_and_history_are_applied(tmp_path):
@@ -370,3 +370,34 @@ def test_expired_runtime_budget_stops_before_spending_a_seat(tmp_path):
     with pytest.raises(RuntimeError, match="time budget reached"):
         classifier.classify([Passage(0, 9, "We use X.")])
     assert not provider.calls
+
+
+def test_small_files_pack_together_and_shared_passages_are_classified_once(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    for index in range(10):
+        (repo / f"sample{index}.py").write_text(
+            f"# We use approach {index % 5} because it fits.\nvalue = 1\n"
+        )
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "Generic fixtures")
+    reg = registry(tmp_path)
+    provider = FakeProvider()
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": "example/sample"}])):
+        classifier = DecisionClassifier(
+            reg, corpus_id=rp.CORPUS, model="test/pinned", provider=provider
+        )
+        result = RepositoryHistoryImporter(
+            reg,
+            GitReader(repo),
+            repo="example/sample",
+            access=rp.operator(),
+            max_commits=0,
+            classifier=classifier,
+        ).run(apply=True)
+    assert result["status"] == "complete"
+    assert len(provider.calls) == 1 and len(provider.calls[0]) == 5
+    assert result["coverage"]["candidate_passages"] == 10
+    assert result["coverage"]["uncached_passages"] == 5
+    assert len(reg._select("kind = 'decision'")) == 10  # provenance remains per source file

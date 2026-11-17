@@ -151,6 +151,20 @@ def file_kind(path: str) -> str:
 def skip_reason(path: str, text: str | None = None) -> str:
     parts = {p.lower() for p in Path(path).parts}
     name = Path(path).name.lower()
+    if name in {
+        "changelog.md",
+        "changelog.txt",
+        "changes.md",
+        "history.md",
+        "license",
+        "license.md",
+        "license.txt",
+        "copying",
+        "copying.md",
+        "release-notes.md",
+        "release_notes.md",
+    }:
+        return "boilerplate"
     if parts & _SKIP_DIRS:
         return "dependency_or_generated_directory"
     if name in _LOCKFILES or name.endswith((".lock", ".min.js", ".min.css", ".map")):
@@ -684,16 +698,14 @@ class RepositoryHistoryImporter:
             estimates: Counter[str] = Counter()
             seen: set[str] = set()
             planning_errors: list[str] = []
-            for number, (kind, path) in enumerate(selected + [("log", "")], 1):
-                if self.max_seconds and time.monotonic() - started_run >= self.max_seconds:
-                    planning_errors.append("time budget reached; estimate is incomplete")
-                    break
-                logger.info("Preview unit %s/%s: %s:%s", number, len(selected) + 1, kind, path)
-                try:
-                    _, counts = self._prepare_unit(frozen, kind, path, apply=False, seen=seen)
-                    estimates.update(counts)
-                except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
-                    planning_errors.append(f"{kind}:{path}: {exc}")
+            for group in self._prepared_groups(
+                frozen, selected + [("log", "")], set(), planning_errors
+            ):
+                prepared = [revision for _, _, revisions, _ in group for revision in revisions]
+                _, counts = self._classify_prepared(prepared, apply=False, seen=seen)
+                estimates.update(counts)
+                for _, _, _, observations in group:
+                    estimates.update(observations)
             return {
                 "apply": False,
                 "commit": frozen,
@@ -764,41 +776,46 @@ class RepositoryHistoryImporter:
         done = set((run["checkpoint"] or {}).get("done") or [])
         errors: list[str] = []
         units = selected + [("log", "")]
-        for number, (kind, path) in enumerate(units, 1):
-            key = f"{kind}:{path}"
-            if key in done:
-                continue
-            if self.max_seconds and time.monotonic() - started_run >= self.max_seconds:
-                errors.append("time budget reached; resume this scope to continue")
-                break
-            done.add(key)
-            run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
+        for group in self._prepared_groups(frozen, units, done, errors):
+            prepared = [revision for _, _, revisions, _ in group for revision in revisions]
             try:
-                logger.info("Import unit %s/%s: %s", number, len(units), key)
-                started = time.monotonic()
-                prepared, observations = self._prepare_unit(frozen, kind, path, apply=True)
-                with self.runs.page(run, self.access) as counts:
-                    counts.update(observations)
-                    for sha, old_path, text, commit, candidates in prepared:
-                        if kind == "log":
-                            self._log_record(run, commit, candidates, counts)
-                        else:
-                            identity = f"{self.repo}:{path}" + (":code" if kind == "code" else "")
-                            self._file_record(
-                                run,
-                                sha,
-                                old_path,
-                                text,
-                                commit,
-                                counts,
-                                identity=identity,
-                                candidates=candidates,
-                            )
-                logger.info("Finished %s in %.3fs", key, time.monotonic() - started)
-            except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
-                done.discard(key)
+                classified, estimates = self._classify_prepared(prepared, apply=True)
+            except (RuntimeError, ValueError) as exc:
+                errors.append(f"classification group: {exc}")
+                continue
+            offset = 0
+            for index, (kind, path, revisions, observations) in enumerate(group):
+                key = f"{kind}:{path}"
+                kept = classified[offset : offset + len(revisions)]
+                offset += len(revisions)
+                done.add(key)
                 run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
-                errors.append(f"{key}: {exc}")
+                try:
+                    with self.runs.page(run, self.access) as counts:
+                        counts.update(observations)
+                        if index == 0:
+                            counts.update(estimates)
+                        for sha, old_path, text, commit, candidates in kept:
+                            if kind == "log":
+                                self._log_record(run, commit, candidates, counts)
+                            else:
+                                identity = f"{self.repo}:{path}" + (
+                                    ":code" if kind == "code" else ""
+                                )
+                                self._file_record(
+                                    run,
+                                    sha,
+                                    old_path,
+                                    text,
+                                    commit,
+                                    counts,
+                                    identity=identity,
+                                    candidates=candidates,
+                                )
+                except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
+                    done.discard(key)
+                    run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
+                    errors.append(f"{key}: {exc}")
         with self.runs.page(run, self.access) as counts:
             if not (run.get("checkpoint") or {}).get("skips_recorded"):
                 counts["excluded_scope"] += sum(skipped.values())
@@ -844,7 +861,7 @@ class RepositoryHistoryImporter:
                 attributions.append(inferred)
         return attributions
 
-    def _prepare_unit(self, frozen, kind, path, *, apply, seen=None):
+    def _collect_unit(self, frozen, kind, path):
         """Classify/cache outside the atomic evidence page transaction."""
         observations: Counter[str] = Counter()
         prepared = []
@@ -883,6 +900,11 @@ class RepositoryHistoryImporter:
                 continue
             passages = nominate(text) if kind == "log" else candidate_passages(text, old_path)
             prepared.append((sha, old_path, text, commit, passages))
+        return prepared, observations
+
+    def _classify_prepared(self, prepared, *, apply, seen=None):
+        """Pack disjoint source revisions across files without losing offsets."""
+        observations: Counter[str] = Counter()
         # Translate offsets into one disjoint virtual file for classification,
         # so all historical revisions share bounded batches and identical text
         # is classified only once. Then restore each revision's real offsets.
@@ -931,6 +953,40 @@ class RepositoryHistoryImporter:
             result.append((sha, old_path, text, commit, candidates))
         prepared = result
         return prepared, observations
+
+    def _prepare_unit(self, frozen, kind, path, *, apply, seen=None):
+        prepared, observations = self._collect_unit(frozen, kind, path)
+        result, estimates = self._classify_prepared(prepared, apply=apply, seen=seen)
+        observations.update(estimates)
+        return result, observations
+
+    def _prepared_groups(self, frozen, units, done, errors):
+        """Bound source-memory lookahead while packing small files together."""
+        group, count, chars = [], 0, 0
+        for number, (kind, path) in enumerate(units, 1):
+            key = f"{kind}:{path}"
+            if key in done:
+                continue
+            if (
+                self.classifier.deadline is not None
+                and time.monotonic() >= self.classifier.deadline
+            ):
+                errors.append("time budget reached; resume this scope")
+                break
+            logger.info("Nominate unit %s/%s: %s", number, len(units), key)
+            try:
+                prepared, observations = self._collect_unit(frozen, kind, path)
+            except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
+                errors.append(f"{key}: {exc}")
+                continue
+            group.append((kind, path, prepared, observations))
+            count += sum(len(passages) for _, _, _, _, passages in prepared)
+            chars += sum(len(text) for _, _, text, _, _ in prepared)
+            if count >= 512 or len(group) >= 256 or chars >= 8 * 1024 * 1024:
+                yield group
+                group, count, chars = [], 0, 0
+        if group:
+            yield group
 
     def _file_record(self, run, sha, path, text, commit, counts, *, identity, candidates):
         from mira.index.extract import extract_symbols

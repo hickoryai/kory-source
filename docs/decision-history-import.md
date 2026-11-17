@@ -42,15 +42,23 @@ Without `--apply` each command is a dry run that writes nothing.
 ## Extraction
 
 Repository history uses a two-stage extractor. `decision_passages.nominate`
-only selects candidates: every Markdown paragraph/list item in every section,
-every rationale-keyed data value, and comments/text with broad choice,
+only selects candidates: Markdown paragraphs/list items with decision/rationale
+cues or ADR/decision/constraint/rationale headings, rationale-keyed data values,
+and comments/text with broad choice,
 constraint or rationale cues (including because, instead of, we use/keep/chose,
 do not, never, always, must, trade-off, rationale, why, decided and ratified).
-Adjacent line comments retain their choice/rationale context. Nomination never
-creates a decision by itself.
+Adjacent line comments retain their choice/rationale context. Changelog, license,
+release-note and generated boilerplate is excluded. Nomination never creates a
+decision by itself.
 
-`decision_llm.DecisionClassifier` batches nominated passages from all revisions
-of one file (16 passages or 24,000 source characters per logical completion).
+`decision_llm.DecisionClassifier` deduplicates nominated passages across files
+and revisions and packs them into batches of at most 64 passages or 48,000
+source characters. Bounded lookahead combines small files into the same call
+while retaining each file's provenance and atomic page checkpoint. Up to two
+calls run concurrently by default; `REGISTRY_EXTRACTION_CONCURRENCY` configures
+the limit. Every successful batch commits its cache before a failed sibling is
+reported, so retries spend seats only on unfinished work. Extractor version 2
+uses short local response IDs while retaining SHA-256 cache keys.
 It uses `mira.llm.router_acp.RouterAcpProvider` with tracing required, regardless
 of `MIRA_ROUTER_ACP_ALLOW_UNTRACED`. The runtime needs the relay settings and
 tracing endpoint described by that provider; no provider API keys are used.

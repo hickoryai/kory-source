@@ -504,3 +504,9 @@ strict support validation and replay cache), and
 `tests/history_classifier.py` cover fake-provider extraction and legacy fixtures;
 `tests/conftest.py` exposes the explicit offline fixture, and migration tests now
 verify every packaged migration and the older-binary refusal for schema 002.
+
+
+The HAI-14000 cost gate makes nomination selective for every source, skips
+boilerplate, packs and deduplicates across source files/revisions, and adds a
+runtime-configurable low concurrency limit. `tests/test_decision_llm_concurrency.py`
+verifies the cap, traced calls, partial-batch cache persistence and replay.

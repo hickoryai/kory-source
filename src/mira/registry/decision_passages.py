@@ -13,12 +13,29 @@ MAX_PASSAGE_CHARS = 6000
 
 _CUE = re.compile(
     r"\b(?:because|instead\s+of|we\s+(?:chose|choose|use|keep)|do\s+not|never|always|"
-    r"must|trade[ -]?off|rationale|why|decided|ratified|approved\s+by|decision)\b",
+    r"must|trade[ -]?off|rationale|why|decided|ratified|approved\s+by|decisions?)\b",
     re.IGNORECASE,
 )
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(?P<title>.*?)\s*#*\s*$")
 _FENCE = re.compile(r"^\s{0,3}(?:```|~~~)")
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+_DECISION_HEADING = re.compile(
+    r"\b(?:adr|architecture\s+decision\s+records?|decisions?|constraints?|rationale|why|"
+    r"trade[ -]?offs?)\b",
+    re.IGNORECASE,
+)
+_BOILERPLATE_HEADING = re.compile(
+    r"\b(?:license|copyright|changelog|change\s*log|release\s+notes?|releases?|"
+    r"version\s+history|generated|auto-generated)\b",
+    re.IGNORECASE,
+)
+_BOILERPLATE_CONTENT = re.compile(
+    r"\b(?:permission\s+is\s+hereby\s+granted|redistribution\s+and\s+use|"
+    r"licensed\s+under|apache\s+license|this\s+(?:file|document)\s+(?:is|was)\s+"
+    r"(?:automatically\s+)?generated|generated\s+(?:automatically\s+)?(?:file|document)|"
+    r"do\s+not\s+edit[^.\n]*\bgenerated)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -41,9 +58,9 @@ def nominate(
 ) -> list[Passage]:
     """Nominate exact, bounded passages without determining their meaning.
 
-    Plain text requires a lightweight decision/rationale cue unless ``force`` is
-    set. Markdown is treated as structured source: every nonempty paragraph in
-    every section is nominated, with its current heading retained as metadata.
+    Every source requires a lightweight decision/rationale cue unless ``force``
+    is set. In Markdown, a decision-oriented heading also admits its section.
+    Known license, release, changelog, and generated boilerplate is excluded.
     Offsets are translated by ``offset`` so callers can pass a source slice.
     """
     if not text:
@@ -52,9 +69,12 @@ def nominate(
     blocks = _markdown_blocks(text, section) if markdown else _plain_blocks(text, section)
     passages: list[Passage] = []
     seen: set[tuple[int, int]] = set()
-    for start, end, block_section in blocks:
+    for start, end, block_section, heading_matches in blocks:
         block = text[start:end]
-        if not force and not markdown and _CUE.search(block) is None:
+        if not force and (
+            _is_boilerplate(block, block_section)
+            or (_CUE.search(block) is None and not heading_matches)
+        ):
             continue
         for chunk_start, chunk_end in _chunks(text, start, end):
             absolute_start = offset + chunk_start
@@ -69,14 +89,16 @@ def nominate(
     return passages
 
 
-def _plain_blocks(text: str, section: str) -> list[tuple[int, int, str]]:
-    return [(start, end, section) for start, end in _paragraph_ranges(text)]
+def _plain_blocks(text: str, section: str) -> list[tuple[int, int, str, bool]]:
+    return [(start, end, section, False) for start, end in _paragraph_ranges(text)]
 
 
-def _markdown_blocks(text: str, initial_section: str) -> list[tuple[int, int, str]]:
+def _markdown_blocks(text: str, initial_section: str) -> list[tuple[int, int, str, bool]]:
     """Return paragraph ranges outside fenced code, carrying their heading."""
-    blocks: list[tuple[int, int, str]] = []
+    blocks: list[tuple[int, int, str, bool]] = []
     current_section = initial_section
+    heading_matches = False
+    heading_stack: list[tuple[int, bool]] = []
     paragraph_start: int | None = None
     paragraph_end: int | None = None
     fenced = False
@@ -85,7 +107,7 @@ def _markdown_blocks(text: str, initial_section: str) -> list[tuple[int, int, st
     def flush() -> None:
         nonlocal paragraph_start, paragraph_end
         if paragraph_start is not None and paragraph_end is not None:
-            blocks.append((paragraph_start, paragraph_end, current_section))
+            blocks.append((paragraph_start, paragraph_end, current_section, heading_matches))
         paragraph_start = None
         paragraph_end = None
 
@@ -102,6 +124,12 @@ def _markdown_blocks(text: str, initial_section: str) -> list[tuple[int, int, st
             if heading:
                 flush()
                 current_section = heading.group("title").strip()
+                level = len(body) - len(body.lstrip())
+                level = len(body[level:]) - len(body[level:].lstrip("#"))
+                while heading_stack and heading_stack[-1][0] >= level:
+                    heading_stack.pop()
+                heading_stack.append((level, bool(_DECISION_HEADING.search(current_section))))
+                heading_matches = any(matches for _, matches in heading_stack)
             elif body.strip():
                 if re.match(r"\s*(?:[-*+] |\d+[.)] )", body):
                     flush()
@@ -115,6 +143,11 @@ def _markdown_blocks(text: str, initial_section: str) -> list[tuple[int, int, st
         position = line_end
     flush()
     return blocks
+
+
+def _is_boilerplate(block: str, section: str) -> bool:
+    """Reject common non-decision boilerplate even when it has a broad cue."""
+    return bool(_BOILERPLATE_HEADING.search(section) or _BOILERPLATE_CONTENT.search(block))
 
 
 def _paragraph_ranges(text: str) -> list[tuple[int, int]]:
