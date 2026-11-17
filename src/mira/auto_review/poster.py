@@ -53,6 +53,26 @@ async def post_secondary_review(
     return int(getattr(provider, "last_review_id", 0) or 0)
 
 
+def actual_models_from_work(store: AutoReviewStore, request_id: str) -> list[str]:
+    """Models the seat reported on answers that produced review text.
+
+    ``work.model`` is the requested id and is not used. Close calls, failures,
+    and an ``unknown`` report contribute nothing.
+    """
+    models: list[str] = []
+    for work in store.work_for_request(request_id):
+        if work.is_close or work.state != "answered" or work.error_code:
+            continue
+        if not work.text.strip():
+            continue
+        actual = work.actual_model.strip()
+        if not actual or actual.lower() == "unknown":
+            continue
+        if actual not in models:
+            models.append(actual)
+    return models
+
+
 async def post_if_current(
     store: AutoReviewStore,
     request_id: str,
@@ -69,6 +89,7 @@ async def post_if_current(
         return int(existing.posted_review_id or 0)
     if not store.begin_post(request_id):
         return None
+    result.actual_models = actual_models_from_work(store, request_id)
     try:
         review_id = await post_secondary_review(provider, pr_info, result, head_sha)
     except Exception as exc:

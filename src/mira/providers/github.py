@@ -16,6 +16,7 @@ from github import Github, GithubException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from mira.exceptions import ProviderError
+from mira.llm.model_name import append_model_footer
 from mira.models import (
     BotThreadRecord,
     FileHistoryEntry,
@@ -520,6 +521,7 @@ class GitHubProvider(BaseProvider):
                 review_body = f"**Mira Review Summary**\n\n{result.summary}"
             if result.key_issues:
                 review_body += _format_key_issues(result.key_issues)
+        review_body = append_model_footer(review_body, result.actual_models)
 
         token = await self._resolve_token()
         gh = self._make_client(token)

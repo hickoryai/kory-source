@@ -1092,6 +1092,40 @@ class ReviewEngine:
         team_conventions: str = "",
         extra_custom_rules: list[dict[str, str]] | None = None,
     ) -> ReviewResult:
+        """Run the review and keep the seat-reported models that produced it."""
+        from mira.llm.model_name import stop_model_watch, watch_actual_models
+
+        collected: list[str] = []
+        token = watch_actual_models(collected)
+        try:
+            result = await self._review_diff_pipeline(
+                diff_text,
+                pr_title=pr_title,
+                pr_description=pr_description,
+                existing_comments=existing_comments,
+                on_walkthrough_ready=on_walkthrough_ready,
+                review_round=review_round,
+                resolved_threads=resolved_threads,
+                team_conventions=team_conventions,
+                extra_custom_rules=extra_custom_rules,
+            )
+        finally:
+            stop_model_watch(token)
+        result.actual_models = collected
+        return result
+
+    async def _review_diff_pipeline(
+        self,
+        diff_text: str,
+        pr_title: str = "",
+        pr_description: str = "",
+        existing_comments: list[UnresolvedThread] | None = None,
+        on_walkthrough_ready: Callable[[WalkthroughResult | None], Awaitable[None]] | None = None,
+        review_round: int = 1,
+        resolved_threads: list[dict] | None = None,
+        team_conventions: str = "",
+        extra_custom_rules: list[dict[str, str]] | None = None,
+    ) -> ReviewResult:
         """Core review pipeline.
 
         Runs walkthrough and review in parallel where possible.
