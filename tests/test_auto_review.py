@@ -509,6 +509,113 @@ def test_lapsed_lease_is_requeued_unless_superseded_or_posting(db: AppDatabase) 
     assert store.interrupt_expired(now=time.time() + 3600) == 0
 
 
+def test_existing_table_gains_the_interruption_column(db: AppDatabase) -> None:
+    _store(db)
+    conn = db._sqlite_conn
+    assert conn is not None
+    conn.execute("ALTER TABLE auto_review_requests DROP COLUMN interrupt_count")
+    conn.commit()
+    store = _store(db)
+    store.enqueue(
+        platform="github",
+        owner="example",
+        repo="project",
+        pr_number=3,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    job = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
+    assert job is not None
+    assert job.interrupt_count == 0
+
+
+def test_third_interruption_skips_the_head(db: AppDatabase) -> None:
+    store = _store(db)
+    store.enqueue(
+        platform="github",
+        owner="example",
+        repo="project",
+        pr_number=3,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    job = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
+    assert job is not None
+    assert store.requeue_unposted(job.id) is True
+    once = store.get(job.id)
+    assert once is not None
+    assert once.state == "queued"
+    assert once.interrupt_count == 1
+    assert once.error_code == ""
+
+    job = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30)
+    assert job is not None
+    assert store.interrupt_expired(now=job.lease_expires_at + 61, grace_seconds=60) == 1
+    twice = store.get(job.id)
+    assert twice is not None
+    assert twice.state == "queued"
+    assert twice.interrupt_count == 2
+
+    job = store.claim_next("worker-c", lease_seconds=30, deadline_seconds=30)
+    assert job is not None
+    # The third interruption still waits out the rollout grace.
+    assert store.interrupt_expired(now=job.lease_expires_at + 1, grace_seconds=60) == 0
+    assert store.get(job.id).state == "running"
+    assert store.get(job.id).interrupt_count == 2
+    assert store.requeue_unposted(job.id) is False
+    skipped = store.get(job.id)
+    assert skipped is not None
+    assert skipped.state == "skipped"
+    assert skipped.error_code == "interrupted_retry_cap"
+    assert skipped.interrupt_count == 3
+    assert "3 interrupted attempts" in skipped.error_message
+    assert store.claim_next("worker-d", lease_seconds=30, deadline_seconds=30) is None
+
+    # A lapsed lease takes the same cap, and a head that started posting does not.
+    store.enqueue(
+        platform="github",
+        owner="example",
+        repo="project",
+        pr_number=4,
+        head_sha=HEAD_NEXT,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    other = store.claim_next("worker-e", lease_seconds=-1, deadline_seconds=30)
+    assert other is not None
+    assert store.interrupt_expired(now=other.lease_expires_at + 1, grace_seconds=0) == 1
+    other = store.claim_next("worker-f", lease_seconds=-1, deadline_seconds=30)
+    assert other is not None
+    assert store.interrupt_expired(now=other.lease_expires_at + 1, grace_seconds=0) == 1
+    other = store.claim_next("worker-g", lease_seconds=-1, deadline_seconds=30)
+    assert other is not None
+    assert store.get(other.id).interrupt_count == 2
+    assert store.begin_post(other.id)
+    assert store.interrupt_expired(now=time.time() + 3600) == 0
+    posting = store.get(other.id)
+    assert posting is not None
+    assert posting.state == "running"
+    assert posting.posted_review_id == "pending"
+    assert posting.interrupt_count == 2
+    assert store.mark_skipped(other.id, "test_slot", "free the only running slot")
+
+    running_old = _running(store, sha="d" * 40, number=8)
+    store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=8,
+        head_sha="e" * 40,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    assert store.get(running_old.id).state == "superseded"
+    assert store.requeue_unposted(running_old.id) is False
+    assert store.get(running_old.id).state == "superseded"
+
+
 def test_claim_takes_the_newest_head_and_keeps_the_backlog(db: AppDatabase) -> None:
     store = _store(db)
     oldest, _ = store.enqueue(
