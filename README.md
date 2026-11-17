@@ -278,6 +278,9 @@ exclusion list. Both processes must be upgraded to get the full throughput gain.
 Set both limits to `1` to restore serial execution. Invalid limits fail startup.
 Shutdown puts an unposted head back on the queue unless a newer head of that
 pull request superseded it. A head that has started posting is left alone.
+The third interruption skips the head with error code `interrupted_retry_cap`
+instead of queueing it again, so a head that keeps stopping the service is not
+retried forever.
 A replacement process waits 60 seconds before adopting a lease that just
 lapsed, so it does not take the shutting-down process's head. The seat
 worker still cancels its in-flight relay calls on shutdown.

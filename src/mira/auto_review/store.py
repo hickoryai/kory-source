@@ -9,12 +9,14 @@ States: ``queued``, ``running``, ``superseded``, ``posted``, ``skipped``.
 A newer head marks older queued or running heads superseded. A posted head
 is left on the commit it reviewed. A running head whose lease lapses, or
 whose process is shutting down, goes back to ``queued`` unless a newer head
-superseded it or posting has started.
+superseded it or posting has started. After three interruptions the head is
+skipped instead, so a head that keeps stopping the service is not retried forever.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 import uuid
@@ -24,6 +26,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from mira.dashboard.db import AppDatabase
+
+logger = logging.getLogger(__name__)
+
+# One shutdown or lapsed lease is one interruption. The third skip is terminal.
+MAX_INTERRUPTIONS = 3
+INTERRUPT_CAP_CODE = "interrupted_retry_cap"
+INTERRUPT_CAP_MESSAGE = (
+    f"skipped after {MAX_INTERRUPTIONS} interrupted attempts; this head is not retried again"
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS auto_review_requests (
@@ -46,6 +57,7 @@ CREATE TABLE IF NOT EXISTS auto_review_requests (
     updated_at DOUBLE PRECISION NOT NULL,
     started_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     finished_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    interrupt_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE (platform, owner, repo, pr_number, head_sha)
 );
 CREATE INDEX IF NOT EXISTS auto_review_requests_state_idx
@@ -74,7 +86,7 @@ CREATE INDEX IF NOT EXISTS auto_review_work_request_idx
 _REQUEST_COLUMNS = (
     "id, platform, owner, repo, pr_number, head_sha, base_sha, title, installation_id, "
     "state, posted_review_id, error_code, error_message, lease_owner, lease_expires_at, "
-    "created_at, updated_at, started_at, finished_at"
+    "created_at, updated_at, started_at, finished_at, interrupt_count"
 )
 
 _WORK_COLUMNS = (
@@ -106,6 +118,7 @@ class AutoReviewRequest:
     updated_at: float
     started_at: float
     finished_at: float
+    interrupt_count: int
 
 
 @dataclass
@@ -182,6 +195,7 @@ class AutoReviewStore:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     cur.execute(statement)
+            self._ensure_interrupt_count(cur)
 
     @contextmanager
     def _cursor(self) -> Iterator[Any]:
@@ -324,21 +338,67 @@ class AutoReviewStore:
             )
             return cur.rowcount == 1
 
+    def _ensure_interrupt_count(self, cur: Any) -> None:
+        """Add the interruption counter on a database created before it existed."""
+        if self._db._backend == "sqlite":
+            cur.execute("PRAGMA table_info(auto_review_requests)")
+            names = {row[1] for row in cur.fetchall()}
+            if "interrupt_count" in names:
+                return
+            cur.execute(
+                "ALTER TABLE auto_review_requests ADD COLUMN interrupt_count "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            return
+        cur.execute(
+            "ALTER TABLE auto_review_requests ADD COLUMN IF NOT EXISTS "
+            "interrupt_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+    def _skip_interrupted(self, cur: Any, extra_where: str, params: tuple, now: float) -> int:
+        cur.execute(
+            "UPDATE auto_review_requests SET state = 'skipped', posted_review_id = '', "
+            "error_code = ?, error_message = ?, interrupt_count = interrupt_count + 1, "
+            "lease_owner = '', lease_expires_at = 0, finished_at = ?, updated_at = ? "
+            "WHERE state = 'running' AND posted_review_id = '' "
+            "AND interrupt_count + 1 >= ? " + extra_where,
+            (
+                INTERRUPT_CAP_CODE,
+                INTERRUPT_CAP_MESSAGE,
+                now,
+                now,
+                MAX_INTERRUPTIONS,
+                *params,
+            ),
+        )
+        skipped = int(cur.rowcount)
+        if skipped:
+            logger.warning(
+                "auto review: skipped %d head(s) after %d interruptions (%s)",
+                skipped,
+                MAX_INTERRUPTIONS,
+                INTERRUPT_CAP_CODE,
+            )
+        return skipped
+
     def requeue_unposted(self, request_id: str) -> bool:
         """Put one interrupted running head back on the queue.
 
         A superseded head stays superseded. A head that has started posting
-        stays running so a second comment is not sent. Returns True when the
-        row moved back to ``queued``.
+        stays running so a second comment is not sent. The third interruption
+        marks the head skipped with ``interrupted_retry_cap`` instead.
+        Returns True when the row moved back to ``queued``.
         """
         now = time.time()
         with self._cursor() as cur:
+            self._skip_interrupted(cur, "AND id = ?", (request_id,), now)
             cur.execute(
                 "UPDATE auto_review_requests SET state = 'queued', error_code = '', "
-                "error_message = '', lease_owner = '', lease_expires_at = 0, "
-                "started_at = 0, finished_at = 0, updated_at = ? "
-                "WHERE id = ? AND state = 'running' AND posted_review_id = ''",
-                (now, request_id),
+                "error_message = '', interrupt_count = interrupt_count + 1, "
+                "lease_owner = '', lease_expires_at = 0, started_at = 0, finished_at = 0, "
+                "updated_at = ? WHERE id = ? AND state = 'running' AND posted_review_id = '' "
+                "AND interrupt_count + 1 < ?",
+                (now, request_id, MAX_INTERRUPTIONS),
             )
             return cur.rowcount == 1
 
@@ -349,17 +409,21 @@ class AutoReviewStore:
         a replacement process does not take it during shutdown. The shutting
         down process requeues its own head immediately. A superseded head is
         not running, so it is left superseded. A head that already started
-        posting is left running.
+        posting is left running. A head that has already been interrupted
+        twice is skipped instead of queued. Returns how many heads were queued
+        again.
         """
         now = time.time() if now is None else now
         cutoff = now - max(0.0, grace_seconds)
         with self._cursor() as cur:
+            self._skip_interrupted(cur, "AND lease_expires_at < ?", (cutoff,), now)
             cur.execute(
                 "UPDATE auto_review_requests SET state = 'queued', error_code = '', "
-                "error_message = '', lease_owner = '', lease_expires_at = 0, "
-                "started_at = 0, finished_at = 0, updated_at = ? "
-                "WHERE state = 'running' AND posted_review_id = '' AND lease_expires_at < ?",
-                (now, cutoff),
+                "error_message = '', interrupt_count = interrupt_count + 1, "
+                "lease_owner = '', lease_expires_at = 0, started_at = 0, finished_at = 0, "
+                "updated_at = ? WHERE state = 'running' AND posted_review_id = '' "
+                "AND interrupt_count + 1 < ? AND lease_expires_at < ?",
+                (now, MAX_INTERRUPTIONS, cutoff),
             )
             return cur.rowcount
 
