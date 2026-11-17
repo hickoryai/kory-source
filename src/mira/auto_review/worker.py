@@ -80,7 +80,7 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
         return 2
     relay = _relay_url()
     logger.info("seat worker polling %s via %s on %s", source, relay, worker_host())
-    limit = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", 8, 20)
+    limit = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", 16, 20)
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=httpx.Timeout(CALL_TIMEOUT, connect=10.0))
     active: dict[str, asyncio.Task[None]] = {}

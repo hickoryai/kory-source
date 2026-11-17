@@ -266,8 +266,8 @@ runtime concurrency limits:
 
 | Variable | Process | Default | Allowed range |
 | --- | --- | --- | --- |
-| `KORY_SOURCE_AUTO_REVIEW_CONCURRENCY` | Service | 4 reviews | 1–8 |
-| `KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY` | Seat worker | 8 relay calls | 1–20 |
+| `KORY_SOURCE_AUTO_REVIEW_CONCURRENCY` | Service | 8 reviews | 1–8 |
+| `KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY` | Seat worker | 16 relay calls | 1–20 |
 
 Run one service process and one seat worker. The worker polls sequentially and
 excludes its in-flight work IDs, then dispatches distinct calls concurrently.
@@ -276,8 +276,11 @@ Deploy the service before upgrading/restarting the worker. An upgraded worker
 against an older service safely continues serially if the service ignores its
 exclusion list. Both processes must be upgraded to get the full throughput gain.
 Set both limits to `1` to restore serial execution. Invalid limits fail startup.
-Shutdown cancels all in-flight reviews and worker calls using the existing
-interruption behavior.
+Shutdown puts an unposted head back on the queue unless a newer head of that
+pull request superseded it. A head that has started posting is left alone.
+A replacement process waits 60 seconds before adopting a lease that just
+lapsed, so it does not take the shutting-down process's head. The seat
+worker still cancels its in-flight relay calls on shutdown.
 
 These limits change scheduling only. Model selection, prompts, chunk limits,
 filters, head eligibility, posting guards, and the tracing requirement are

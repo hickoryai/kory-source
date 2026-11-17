@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -458,12 +459,12 @@ def test_duplicate_delivery_and_supersede_keep_posted_heads(db: AppDatabase) -> 
     assert store.get(running_old.id).state == "superseded"
 
 
-def test_lapsed_lease_is_skipped_and_not_requeued(db: AppDatabase) -> None:
+def test_lapsed_lease_is_requeued_unless_superseded_or_posting(db: AppDatabase) -> None:
     store = _store(db)
     store.enqueue(
         platform="github",
-        owner="hickoryai",
-        repo="hickory-ai",
+        owner="example",
+        repo="project",
         pr_number=3,
         head_sha=HEAD,
         base_sha=BASE,
@@ -471,10 +472,81 @@ def test_lapsed_lease_is_skipped_and_not_requeued(db: AppDatabase) -> None:
     )
     job = store.claim_next("worker-a", lease_seconds=-1, deadline_seconds=30)
     assert job is not None
-    assert store.interrupt_expired() == 1
-    assert store.get(job.id).state == "skipped"
-    assert store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30) is None
-    assert store.claim_next("worker-b", lease_seconds=30, deadline_seconds=-1) is None
+    # One second past expiry is still inside a rollout's grace.
+    assert store.interrupt_expired(now=job.lease_expires_at + 1, grace_seconds=60) == 0
+    assert store.get(job.id).state == "running"
+    assert store.interrupt_expired(now=job.lease_expires_at + 61, grace_seconds=60) == 1
+    restored = store.get(job.id)
+    assert restored is not None
+    assert restored.state == "queued"
+    assert restored.lease_owner == ""
+    assert restored.started_at == 0
+    assert restored.finished_at == 0
+    again = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30)
+    assert again is not None and again.id == job.id
+
+    assert store.begin_post(again.id)
+    assert store.interrupt_expired(now=time.time() + 3600) == 0
+    posting = store.get(again.id)
+    assert posting is not None
+    assert posting.state == "running"
+    assert posting.posted_review_id == "pending"
+    assert store.mark_skipped(again.id, "test_slot", "free the only running slot")
+
+    running_old = _running(store, sha="d" * 40, number=8)
+    store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=8,
+        head_sha="e" * 40,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    assert store.get(running_old.id).state == "superseded"
+    assert store.requeue_unposted(running_old.id) is False
+    assert store.get(running_old.id).state == "superseded"
+    assert store.interrupt_expired(now=time.time() + 3600) == 0
+
+
+def test_claim_takes_the_newest_head_and_keeps_the_backlog(db: AppDatabase) -> None:
+    store = _store(db)
+    oldest, _ = store.enqueue(
+        platform="github",
+        owner="example",
+        repo="project",
+        pr_number=1,
+        head_sha="a" * 40,
+        base_sha=BASE,
+        installation_id=1,
+    )
+    middle, _ = store.enqueue(
+        platform="github",
+        owner="example",
+        repo="project",
+        pr_number=2,
+        head_sha="b" * 40,
+        base_sha=BASE,
+        installation_id=1,
+    )
+    newest, _ = store.enqueue(
+        platform="github",
+        owner="example",
+        repo="project",
+        pr_number=3,
+        head_sha="c" * 40,
+        base_sha=BASE,
+        installation_id=1,
+    )
+    claimed = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
+    assert claimed is not None
+    assert claimed.id == newest.id
+    assert store.get(oldest.id).state == "queued"
+    assert store.get(middle.id).state == "queued"
+    store.mark_skipped(claimed.id, "test_done", "finished the fresh head")
+    nxt = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
+    assert nxt is not None and nxt.id == middle.id
+    assert store.get(oldest.id).state == "queued"
 
 
 def test_pinned_model_rejects_substitution(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -992,7 +1064,9 @@ async def test_executor_runs_bounded_reviews_and_cancels_all_on_stop(
         await executor.stop()
     assert len(started) == 3
     assert set(cancelled) == set(started)
-    assert all(store.get(job).error_code == "interrupted" for job in started)
+    assert all(store.get(job).state == "queued" for job in started)
+    assert all(store.get(job).error_code == "" for job in started)
+    assert all(store.get(job).posted_review_id == "" for job in started)
 
 
 async def test_executor_refills_after_one_review_finishes(
@@ -1130,6 +1204,14 @@ async def test_poll_excludes_in_flight_work_without_mutating_it(
         assert response.status_code == 204
     assert store.get_work(first).state == "pending"
     assert store.get_work(second).state == "pending"
+
+
+def test_executor_defaults_to_eight_reviews(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", raising=False)
+    executor = AutoReviewExecutor(_store(db), AsyncMock())
+    assert executor.max_running == 8
 
 
 @pytest.mark.parametrize("value", ["0", "9", "-1", "invalid"])

@@ -6,6 +6,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Automatic reviews survive a process restart and prefer a fresh head.** A running head that has not started posting is queued again when its lease lapses or the process shuts down, unless a newer head superseded it. A replacement process waits 60 seconds before taking a lease that just lapsed. The service claims the newest queued head first and leaves older heads queued. The default service concurrency is 8 reviews, and the default seat-worker call concurrency is 16, both still inside their existing caps.
+
 ### Added
 
 - **Review bodies name the model that produced them.** A GitHub review ends with the family and version reported by the seat, such as `Sol 6.1` or `Grok 4.7`. Several models are listed once each. An id that does not state a family and version is shown unchanged, and a review with no reported model has no footer. The requested model is not used.
