@@ -510,3 +510,10 @@ The HAI-14000 cost gate makes nomination selective for every source, skips
 boilerplate, packs and deduplicates across source files/revisions, and adds a
 runtime-configurable low concurrency limit. `tests/test_decision_llm_concurrency.py`
 verifies the cap, traced calls, partial-batch cache persistence and replay.
+
+Timeout adaptation defaults to configurable 16-passage/12,000-character packs.
+Timed-out packs split under the existing concurrency cap; completed halves are
+cached immediately. Singleton timeouts remain auditable skips in import
+coverage, while execution-budget expiry leaves unfinished work resumable.
+`tests/test_decision_llm_timeouts.py` covers splitting, singleton skip replay,
+partial success, configuration and budget expiry.

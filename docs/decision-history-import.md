@@ -52,12 +52,18 @@ release-note and generated boilerplate is excluded. Nomination never creates a
 decision by itself.
 
 `decision_llm.DecisionClassifier` deduplicates nominated passages across files
-and revisions and packs them into batches of at most 64 passages or 48,000
-source characters. Bounded lookahead combines small files into the same call
+and revisions and packs them into batches of at most 16 passages or 12,000
+source characters (`REGISTRY_EXTRACTION_BATCH_SIZE` and
+`REGISTRY_EXTRACTION_BATCH_CHARS` configure these limits). Bounded lookahead combines small files into the same call
 while retaining each file's provenance and atomic page checkpoint. Up to two
 calls run concurrently by default; `REGISTRY_EXTRACTION_CONCURRENCY` configures
 the limit. Every successful batch commits its cache before a failed sibling is
-reported, so retries spend seats only on unfinished work. Extractor version 2
+reported, so retries spend seats only on unfinished work. Call timeouts split
+the pack in half under the same concurrency cap, down to a single passage.
+A singleton that still times out is cached as skipped with its reason and
+recorded in coverage/checkpoint details; it is never counted as a negative
+classification or a completed decision. Budget expiry instead leaves work
+resumable. Extractor version 3
 uses short local response IDs while retaining SHA-256 cache keys.
 It uses `mira.llm.router_acp.RouterAcpProvider` with tracing required, regardless
 of `MIRA_ROUTER_ACP_ALLOW_UNTRACED`. The runtime needs the relay settings and

@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 SOURCE_SYSTEM = "git"
 IMPORTER = "kory-source.repository-history"
-IMPORTER_VERSION = "4"
+IMPORTER_VERSION = "5"
 _READ_ONLY = {"log", "show", "ls-tree", "rev-parse", "cat-file", "diff", "blame"}
 _MARKDOWN = (".md", ".mdx", ".markdown")
 # Comment syntax per language. Anything else is reported as unsupported.
@@ -691,6 +691,7 @@ class RepositoryHistoryImporter:
                 self.registry, corpus_id=policy.corpus_id
             )
         self.classifier.deadline = started_run + self.max_seconds if self.max_seconds else None
+        stats_before = Counter(getattr(self.classifier, "stats", {}))
         if self.classifier.corpus_id != policy.corpus_id:
             raise AccessDenied("classifier cache belongs to another corpus")
         if not apply:
@@ -723,6 +724,9 @@ class RepositoryHistoryImporter:
                 "uncached_passages": estimates["uncached_passages"],
                 "estimated_llm_calls": estimates["estimated_llm_calls"],
                 "extractor_model": self.classifier.model,
+                "batch_size": getattr(self.classifier, "batch_size", decision_llm.BATCH_SIZE),
+                "batch_chars": getattr(self.classifier, "batch_chars", decision_llm.BATCH_CHARS),
+                "max_concurrency": getattr(self.classifier, "max_concurrency", 2),
                 "paths": self.paths,
                 "max_commits_per_file": self.max_commits,
                 "errors": planning_errors,
@@ -817,10 +821,15 @@ class RepositoryHistoryImporter:
                     run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
                     errors.append(f"{key}: {exc}")
         with self.runs.page(run, self.access) as counts:
+            counts.update(Counter(getattr(self.classifier, "stats", {})) - stats_before)
             if not (run.get("checkpoint") or {}).get("skips_recorded"):
                 counts["excluded_scope"] += sum(skipped.values())
                 counts.update({f"skipped_{key}": value for key, value in skipped.items()})
-                run["next_checkpoint"] = {"done": sorted(done), "skips_recorded": True}
+                run["next_checkpoint"] = {
+                    **(run.get("checkpoint") or {}),
+                    "done": sorted(done),
+                    "skips_recorded": True,
+                }
         final = self.runs.finish(
             run,
             complete=self.max_commits == 0 and not self.paths,
@@ -988,11 +997,50 @@ class RepositoryHistoryImporter:
         if group:
             yield group
 
+    def _record_timeout_skips(self, run, sha, path, text, counts):
+        skipped = getattr(self.classifier, "skipped", {})
+        if not skipped:
+            return
+        passages = candidate_passages(text, path) if path else nominate(text)
+        records = list(
+            (run.get("next_checkpoint") or run.get("checkpoint") or {}).get(
+                "classification_skips", []
+            )
+        )
+        known = {(r["commit"], r["path"], r["start"], r["end"]) for r in records}
+        hashes = {r["passage_sha256"] for r in records}
+        for passage in passages:
+            digest = decision_llm.passage_hash(passage.text)
+            key = (sha, path, passage.start, passage.end)
+            if digest not in skipped or key in known:
+                continue
+            records.append(
+                {
+                    "commit": sha,
+                    "path": path,
+                    "start": passage.start,
+                    "end": passage.end,
+                    "section": passage.section,
+                    "passage_sha256": digest,
+                    "reason": skipped[digest]["skip_reason"],
+                }
+            )
+            known.add(key)
+            counts["skipped_timeout_passages"] += 1
+            counts["skipped_single_passage_timeout"] += 1
+            if digest not in hashes:
+                hashes.add(digest)
+                counts["skipped_timeout_unique_passages"] += 1
+        run.setdefault("next_checkpoint", dict(run.get("checkpoint") or {}))[
+            "classification_skips"
+        ] = records
+
     def _file_record(self, run, sha, path, text, commit, counts, *, identity, candidates):
         from mira.index.extract import extract_symbols
 
         kind = file_kind(path)
         language = language_of(path)
+        self._record_timeout_skips(run, sha, path, text, counts)
         rev = SourceRevision(
             SOURCE_SYSTEM,
             "git_markdown" if kind == "md" else "git_source_file",
@@ -1061,6 +1109,7 @@ class RepositoryHistoryImporter:
             )
 
     def _log_record(self, run, commit, candidates, counts):
+        self._record_timeout_skips(run, commit["sha"], "", commit["message"], counts)
         rev = SourceRevision(
             SOURCE_SYSTEM,
             "git_commit_message",

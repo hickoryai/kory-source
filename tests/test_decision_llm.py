@@ -137,9 +137,9 @@ def test_batch_bounds_and_content_deduplication(tmp_path):
     classifier = DecisionClassifier(reg, corpus_id="sample", model="test/pinned", provider=provider)
     texts = [f"We use approach {i} because it fits." for i in range(35)]
     passages = [Passage(0, len(t), t) for t in texts]
-    assert classifier.estimate(passages + passages)["estimated_llm_calls"] == 1
+    assert classifier.estimate(passages + passages)["estimated_llm_calls"] == 3
     assert len(classifier.classify(passages + passages)) == 70
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 3
 
 
 def test_required_tracing_ignores_general_opt_out(tmp_path, monkeypatch):
