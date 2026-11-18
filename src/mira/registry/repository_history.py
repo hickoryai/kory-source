@@ -68,8 +68,22 @@ def _record_error(errors: list[str], message: str) -> None:
 
 
 def _error_preview(errors: list[str]) -> dict[str, Any]:
+    def kind(message):
+        if "Router workstation outage" in message:
+            return "router_outage"
+        if "time budget reached" in message:
+            return "time_budget"
+        if "git " in message and " failed:" in message:
+            return "git_failure"
+        if message.startswith("classification group:"):
+            return "classification_failure"
+        if message.startswith("data:"):
+            return "data_parse_or_store_failure"
+        return "source_failure"
+
     return {
         "error_count": len(errors),
+        "errors_by_type": dict(Counter(kind(item) for item in errors)),
         "errors": [item[:_ERROR_PREVIEW_CHARS] for item in errors[:_ERROR_PREVIEW_COUNT]],
     }
 
@@ -235,6 +249,61 @@ def _pointer(parts: list[str]) -> str:
     return "/" + "/".join(p.replace("~", "~0").replace("/", "~1") for p in parts)
 
 
+def _json_values(text: str):
+    """Parse JSONC without YAML semantics, retaining original lexical offsets.
+
+    Mask comments and trailing commas with spaces, never delete bytes. JSON's
+    decoder validates the document and decodes each scalar at its source offset.
+    """
+    tokens = re.compile(r'"(?:\\.|[^"\\])*"|//[^\r\n]*|/\*.*?\*/', re.S)
+    clean = tokens.sub(
+        lambda m: m[0] if m[0].startswith('"') else re.sub(r"[^\r\n]", " ", m[0]), text
+    )
+    clean = re.sub(
+        r'"(?:\\.|[^"\\])*"|,(?=\s*[}\]])',
+        lambda m: " " if m[0] == "," else m[0],
+        clean,
+    )
+    json.loads(clean)
+    decoder = json.JSONDecoder()
+    position = 0
+
+    def whitespace():
+        nonlocal position
+        while position < len(clean) and clean[position].isspace():
+            position += 1
+
+    def walk(parts, key=""):
+        nonlocal position
+        whitespace()
+        start = position
+        if clean[position] in "{[":
+            mapping = clean[position] == "{"
+            closing = "}" if mapping else "]"
+            position += 1
+            whitespace()
+            index = 0
+            while clean[position] != closing:
+                name = str(index)
+                if mapping:
+                    name, position = decoder.raw_decode(clean, position)
+                    whitespace()
+                    position += 1  # colon, validated above
+                yield from walk([*parts, name], name if mapping else key)
+                whitespace()
+                if clean[position] == ",":
+                    position += 1
+                    whitespace()
+                index += 1
+            position += 1
+        else:
+            value, position = decoder.raw_decode(clean, position)
+            if isinstance(value, str):
+                yield key, value, start, position, parts
+
+    yield from walk([])
+
+
 def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) -> list[Candidate]:
     """Reason values with exact lexical quotes and JSON-pointer-style key paths.
 
@@ -274,9 +343,10 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
             )
         )
 
-    if suffix in {".json", ".yaml", ".yml"}:
-        if suffix == ".json":
-            json.loads(text)  # YAML's permissive parser must not accept invalid JSON.
+    if suffix == ".json":
+        for key, value, start, end, parts in _json_values(text):
+            add(key, value, start, end, parts)
+    elif suffix in {".yaml", ".yml"}:
         root = yaml.compose(text, Loader=_YAML_LOADER)
 
         def walk(node, parts: list[str], key: str = "", ancestors=frozenset()):
@@ -501,7 +571,12 @@ class GitReader:
         try:
             return self.git("show", f"{commit}:{path}")
         except RuntimeError:
-            return None
+            # Distinguish a legitimate deletion/rename boundary from a broken
+            # revision, corrupt object, permission failure or other git error.
+            self.git("rev-parse", "--verify", f"{commit}^{{commit}}")
+            if not self.git("ls-tree", "-z", commit, "--", path):
+                return None
+            raise
 
     def commits(
         self, commit: str, paths: list[str] | None = None, max_count: int = 200
@@ -699,6 +774,8 @@ class RepositoryHistoryImporter:
 
     def run(self, *, apply: bool = False) -> dict:
         started_run = time.monotonic()
+        self.stages = {kind: Counter() for kind in ("md", "code", "sql", "data", "template", "log")}
+        self.attempt_estimates: Counter[str] = Counter()
         policy = require_import(self.access)
         if not policy.admits_repository(self.repo):
             raise AccessDenied("the repository is not in the approved corpus manifest")
@@ -797,17 +874,34 @@ class RepositoryHistoryImporter:
             extractor_model=self.classifier.model,
         )
         done = set((run["checkpoint"] or {}).get("done") or [])
+        coverage_before = Counter(run["coverage"])
         errors: list[str] = []
         units = selected + [("log", "")]
         for group in self._prepared_groups(frozen, units, done, errors):
             prepared = [revision for _, _, revisions, _ in group for revision in revisions]
+            for kind, _, revisions, _ in group:
+                self.stages[kind]["grouped"] += sum(len(r[4]) for r in revisions)
             try:
                 classified, estimates = self._classify_prepared(prepared, apply=True)
             except (RuntimeError, ValueError) as exc:
                 _record_error(errors, f"classification group: {exc}")
                 continue
+            finally:
+                # Finished batches are cached even if a sibling batch failed.
+                # Report those successes and the unclassified remainder, rather
+                # than losing the entire failed group's nomination estimates.
+                for kind, _, revisions, _ in group:
+                    passages = [p for r in revisions for p in r[4]]
+                    outcomes = [self.classifier._cached(p.text) for p in passages]
+                    skipped_outcomes = sum(
+                        r is not None and r.get("outcome") == "skipped" for r in outcomes
+                    )
+                    ok = sum(r is not None for r in outcomes) - skipped_outcomes
+                    self.stages[kind]["classified_ok"] += ok
+                    self.stages[kind]["classified_skipped"] += skipped_outcomes
+                    self.stages[kind]["classified_failed"] += len(passages) - ok - skipped_outcomes
             offset = 0
-            for index, (kind, path, revisions, observations) in enumerate(group):
+            for kind, path, revisions, observations in group:
                 key = f"{kind}:{path}"
                 kept = classified[offset : offset + len(revisions)]
                 offset += len(revisions)
@@ -816,8 +910,6 @@ class RepositoryHistoryImporter:
                 try:
                     with self.runs.page(run, self.access) as counts:
                         counts.update(observations)
-                        if index == 0:
-                            counts.update(estimates)
                         for sha, old_path, text, commit, candidates in kept:
                             if kind == "log":
                                 self._log_record(run, commit, candidates, counts)
@@ -840,6 +932,9 @@ class RepositoryHistoryImporter:
                     run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
                     _record_error(errors, f"{key}: {exc}")
         with self.runs.page(run, self.access) as counts:
+            counts.update(self.attempt_estimates)
+            for kind, stages in self.stages.items():
+                counts.update({f"{kind}_passages_{stage}": n for stage, n in stages.items()})
             counts.update(Counter(getattr(self.classifier, "stats", {})) - stats_before)
             if not (run.get("checkpoint") or {}).get("skips_recorded"):
                 counts["excluded_scope"] += sum(skipped.values())
@@ -870,6 +965,30 @@ class RepositoryHistoryImporter:
             "status": final["status"],
             "commit": frozen,
             "coverage": final["coverage"],
+            "slice_coverage": {
+                key: value - (coverage_before[key] or 0)
+                for key, value in final["coverage"].items()
+                if isinstance(value, (int, float))
+            },
+            "per_source": {
+                kind: {
+                    **{
+                        stage: stages[stage]
+                        for stage in (
+                            "nominated",
+                            "grouped",
+                            "classified_ok",
+                            "classified_failed",
+                            "classified_skipped",
+                        )
+                    },
+                    "stored": final["coverage"].get(f"{kind}_stored_passages", 0)
+                    - coverage_before[f"{kind}_stored_passages"],
+                    "stored_evidence": final["coverage"].get(f"{kind}_stored_evidence", 0)
+                    - coverage_before[f"{kind}_stored_evidence"],
+                }
+                for kind, stages in self.stages.items()
+            },
             **_error_preview(errors),
         }
 
@@ -921,13 +1040,16 @@ class RepositoryHistoryImporter:
                 observations["excluded_scope"] += 1
                 continue
             if text is None:
-                raise RuntimeError("source revision unavailable")
+                observations["skipped_history_absent_path"] += 1
+                logger.info("path absent at that commit: %s:%s", sha, old_path)
+                continue
             reason = skip_reason(old_path, text) if kind != "log" else ""
             if reason:
                 observations[f"skipped_history_{reason}"] += 1
                 observations["excluded_scope"] += 1
                 continue
             passages = nominate(text) if kind == "log" else candidate_passages(text, old_path)
+            self.stages[kind]["nominated"] += len(passages)
             prepared.append((sha, old_path, text, commit, passages))
         return prepared, observations
 
@@ -953,6 +1075,8 @@ class RepositoryHistoryImporter:
                 for key in ("candidate_passages", "uncached_passages", "estimated_llm_calls")
             }
         )
+        if apply:
+            self.attempt_estimates.update(observations)
         extracted = self.classifier.classify(flat) if apply else []
         result = []
         for (sha, old_path, text, commit, _passages), base in zip(prepared, bases, strict=True):
@@ -1079,6 +1203,8 @@ class RepositoryHistoryImporter:
         counts["discovered"] += 1
         counts["fetched_versions"] += 1
         counts["stored_evidence" if created else "duplicate_evidence"] += 1
+        counts[f"{kind}_stored_evidence" if created else f"{kind}_duplicate_evidence"] += 1
+        counts[f"{kind}_stored_passages"] += len(candidates)
         counts[f"{kind}_versions"] += 1
         symbols = extract_symbols(text, language) if kind == "code" else []
         newlines = [m.start() for m in re.finditer("\n", text)]
@@ -1141,9 +1267,12 @@ class RepositoryHistoryImporter:
             repository=self.repo,
             commit_sha=commit["sha"],
         )
+        before = counts["stored_evidence"]
         self._record(
             run, rev, self._git_attrs(rev.evidence_id, commit), counts, candidates=candidates
         )
+        counts["log_stored_passages"] += len(candidates)
+        counts["log_stored_evidence"] += counts["stored_evidence"] - before
 
     def _record(
         self,

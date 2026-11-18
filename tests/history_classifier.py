@@ -9,6 +9,10 @@ class LegacyFixtureClassifier:
 
     def __init__(self, corpus_id):
         self.corpus_id = corpus_id
+        self.completed = set()
+
+    def _cached(self, text):
+        return {} if text in self.completed else None
 
     def estimate(self, passages, *, seen=None):
         return {
@@ -18,6 +22,7 @@ class LegacyFixtureClassifier:
         }
 
     def classify(self, passages: list[Passage]):
+        self.completed.update(p.text for p in passages)
         out = []
         for passage in passages:
             if passage.section.startswith("/"):

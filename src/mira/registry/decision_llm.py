@@ -231,21 +231,37 @@ class DecisionClassifier:
         return max(1, min(configured or 900, math.ceil(remaining))), 0
 
     async def _classify_batch(self, batch: list[Passage]) -> dict[str, dict]:
-        timeout, retries = self._deadline_timeout()
         by_id = {str(index): passage for index, passage in enumerate(batch)}
         prompt = json.dumps(
             {"passages": [{"id": ident, "text": p.text} for ident, p in by_id.items()]}
         )
-        provider = self._provider(timeout=timeout, retries=retries)
-        self.stats["llm_calls"] += 1
         try:
-            raw = await provider.complete(
-                [
-                    {"role": "system", "content": _SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                json_mode=True,
-            )
+            # Import retries must survive a short workstation outage, while
+            # checking the deadline before every sleep and every new attempt.
+            # Disable the provider's shorter retry loop to keep one budget.
+            for attempt in range(7):
+                timeout, _ = self._deadline_timeout()
+                provider = self._provider(timeout=timeout, retries=0)
+                self.stats["llm_calls"] += 1
+                try:
+                    raw = await provider.complete(
+                        [
+                            {"role": "system", "content": _SYSTEM},
+                            {"role": "user", "content": prompt},
+                        ],
+                        json_mode=True,
+                    )
+                    break
+                except Exception as exc:
+                    if getattr(exc, "code", "") != "router_acp_workstation_outage" or attempt == 6:
+                        raise
+                    delay = min(5 * 2**attempt, 30)
+                    if self.deadline is not None and time.monotonic() + delay >= self.deadline:
+                        raise RuntimeError(
+                            "classification time budget reached; resume reuses completed batches"
+                        ) from exc
+                    self.stats["router_outage_retries"] += 1
+                    await asyncio.sleep(delay)
         except Exception as exc:
             if getattr(exc, "code", "") == "router_acp_timeout" or isinstance(exc, TimeoutError):
                 self.stats["llm_timeouts"] += 1

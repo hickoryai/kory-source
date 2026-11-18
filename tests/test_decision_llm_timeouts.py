@@ -99,6 +99,84 @@ def passages(count: int) -> list[Passage]:
     return [Passage(0, 40, f"We use choice {number} because it fits.") for number in range(count)]
 
 
+def test_outage_retries_with_backoff_even_with_import_deadline(tmp_path, monkeypatch):
+    router = Router()
+    original = router.transport
+    attempts = 0
+    delays = []
+
+    async def transport(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 3:
+            raise RouterTransportError("connect refused", kind="workstation_outage")
+        return await original(request)
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    router.transport = transport
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    subject = classifier(tmp_path, router)
+    subject.deadline = time.monotonic() + 180
+    assert len(subject.classify(passages(1))) == 1
+    assert delays[:3] == [5, 10, 20]
+    assert attempts == 4
+    assert subject.stats["router_outage_retries"] == 3
+    assert subject.stats["llm_calls"] == 4
+    assert router.traces == 4
+
+
+def test_persistent_outage_exhausts_bounded_retry_budget(tmp_path, monkeypatch):
+    router = Router()
+    attempts = 0
+    delays = []
+
+    async def transport(request):
+        nonlocal attempts
+        attempts += 1
+        raise RouterTransportError("connect refused", kind="workstation_outage")
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    router.transport = transport
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    subject = classifier(tmp_path, router)
+    with pytest.raises(RuntimeError, match="Router workstation outage"):
+        subject.classify(passages(1))
+    assert attempts == 7
+    assert delays == [5, 10, 20, 30, 30, 30]
+    assert subject.stats["llm_calls"] == 7
+    assert subject.registry.db.execute(
+        "SELECT COUNT(*) FROM registry_decision_classifications"
+    ) == [(0,)]
+
+
+def test_outage_does_not_sleep_or_retry_past_deadline(tmp_path, monkeypatch):
+    router = Router()
+    attempts = 0
+
+    async def transport(request):
+        nonlocal attempts
+        attempts += 1
+        raise RouterTransportError("connect refused", kind="workstation_outage")
+
+    async def sleep(delay):
+        raise AssertionError("backoff would exceed deadline")
+
+    router.transport = transport
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    subject = classifier(tmp_path, router)
+    subject.deadline = time.monotonic() + 1
+    with pytest.raises(RuntimeError, match="classification time budget reached"):
+        subject.classify(passages(1))
+    assert attempts == 1
+    assert subject.registry.db.execute(
+        "SELECT COUNT(*) FROM registry_decision_classifications"
+    ) == [(0,)]
+
+
 def test_router_timeout_splits_parent_and_replays_completed_halves(tmp_path):
     router = Router(timeout_sizes={4})
     subject = classifier(tmp_path, router, batch_size=4, max_concurrency=2)
