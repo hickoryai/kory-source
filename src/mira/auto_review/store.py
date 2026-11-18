@@ -262,7 +262,7 @@ class AutoReviewStore:
 
         When the insert is new, other queued heads of this pull request are
         marked superseded, so one queued head waits. A running head is left
-        running and posts on its own sha. Posted heads stay.
+        running until it can carry its findings to the newest head. Posted heads stay.
         """
         request_id = "ar_" + uuid.uuid4().hex
         now = time.time()
@@ -434,13 +434,66 @@ class AutoReviewStore:
             )
             return cur.rowcount
 
+    def advance(self, request_id: str, head_sha: str) -> AutoReviewRequest | None:
+        """Atomically transfer the active lease to an already-enqueued newer head."""
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests WHERE id = ?", (request_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            old = AutoReviewRequest(*row)
+            if old.state != "running" or old.posted_review_id:
+                return None
+            cur.execute(
+                "UPDATE auto_review_requests SET state = 'running', lease_owner = ?, "
+                "lease_expires_at = ?, started_at = ?, updated_at = ? "
+                "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
+                "AND head_sha = ? AND state = 'queued'",
+                (
+                    old.lease_owner,
+                    old.lease_expires_at,
+                    now,
+                    now,
+                    old.platform,
+                    old.owner,
+                    old.repo,
+                    old.pr_number,
+                    head_sha,
+                ),
+            )
+            if cur.rowcount != 1:
+                return None
+            cur.execute(
+                "UPDATE auto_review_requests SET state = 'superseded', lease_owner = '', "
+                "lease_expires_at = 0, finished_at = ?, updated_at = ? WHERE id = ?",
+                (now, now, request_id),
+            )
+        return self.get_by_head(old.owner, old.repo, old.pr_number, head_sha, old.platform)
+
+    def cancel_post(self, request_id: str) -> None:
+        """Release the reservation when GitHub reports a newer head before writing."""
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE auto_review_requests SET posted_review_id = '' "
+                "WHERE id = ? AND state = 'running' AND posted_review_id = 'pending'",
+                (request_id,),
+            )
+
     def begin_post(self, request_id: str) -> bool:
         """True when this running head may post. A second caller loses."""
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
                 "UPDATE auto_review_requests SET posted_review_id = 'pending', updated_at = ? "
-                "WHERE id = ? AND state = 'running' AND posted_review_id = ''",
+                "WHERE id = ? AND state = 'running' AND posted_review_id = '' "
+                "AND NOT EXISTS (SELECT 1 FROM auto_review_requests AS newer "
+                "WHERE newer.platform = auto_review_requests.platform "
+                "AND newer.owner = auto_review_requests.owner "
+                "AND newer.repo = auto_review_requests.repo "
+                "AND newer.pr_number = auto_review_requests.pr_number AND newer.state = 'queued')",
                 (now, request_id),
             )
             return cur.rowcount == 1

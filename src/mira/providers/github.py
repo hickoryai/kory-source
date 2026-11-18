@@ -15,7 +15,7 @@ import httpx
 from github import Github, GithubException
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from mira.exceptions import ProviderError
+from mira.exceptions import ProviderError, StaleReviewError
 from mira.llm.model_name import append_model_footer
 from mira.models import (
     BotThreadRecord,
@@ -510,6 +510,7 @@ class GitHubProvider(BaseProvider):
         commit_sha: str | None = None,
         review_body: str | None = None,
         comment_prefix: str | None = None,
+        require_current_head: bool = False,
     ) -> list[int]:
         """Post one COMMENT review.
 
@@ -578,6 +579,11 @@ class GitHubProvider(BaseProvider):
                 getattr(latest_commit, "sha", None) or commit_sha or "latest",
             )
 
+            if require_current_head:
+                pr.update()
+                if pr.head.sha != commit_sha:
+                    raise StaleReviewError("Pull request head changed before review submission")
+
             # GitHub comment IDs aligned to result.comments (0 = unknown).
             ids = [0] * len(result.comments)
 
@@ -604,6 +610,10 @@ class GitHubProvider(BaseProvider):
                     logger.debug("Could not map review comment IDs", exc_info=True)
                 return ids
             except GithubException as exc:
+                if require_current_head and exc.status == 422:
+                    raise ProviderError(
+                        "Current-head review was rejected; no individual fallback"
+                    ) from exc
                 if exc.status != 422:
                     raise
                 logger.warning(

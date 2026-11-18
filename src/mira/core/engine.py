@@ -1069,6 +1069,8 @@ class ReviewEngine:
         *,
         team_conventions: str = "",
         extra_custom_rules: list[dict[str, str]] | None = None,
+        previous_result: ReviewResult | None = None,
+        full_diff_text: str = "",
     ) -> ReviewResult:
         """Review one frozen diff. Posts nothing and records no review history."""
         self._pr_info = pr_info
@@ -1078,6 +1080,8 @@ class ReviewEngine:
             pr_description=pr_info.description,
             team_conventions=team_conventions,
             extra_custom_rules=extra_custom_rules,
+            previous_result=previous_result,
+            full_diff_text=full_diff_text,
         )
 
     async def _review_diff_internal(
@@ -1091,6 +1095,8 @@ class ReviewEngine:
         resolved_threads: list[dict] | None = None,
         team_conventions: str = "",
         extra_custom_rules: list[dict[str, str]] | None = None,
+        previous_result: ReviewResult | None = None,
+        full_diff_text: str = "",
     ) -> ReviewResult:
         """Run the review and keep the seat-reported models that produced it."""
         from mira.llm.model_name import stop_model_watch, watch_actual_models
@@ -1108,10 +1114,14 @@ class ReviewEngine:
                 resolved_threads=resolved_threads,
                 team_conventions=team_conventions,
                 extra_custom_rules=extra_custom_rules,
+                previous_result=previous_result,
+                full_diff_text=full_diff_text,
             )
         finally:
             stop_model_watch(token)
-        result.actual_models = collected
+        result.actual_models = list(
+            dict.fromkeys((previous_result.actual_models if previous_result else []) + collected)
+        )
         return result
 
     async def _review_diff_pipeline(
@@ -1125,6 +1135,8 @@ class ReviewEngine:
         resolved_threads: list[dict] | None = None,
         team_conventions: str = "",
         extra_custom_rules: list[dict[str, str]] | None = None,
+        previous_result: ReviewResult | None = None,
+        full_diff_text: str = "",
     ) -> ReviewResult:
         """Core review pipeline.
 
@@ -1140,11 +1152,11 @@ class ReviewEngine:
         # Parse the full diff (not just the priority-selected subset) so the
         # walkthrough can surface skipped files to the user.
         patch = parse_diff(diff_text)
-        if not patch.files:
+        if not patch.files and previous_result is None:
             return ReviewResult(summary="No files to review.")
 
         filtered = filter_files(patch.files, self.config.filter)
-        if not filtered:
+        if not filtered and previous_result is None:
             return ReviewResult(
                 summary="All files were filtered out.",
                 skipped_reason="All files matched exclusion rules",
@@ -1157,7 +1169,7 @@ class ReviewEngine:
             max_per_file_size=self.config.review.max_file_size,
             only_paths=only_paths,
         )
-        if not selected:
+        if not selected and previous_result is None:
             return ReviewResult(
                 summary="No files were selected for review.",
                 skipped_reason="All files exceeded size limits or were deprioritized.",
@@ -1190,6 +1202,8 @@ class ReviewEngine:
         filtered = selected
 
         async def _generate_walkthrough() -> WalkthroughResult | None:
+            if not filtered:
+                return previous_result.walkthrough if previous_result else None
             if not self.config.review.walkthrough:
                 return None
             try:
@@ -1633,6 +1647,16 @@ class ReviewEngine:
         audit.append({"stage": "drafted", "chunk": "secrets", "count": len(secrets_comments)})
         all_comments.extend(secrets_comments)
 
+        if previous_result is not None:
+            all_comments = previous_result.comments + all_comments
+            all_key_issues = previous_result.key_issues + all_key_issues
+            current_paths = {f.path for f in parse_diff(full_diff_text).files}
+            selected_paths = sorted(
+                (set(previous_result.reviewed_paths) | set(selected_paths)) & current_paths
+            )
+            all_paths = sorted(current_paths)
+            skipped_paths_only = sorted(current_paths - set(selected_paths))
+
         all_comments = [classify_severity(c) for c in all_comments]
 
         final_comments = filter_noise(
@@ -1654,6 +1678,9 @@ class ReviewEngine:
                     len(before_drop) - len(final_comments),
                 )
 
+        if previous_result is not None:
+            final_comments.sort(key=lambda c: (-int(c.severity), c.path, c.line, c.title))
+
         # Self-critique catches confident-but-wrong claims that the noise
         # filter can't, since confidence scores are LLM-generated too. Pass
         # the team's documented preferences so the critic doesn't strip
@@ -1664,7 +1691,11 @@ class ReviewEngine:
             # covering a comment; with no hunk it reads as "unsupported" and
             # drops the finding. Add those manifests back as evidence only.
             _selected = {f.path for f in filtered}
-            critique_files = filtered + [f for f in manifest_candidates if f.path not in _selected]
+            critique_files = (
+                parse_diff(full_diff_text).files
+                if previous_result is not None
+                else filtered + [f for f in manifest_candidates if f.path not in _selected]
+            )
             try:
                 final_comments = await self_critique(
                     self.llm,
@@ -1732,7 +1763,7 @@ class ReviewEngine:
             key_issues=all_key_issues,
             summary=summary,
             pr_summary_block=pr_summary_block,
-            reviewed_files=len(filtered),
+            reviewed_files=len(selected_paths),
             token_usage=self.llm.usage,
             walkthrough=walkthrough,
             reviewed_paths=selected_paths,
