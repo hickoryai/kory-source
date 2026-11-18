@@ -431,16 +431,17 @@ async def _handle_thread_freeform_reply(
 
 
 def _auto_review_status(payload: dict[str, Any]) -> str | None:
-    """Queue one secondary review, or leave today's reviewer in place.
+    """Queue this head's reviews, or leave today's reviewer in place.
 
     ``None`` means the flag is off, so the caller keeps the existing path.
     While the flag is on, a delivery is queued or ignored and the unlabeled
     reviewer does not run. The flag is read before any head sha, so
     deliveries that omit ``head.sha`` stay valid while the path is off.
     Drafts are included. ``ready_for_review`` for a sha that is already
-    queued inserts nothing.
+    queued inserts nothing. A first head queues an opinion and a gate.
+    A head after a posted review queues a gate and a Grok-only opinion.
     """
-    from mira.auto_review.config import flag_on, ownership
+    from mira.auto_review.config import flag_on, jobs_for, ownership
 
     if not flag_on():
         return None
@@ -469,17 +470,23 @@ def _auto_review_status(payload: dict[str, Any]) -> str | None:
     from mira.auto_review.store import AutoReviewStore
 
     store = AutoReviewStore(_get_app_db())
-    _row, inserted = store.enqueue(
-        platform="github",
-        owner=owner,
-        repo=repo,
-        pr_number=number,
-        head_sha=head_sha,
-        base_sha=base_sha,
-        installation_id=installation_id,
-        title=str(pr.get("title") or ""),
-    )
-    if inserted:
+    prior = store.latest_posted_head("github", owner, repo, number)
+    inserted_any = False
+    for role, skill in jobs_for(prior is not None):
+        _row, inserted = store.enqueue(
+            platform="github",
+            owner=owner,
+            repo=repo,
+            pr_number=number,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            installation_id=installation_id,
+            title=str(pr.get("title") or ""),
+            role=role,
+            skill=skill,
+        )
+        inserted_any = inserted_any or inserted
+    if inserted_any:
         wake_executor()
         logger.info("auto review queued %s/%s#%s %s", owner, repo, number, head_sha)
     return "processing"

@@ -1,14 +1,16 @@
 """Durable secondary-review rows, kept apart from the public review-API tables.
 
 ``auto_review_requests`` is unique on ``(platform, owner, repo, pr_number,
-head_sha)``. A second delivery of the same head updates nothing.
+head_sha, role)``. One head can hold an opinion row and a gate row. A second
+delivery of the same head and role updates nothing.
 ``auto_review_work`` holds the seat body, including ``conversation_id`` and
 ``close``, so the public ``review_api_work`` schema stays unchanged.
 
 States: ``queued``, ``running``, ``superseded``, ``posted``, ``skipped``.
 A newer head does not cancel a review that is already running. That review
 finishes and posts on its own head. At most one newer head of the same pull
-request stays queued behind it, and a later push replaces that queued head.
+request and role stays queued behind it, and a later push replaces that
+queued head. The other role is left alone, so both roles of one head can run.
 A posted head is left on the commit it reviewed. A running head whose lease
 lapses, or whose process is shutting down, goes back to ``queued`` unless
 posting has started. After three interruptions the head is skipped instead,
@@ -61,7 +63,8 @@ CREATE TABLE IF NOT EXISTS auto_review_requests (
     finished_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     interrupt_count INTEGER NOT NULL DEFAULT 0,
     role TEXT NOT NULL DEFAULT 'opinion',
-    UNIQUE (platform, owner, repo, pr_number, head_sha)
+    skill TEXT NOT NULL DEFAULT '',
+    UNIQUE (platform, owner, repo, pr_number, head_sha, role)
 );
 CREATE INDEX IF NOT EXISTS auto_review_requests_state_idx
     ON auto_review_requests (state, created_at);
@@ -89,8 +92,9 @@ CREATE INDEX IF NOT EXISTS auto_review_work_request_idx
 _REQUEST_COLUMNS = (
     "id, platform, owner, repo, pr_number, head_sha, base_sha, title, installation_id, "
     "state, posted_review_id, error_code, error_message, lease_owner, lease_expires_at, "
-    "created_at, updated_at, started_at, finished_at, interrupt_count, role"
+    "created_at, updated_at, started_at, finished_at, interrupt_count, role, skill"
 )
+_REQUEST_COLUMN_NAMES = tuple(part.strip() for part in _REQUEST_COLUMNS.split(","))
 
 _WORK_COLUMNS = (
     "id, request_id, state, prompt, model, timeout_seconds, conversation_id, close, "
@@ -123,6 +127,7 @@ class AutoReviewRequest:
     finished_at: float
     interrupt_count: int
     role: str
+    skill: str
 
 
 @dataclass
@@ -201,6 +206,8 @@ class AutoReviewStore:
                     cur.execute(statement)
             self._ensure_interrupt_count(cur)
             self._ensure_role(cur)
+            self._ensure_skill(cur)
+            self._ensure_head_role_unique(cur)
 
     @contextmanager
     def _cursor(self) -> Iterator[Any]:
@@ -241,13 +248,50 @@ class AutoReviewStore:
         )
 
     def get_by_head(
-        self, owner: str, repo: str, pr_number: int, head_sha: str, platform: str = "github"
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        head_sha: str,
+        platform: str = "github",
+        role: str | None = None,
     ) -> AutoReviewRequest | None:
-        return self._one(
-            f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests WHERE platform = ? "
-            "AND owner = ? AND repo = ? AND pr_number = ? AND head_sha = ?",
-            (platform, owner, repo, pr_number, head_sha),
+        sql = (
+            f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests WHERE platform = ? "  # noqa: S608
+            "AND owner = ? AND repo = ? AND pr_number = ? AND head_sha = ?"
         )
+        params: tuple[Any, ...] = (platform, owner, repo, pr_number, head_sha)
+        if role is not None:
+            sql += " AND role = ?"
+            params = (*params, role)
+        return self._one(sql + " ORDER BY role, id LIMIT 1", params)
+
+    def list_for_head(
+        self, owner: str, repo: str, pr_number: int, head_sha: str, platform: str = "github"
+    ) -> list[AutoReviewRequest]:
+        with self._cursor() as cur:
+            cur.execute(
+                f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests WHERE platform = ? "  # noqa: S608
+                "AND owner = ? AND repo = ? AND pr_number = ? AND head_sha = ? "
+                "ORDER BY role, id",
+                (platform, owner, repo, pr_number, head_sha),
+            )
+            rows = cur.fetchall()
+        return [AutoReviewRequest(*row) for row in rows]
+
+    def latest_posted_head(
+        self, platform: str, owner: str, repo: str, pr_number: int
+    ) -> str | None:
+        """Newest head this pull request has already posted, or none."""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT head_sha FROM auto_review_requests "  # noqa: S608
+                "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
+                "AND state = 'posted' ORDER BY finished_at DESC, id DESC LIMIT 1",
+                (platform, owner, repo, pr_number),
+            )
+            row = cur.fetchone()
+        return str(row[0]) if row else None
 
     def enqueue(
         self,
@@ -260,21 +304,23 @@ class AutoReviewStore:
         base_sha: str,
         installation_id: int,
         title: str = "",
+        role: str = "opinion",
+        skill: str = "",
     ) -> tuple[AutoReviewRequest, bool]:
-        """Insert one row per head. A duplicate delivery returns the existing row.
+        """Insert one row per head and role. A duplicate delivery returns that row.
 
-        When the insert is new, other queued heads of this pull request are
-        marked superseded, so one queued head waits. A running head is left
-        running until it can carry its findings to the newest head. Posted heads stay.
+        When the insert is new, other queued heads of this pull request and
+        role are marked superseded. A running head of that role is left
+        running. The other role is not superseded. Posted heads stay.
         """
         request_id = "ar_" + uuid.uuid4().hex
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
-                "INSERT INTO auto_review_requests (id, platform, owner, repo, pr_number, "
-                "head_sha, base_sha, title, installation_id, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?) "
-                "ON CONFLICT (platform, owner, repo, pr_number, head_sha) DO NOTHING",
+                "INSERT INTO auto_review_requests (id, platform, owner, repo, pr_number, "  # noqa: S608
+                "head_sha, base_sha, title, installation_id, state, created_at, updated_at, "
+                "role, skill) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?) "
+                "ON CONFLICT (platform, owner, repo, pr_number, head_sha, role) DO NOTHING",
                 (
                     request_id,
                     platform,
@@ -287,17 +333,20 @@ class AutoReviewStore:
                     installation_id,
                     now,
                     now,
+                    role,
+                    skill,
                 ),
             )
             inserted = cur.rowcount == 1
             if inserted:
                 cur.execute(
-                    "UPDATE auto_review_requests SET state = 'superseded', lease_owner = '', "
+                    "UPDATE auto_review_requests SET state = 'superseded', lease_owner = '', "  # noqa: S608
                     "lease_expires_at = 0, updated_at = ? WHERE platform = ? AND owner = ? "
-                    "AND repo = ? AND pr_number = ? AND head_sha != ? AND state = 'queued'",
-                    (now, platform, owner, repo, pr_number, head_sha),
+                    "AND repo = ? AND pr_number = ? AND role = ? AND head_sha != ? "
+                    "AND state = 'queued'",
+                    (now, platform, owner, repo, pr_number, role, head_sha),
                 )
-        row = self.get_by_head(owner, repo, pr_number, head_sha, platform)
+        row = self.get_by_head(owner, repo, pr_number, head_sha, platform, role=role)
         if row is None:
             raise RuntimeError(f"auto review row missing after enqueue {owner}/{repo}#{pr_number}")
         return row, inserted
@@ -308,18 +357,21 @@ class AutoReviewStore:
         """Move the newest queued head to running within the executor limit.
 
         Older heads stay queued. A queued head whose pull request already has
-        a running review stays queued until that review leaves ``running``.
+        a running review of the same role stays queued until that review
+        leaves ``running``. The other role can run at the same time.
         ``deadline_seconds`` is the caller's budget. A negative budget claims
         nothing. The executor enforces the real deadline with ``wait_for``.
         """
         if deadline_seconds < 0 or max_running < 1:
             return None
         candidate = self._one(
-            f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests AS queued "
+            f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests AS queued "  # noqa: S608
             "WHERE queued.state = 'queued' AND NOT EXISTS ("
-            "SELECT 1 FROM auto_review_requests AS running WHERE running.state = 'running' "
+            "SELECT 1 FROM auto_review_requests AS running "  # noqa: S608
+            "WHERE running.state = 'running' "
             "AND running.platform = queued.platform AND running.owner = queued.owner "
-            "AND running.repo = queued.repo AND running.pr_number = queued.pr_number) "
+            "AND running.repo = queued.repo AND running.pr_number = queued.pr_number "
+            "AND running.role = queued.role) "
             "ORDER BY queued.created_at DESC, queued.id DESC LIMIT 1"
         )
         if candidate is None:
@@ -368,7 +420,7 @@ class AutoReviewStore:
     def _ensure_role(self, cur: Any) -> None:
         """Add the review role on a database created before it existed.
 
-        The default is opinion. One row per head stays the unique key.
+        The default is opinion. The unique key includes the role.
         """
         column = "role TEXT NOT NULL DEFAULT 'opinion'"
         if self._db._backend == "sqlite":
@@ -382,6 +434,102 @@ class AutoReviewStore:
             return
         cur.execute(
             "ALTER TABLE auto_review_requests ADD COLUMN IF NOT EXISTS " + column  # noqa: S608
+        )
+
+    def _ensure_skill(self, cur: Any) -> None:
+        """Add the router skill on a database created before it existed."""
+        column = "skill TEXT NOT NULL DEFAULT ''"
+        if self._db._backend == "sqlite":
+            cur.execute("PRAGMA table_info(auto_review_requests)")
+            names = {row[1] for row in cur.fetchall()}
+            if "skill" in names:
+                return
+            cur.execute(
+                "ALTER TABLE auto_review_requests ADD COLUMN " + column  # noqa: S608
+            )
+            return
+        cur.execute(
+            "ALTER TABLE auto_review_requests ADD COLUMN IF NOT EXISTS " + column  # noqa: S608
+        )
+
+    def _ensure_head_role_unique(self, cur: Any) -> None:
+        """Let one head store both roles.
+
+        A database created before the role was part of the key still has a
+        unique constraint on the head alone. New installs already have the
+        five-column key from ``SCHEMA``.
+        """
+        if self._db._backend == "sqlite":
+            cur.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "  # noqa: S608
+                "AND name = 'auto_review_requests'"
+            )
+            row = cur.fetchone()
+            sql = " ".join((row[0] or "").split()) if row else ""
+            if "head_sha, role)" in sql:
+                return
+            self._rebuild_sqlite_requests(cur)
+            return
+        cur.execute(
+            "SELECT con.conname, pg_get_constraintdef(con.oid) "  # noqa: S608
+            "FROM pg_constraint con "
+            "JOIN pg_class rel ON rel.oid = con.conrelid "
+            "WHERE rel.relname = 'auto_review_requests' AND con.contype = 'u'"
+        )
+        has_role_key = False
+        drop_names: list[str] = []
+        for name, definition in cur.fetchall():
+            text = str(definition).lower()
+            if "head_sha" in text and "role" in text:
+                has_role_key = True
+            elif "head_sha" in text:
+                drop_names.append(str(name))
+        for name in drop_names:
+            if not name.replace("_", "").isalnum():
+                continue
+            cur.execute(
+                'ALTER TABLE auto_review_requests DROP CONSTRAINT "' + name + '"'  # noqa: S608
+            )
+        if not has_role_key:
+            cur.execute(
+                "ALTER TABLE auto_review_requests "  # noqa: S608
+                "ADD CONSTRAINT auto_review_head_role_key "
+                "UNIQUE (platform, owner, repo, pr_number, head_sha, role)"
+            )
+
+    def _rebuild_sqlite_requests(self, cur: Any) -> None:
+        """Copy request rows onto a table whose unique key includes role."""
+        cur.execute(
+            "ALTER TABLE auto_review_requests RENAME TO auto_review_requests_old"  # noqa: S608
+        )
+        cur.execute(
+            "CREATE TABLE auto_review_requests ("  # noqa: S608
+            "id TEXT PRIMARY KEY, platform TEXT NOT NULL, owner TEXT NOT NULL, "
+            "repo TEXT NOT NULL, pr_number INTEGER NOT NULL, head_sha TEXT NOT NULL, "
+            "base_sha TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', "
+            "installation_id INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, "
+            "posted_review_id TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '', "
+            "error_message TEXT NOT NULL DEFAULT '', lease_owner TEXT NOT NULL DEFAULT '', "
+            "lease_expires_at DOUBLE PRECISION NOT NULL DEFAULT 0, "
+            "created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL, "
+            "started_at DOUBLE PRECISION NOT NULL DEFAULT 0, "
+            "finished_at DOUBLE PRECISION NOT NULL DEFAULT 0, "
+            "interrupt_count INTEGER NOT NULL DEFAULT 0, "
+            "role TEXT NOT NULL DEFAULT 'opinion', skill TEXT NOT NULL DEFAULT '', "
+            "UNIQUE (platform, owner, repo, pr_number, head_sha, role))"
+        )
+        cur.execute("PRAGMA table_info(auto_review_requests_old)")
+        old_names = {row[1] for row in cur.fetchall()}
+        shared = [name for name in _REQUEST_COLUMN_NAMES if name in old_names]
+        cols = ", ".join(shared)
+        cur.execute(
+            f"INSERT INTO auto_review_requests ({cols}) "  # noqa: S608
+            f"SELECT {cols} FROM auto_review_requests_old"  # noqa: S608
+        )
+        cur.execute("DROP TABLE auto_review_requests_old")  # noqa: S608
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS auto_review_requests_state_idx "  # noqa: S608
+            "ON auto_review_requests (state, created_at)"
         )
 
     def _skip_interrupted(self, cur: Any, extra_where: str, params: tuple, now: float) -> int:
@@ -470,16 +618,18 @@ class AutoReviewStore:
             if old.state != "running" or old.posted_review_id:
                 return None
             cur.execute(
-                "UPDATE auto_review_requests SET state = 'running', lease_owner = ?, "
+                "UPDATE auto_review_requests SET state = 'running', lease_owner = ?, "  # noqa: S608
                 "lease_expires_at = ?, started_at = ?, updated_at = ? "
                 "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
-                "AND head_sha = ? AND state IN ('queued', 'superseded') "
+                "AND head_sha = ? AND role = ? AND state IN ('queued', 'superseded') "
                 "AND NOT EXISTS (SELECT 1 FROM auto_review_requests AS waiting "
                 "WHERE waiting.platform = auto_review_requests.platform "
                 "AND waiting.owner = auto_review_requests.owner "
                 "AND waiting.repo = auto_review_requests.repo "
                 "AND waiting.pr_number = auto_review_requests.pr_number "
-                "AND waiting.head_sha != auto_review_requests.head_sha AND waiting.state = 'queued')",
+                "AND waiting.role = auto_review_requests.role "
+                "AND waiting.head_sha != auto_review_requests.head_sha "
+                "AND waiting.state = 'queued')",
                 (
                     old.lease_owner,
                     old.lease_expires_at,
@@ -490,6 +640,7 @@ class AutoReviewStore:
                     old.repo,
                     old.pr_number,
                     head_sha,
+                    old.role,
                 ),
             )
             if cur.rowcount != 1:
@@ -499,18 +650,29 @@ class AutoReviewStore:
                 "lease_expires_at = 0, finished_at = ?, updated_at = ? WHERE id = ?",
                 (now, now, request_id),
             )
-        return self.get_by_head(old.owner, old.repo, old.pr_number, head_sha, old.platform)
+        return self.get_by_head(
+            old.owner, old.repo, old.pr_number, head_sha, old.platform, role=old.role
+        )
 
     def supersede_queued_except(self, req: AutoReviewRequest, live_head_sha: str) -> None:
         """Discard delayed webhook heads after a live GitHub head check."""
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
-                "UPDATE auto_review_requests SET state = 'superseded', lease_owner = '', "
+                "UPDATE auto_review_requests SET state = 'superseded', lease_owner = '', "  # noqa: S608
                 "lease_expires_at = 0, finished_at = ?, updated_at = ? "
                 "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
-                "AND state = 'queued' AND head_sha != ?",
-                (now, now, req.platform, req.owner, req.repo, req.pr_number, live_head_sha),
+                "AND role = ? AND state = 'queued' AND head_sha != ?",
+                (
+                    now,
+                    now,
+                    req.platform,
+                    req.owner,
+                    req.repo,
+                    req.pr_number,
+                    req.role,
+                    live_head_sha,
+                ),
             )
 
     def cancel_post(self, request_id: str) -> None:
@@ -527,13 +689,14 @@ class AutoReviewStore:
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
-                "UPDATE auto_review_requests SET posted_review_id = 'pending', updated_at = ? "
+                "UPDATE auto_review_requests SET posted_review_id = 'pending', updated_at = ? "  # noqa: S608
                 "WHERE id = ? AND state = 'running' AND posted_review_id = '' "
                 "AND NOT EXISTS (SELECT 1 FROM auto_review_requests AS newer "
                 "WHERE newer.platform = auto_review_requests.platform "
                 "AND newer.owner = auto_review_requests.owner "
                 "AND newer.repo = auto_review_requests.repo "
-                "AND newer.pr_number = auto_review_requests.pr_number AND newer.state = 'queued')",
+                "AND newer.pr_number = auto_review_requests.pr_number "
+                "AND newer.role = auto_review_requests.role AND newer.state = 'queued')",
                 (now, request_id),
             )
             return cur.rowcount == 1

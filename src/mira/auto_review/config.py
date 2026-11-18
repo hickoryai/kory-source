@@ -26,6 +26,10 @@ GENERIC_WORKER_HOST = "the workstation with the logged-in router account pool"
 # The request stays unpinned. The router selects the seat from the skill line.
 DEFAULT_ROLE = "opinion"
 ROLE_SKILL = {"opinion": "review-opinion", "gate": "review-gate"}
+# Later-version extra opinion. Candidates are Grok only, so a full gate is
+# not duplicated when Grok has no capacity.
+GROK_ONLY_SKILL = "review-grok"
+ALLOWED_SKILLS = frozenset({*ROLE_SKILL.values(), GROK_ONLY_SKILL})
 CALL_TIMEOUT_SECONDS = 1800
 REVIEW_EVENT = "COMMENT"
 SECONDARY_LABEL = "Kory Source (secondary reviewer)"
@@ -154,12 +158,27 @@ def ownership(db: Any, owner: str, repo: str, installation_id: int) -> str | Non
     return "enqueue"
 
 
-def skill_line(role: str) -> str:
-    """One stripped router directive for this role. The model does not see it."""
-    skill = ROLE_SKILL.get(role)
-    if skill is None:
+def jobs_for(has_posted: bool) -> list[tuple[str, str]]:
+    """Role and router skill for each review of one head.
+
+    The first reviewed head gets a full opinion that prefers Grok and a full
+    gate that prefers Opus or Sol. A later head reviews the new changes: the
+    gate prefers Opus or Sol, and the extra opinion runs only on Grok.
+    """
+    if has_posted:
+        return [("gate", "review-gate"), ("opinion", GROK_ONLY_SKILL)]
+    return [("opinion", "review-opinion"), ("gate", "review-gate")]
+
+
+def skill_line(role: str, skill: str = "") -> str:
+    """One stripped router directive. The model does not see it.
+
+    An allowed skill wins. Otherwise the role's default skill is used.
+    """
+    chosen = skill if skill in ALLOWED_SKILLS else ROLE_SKILL.get(role)
+    if chosen not in ALLOWED_SKILLS:
         raise ValueError(f"unknown review role {role!r}")
-    return f"[router: skill={skill}]"
+    return f"[router: skill={chosen}]"
 
 
 def review_preamble(head_sha: str, role: str = DEFAULT_ROLE) -> str:

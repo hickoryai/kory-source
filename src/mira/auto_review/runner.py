@@ -189,11 +189,12 @@ async def execute_request(
         req.id,
         max(0, time.time() - req.created_at),
     )
-    from mira.auto_review.config import DEFAULT_ROLE, ROLE_SKILL, skill_line
+    from mira.auto_review.config import ALLOWED_SKILLS, DEFAULT_ROLE, ROLE_SKILL, skill_line
     from mira.llm.router_acp import review_skill_line
 
     role = req.role if req.role in ROLE_SKILL else DEFAULT_ROLE
-    skill_token = review_skill_line.set(skill_line(role))
+    named = req.skill if req.skill in ALLOWED_SKILLS else ""
+    skill_token = review_skill_line.set(skill_line(role, named))
     try:
         reader = await reader_factory(req.owner, req.repo, req.installation_id)
         fetch_started = time.monotonic()
@@ -209,6 +210,13 @@ async def execute_request(
         result = None
         carried = None
         diff_text = snapshot.diff_text
+        prior = store.latest_posted_head(req.platform, req.owner, req.repo, req.pr_number)
+        if prior and prior != snapshot.meta.head_sha:
+            try:
+                delta = await reader.incremental(snapshot.meta, prior)
+                diff_text = delta.diff_text
+            except SnapshotError as exc:
+                logger.info("auto review full fallback request=%s reason=%s", req.id, exc.code)
         while True:
             provider = ReadOnlySnapshotProvider(reader, snapshot)
             engine = engine_factory(provider, seat_transport(store, req.id))
@@ -267,6 +275,8 @@ async def execute_request(
                         base_sha=meta.base_sha,
                         installation_id=req.installation_id,
                         title=meta.title,
+                        role=role,
+                        skill=named,
                     )
                     carried = None
                     diff_text = latest.diff_text
