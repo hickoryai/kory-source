@@ -20,7 +20,7 @@ from tests import registry_policy as rp
 
 
 @pytest.fixture(params=["sqlite", "postgres"])
-def queue(tmp_path, monkeypatch, request):
+def queue(tmp_path_factory, monkeypatch, request):
     with rp.policy():
         monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
         url = (
@@ -28,7 +28,12 @@ def queue(tmp_path, monkeypatch, request):
         )
         if request.param == "postgres" and not url:
             pytest.skip("REGISTRY_TEST_POSTGRES_URL not set")
-        registry = Registry(RegistryDB(url=url or None, path=str(tmp_path / "registry.db")))
+        # Share SQLite too, so local tests exercise the same isolation contract as CI.
+        registry = Registry(
+            RegistryDB(
+                url=url or None, path=str(tmp_path_factory.getbasetemp() / "import-work-shared.db")
+            )
+        )
         run = ImportRuns(registry).start(
             rp.operator(),
             source_system="git",
@@ -46,8 +51,18 @@ def queue(tmp_path, monkeypatch, request):
             "UPDATE registry_import_runs SET stream = ? WHERE run_id = ?",
             ("repository:" + repo, run["run_id"]),
         )
-        yield ImportWorkStore(registry), run
-        registry.db.close()
+        try:
+            yield ImportWorkStore(registry), run
+        finally:
+            # Postgres cases share a disposable database. A revoked-admission
+            # test deliberately leaves a lease, which must not block later cases.
+            registry.db.execute(
+                "DELETE FROM registry_import_work WHERE run_id = ?", (run["run_id"],)
+            )
+            registry.db.execute(
+                "DELETE FROM registry_import_runs WHERE run_id = ?", (run["run_id"],)
+            )
+            registry.db.close()
 
 
 def enqueue(queue, **body):
