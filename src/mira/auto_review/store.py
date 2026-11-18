@@ -451,7 +451,13 @@ class AutoReviewStore:
                 "UPDATE auto_review_requests SET state = 'running', lease_owner = ?, "
                 "lease_expires_at = ?, started_at = ?, updated_at = ? "
                 "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
-                "AND head_sha = ? AND state = 'queued'",
+                "AND head_sha = ? AND state IN ('queued', 'superseded') "
+                "AND NOT EXISTS (SELECT 1 FROM auto_review_requests AS waiting "
+                "WHERE waiting.platform = auto_review_requests.platform "
+                "AND waiting.owner = auto_review_requests.owner "
+                "AND waiting.repo = auto_review_requests.repo "
+                "AND waiting.pr_number = auto_review_requests.pr_number "
+                "AND waiting.head_sha != auto_review_requests.head_sha AND waiting.state = 'queued')",
                 (
                     old.lease_owner,
                     old.lease_expires_at,
@@ -472,6 +478,18 @@ class AutoReviewStore:
                 (now, now, request_id),
             )
         return self.get_by_head(old.owner, old.repo, old.pr_number, head_sha, old.platform)
+
+    def supersede_queued_except(self, req: AutoReviewRequest, live_head_sha: str) -> None:
+        """Discard delayed webhook heads after a live GitHub head check."""
+        now = time.time()
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE auto_review_requests SET state = 'superseded', lease_owner = '', "
+                "lease_expires_at = 0, finished_at = ?, updated_at = ? "
+                "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
+                "AND state = 'queued' AND head_sha != ?",
+                (now, now, req.platform, req.owner, req.repo, req.pr_number, live_head_sha),
+            )
 
     def cancel_post(self, request_id: str) -> None:
         """Release the reservation when GitHub reports a newer head before writing."""

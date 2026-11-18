@@ -437,3 +437,137 @@ async def test_cancellation_requeues_the_latest_active_head(store):
         )
     assert store.get(job.id).state == "superseded"
     assert store.get_by_head("example", "project", 1, HEADS[1]).state == "queued"
+
+
+@pytest.mark.parametrize(
+    "cause", ["stale_queue", "pending", "missing", "attempt_bound", "time_bound"]
+)
+async def test_refused_post_terminates_without_duplicate_delivery(store, monkeypatch, cause):
+    import asyncio
+    import time
+
+    import mira.auto_review.runner as runner
+
+    monkeypatch.setattr(runner, "POST_RETRY_MAX_ATTEMPTS", 3, raising=False)
+    monkeypatch.setattr(runner, "POST_RETRY_BACKOFF_SECONDS", 0.001, raising=False)
+    monkeypatch.setattr(runner, "POST_RETRY_TIMEOUT_SECONDS", 1, raising=False)
+    delays = []
+    real_sleep = asyncio.sleep
+
+    async def backoff(delay):
+        delays.append(delay)
+        await real_sleep(delay)
+
+    monkeypatch.setattr(runner.asyncio, "sleep", backoff)
+    clock = [time.monotonic()]
+    if cause == "time_bound":
+        monkeypatch.setattr(
+            runner, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0])
+        )
+    enqueue(store, HEADS[1])
+    job = store.claim_next("worker", lease_seconds=60, deadline_seconds=60)
+    older = enqueue(store, HEADS[0]) if cause == "stale_queue" else None
+    if cause == "pending":
+        assert store.begin_post(job.id)
+    reader = SimpleNamespace(get_pull=AsyncMock(return_value=frozen(HEADS[1]).meta))
+    posts = []
+
+    async def write(*args, **kwargs):
+        posts.append(kwargs["commit_sha"])
+        return []
+
+    writer = SimpleNamespace(post_review=write, last_review_id=31)
+
+    async def post(db, request_id, pr, result, head):
+        if cause == "attempt_bound":
+            return None
+        if cause == "time_bound":
+            clock[0] += 2
+            return None
+        if cause == "missing":
+            with db._cursor() as cur:
+                cur.execute("DELETE FROM auto_review_requests WHERE id = ?", (request_id,))
+            return None
+        return await post_if_current(db, request_id, writer, pr, result, head)
+
+    monkeypatch.setattr(runner, "capture", AsyncMock(return_value=frozen(HEADS[1])))
+    await asyncio.wait_for(
+        execute_request(
+            store,
+            job,
+            AsyncMock(return_value=reader),
+            engine_factory=lambda *_: SimpleNamespace(
+                review_snapshot=AsyncMock(return_value=ReviewResult(summary="ready")),
+                llm=SimpleNamespace(close_conversations=AsyncMock()),
+            ),
+            poster=post,
+        ),
+        timeout=1,
+    )
+    assert reader.get_pull.await_count <= 3
+    assert len(posts) <= 1
+    assert all(head == HEADS[1] for head in posts)
+    final = store.get(job.id)
+    if cause == "stale_queue":
+        assert posts == [HEADS[1]]
+        assert store.get(older.id).state == "superseded"
+        assert final.state == "posted"
+    elif cause == "pending":
+        assert final.state == "skipped"
+        assert final.error_code == "post_reservation_unknown"
+        assert final.posted_review_id == ""
+        assert posts == []
+    elif cause == "missing":
+        assert final is None
+        assert delays == []
+        assert reader.get_pull.await_count == 1
+    else:
+        assert final.state == "skipped"
+        assert final.error_code == "post_retry_exhausted"
+        assert "posting" in final.error_message.lower()
+        assert reader.get_pull.await_count == (3 if cause == "attempt_bound" else 1)
+        assert delays == ([0.001, 0.002] if cause == "attempt_bound" else [])
+
+
+async def test_lagging_head_read_can_adopt_a_discarded_queue_row(store, monkeypatch):
+    import mira.auto_review.runner as runner
+
+    monkeypatch.setattr(runner, "POST_RETRY_BACKOFF_SECONDS", 0.001)
+    enqueue(store, HEADS[0])
+    job = store.claim_next("worker", lease_seconds=60, deadline_seconds=60)
+    newer = enqueue(store, HEADS[1])
+    # The first API read lags the push; the final provider check sees it.
+    heads = iter([HEADS[0], HEADS[1], HEADS[1]])
+    reader = SimpleNamespace(
+        get_pull=AsyncMock(side_effect=lambda n: frozen(next(heads)).meta),
+        freeze=AsyncMock(side_effect=lambda meta: frozen(meta.head_sha)),
+        incremental=AsyncMock(return_value=replace(frozen(HEADS[1]), diff_text=DELTA)),
+    )
+    monkeypatch.setattr(runner, "capture", AsyncMock(return_value=frozen(HEADS[0])))
+    posts = []
+
+    async def write(*args, **kwargs):
+        if kwargs["commit_sha"] == HEADS[0]:
+            assert store.get(newer.id).state == "superseded"
+            raise StaleReviewError("head advanced")
+        posts.append(kwargs["commit_sha"])
+        return []
+
+    writer = SimpleNamespace(post_review=write, last_review_id=33)
+
+    async def post(db, request_id, pr, result, head):
+        return await post_if_current(db, request_id, writer, pr, result, head)
+
+    await execute_request(
+        store,
+        job,
+        AsyncMock(return_value=reader),
+        engine_factory=lambda *_: SimpleNamespace(
+            review_snapshot=AsyncMock(return_value=ReviewResult(summary="ready")),
+            llm=SimpleNamespace(close_conversations=AsyncMock()),
+        ),
+        poster=post,
+    )
+    assert reader.get_pull.await_count == 3
+    assert posts == [HEADS[1]]
+    assert store.get(newer.id).state == "posted"

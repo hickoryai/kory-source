@@ -44,6 +44,9 @@ LEASE_SECONDS = 120.0
 ROLLOUT_GRACE_SECONDS = 60.0
 DEADLINE_SECONDS = 3 * 60 * 60
 POLL_SECONDS = 2.0
+POST_RETRY_MAX_ATTEMPTS = 5
+POST_RETRY_TIMEOUT_SECONDS = 60.0
+POST_RETRY_BACKOFF_SECONDS = 2.0
 
 ReaderFactory = Callable[[str, str, int], Awaitable[SnapshotReader]]
 _executor: AutoReviewExecutor | None = None
@@ -220,10 +223,30 @@ async def execute_request(
             # Close before checking the head: cleanup can itself take a seat call.
             await _close_seats(engine)
             engine = None
-            while True:
+            posting_deadline = time.monotonic() + POST_RETRY_TIMEOUT_SECONDS
+            advanced = False
+            for attempt in range(POST_RETRY_MAX_ATTEMPTS):
                 fresh = store.get(req.id)
                 if fresh is None or fresh.state != "running":
                     return
+                if fresh.posted_review_id == "pending":
+                    # The previous write may have reached GitHub before its
+                    # process died. Clear the reservation without resubmitting.
+                    store.mark_skipped(
+                        req.id,
+                        "post_reservation_unknown",
+                        "Posting reservation has no recorded outcome; not resubmitting an uncertain write",
+                    )
+                    return
+                if attempt:
+                    remaining = posting_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(
+                        min(POST_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1), remaining)
+                    )
+                if time.monotonic() >= posting_deadline:
+                    break
                 if paused(store._db):
                     store.mark_skipped(req.id, "paused", "auto review was paused before posting")
                     return
@@ -270,7 +293,9 @@ async def execute_request(
                     if on_request_changed is not None:
                         on_request_changed(req)
                     snapshot = latest
+                    advanced = True
                     break
+                store.supersede_queued_except(fresh, meta.head_sha)
                 if poster is None:
                     posted = await post_if_current(
                         store,
@@ -290,9 +315,16 @@ async def execute_request(
                     )
                 if posted is not None:
                     return
-                # A push may have arrived during posting preparation. Re-read
-                # the head and keep the already-reviewed findings for its delta.
-                await asyncio.sleep(0)
+                # Re-read after backoff if a push raced posting preparation.
+                # The attempt and wall-clock budgets also cover failed adoption.
+            if not advanced:
+                store.mark_skipped(
+                    req.id,
+                    "post_retry_exhausted",
+                    f"Posting or head adoption refused within {POST_RETRY_MAX_ATTEMPTS} attempts "
+                    f"or {POST_RETRY_TIMEOUT_SECONDS:g}s budget",
+                )
+                return
     except asyncio.CancelledError:
         store.requeue_unposted(req.id)
         raise
