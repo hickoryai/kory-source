@@ -308,6 +308,13 @@ class Registry:
             restored_at=obj["restored_at"],
             now=now,
         )
+        if obj.get("source_system") == "mira_learned_rule":
+            rows = self.db.execute(
+                "SELECT weight FROM registry_learned_rule_weights WHERE object_id = ?",
+                (obj["id"],),
+            )
+            if rows:
+                obj["confidence"] = round(obj["confidence"] * float(rows[0][0]), 4)
         values = [obj[c] for c in COLUMNS]
         values[COLUMNS.index("alternatives")] = (
             json.dumps(obj["alternatives"]) if obj["alternatives"] else ""

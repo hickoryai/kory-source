@@ -7,7 +7,20 @@ from unittest.mock import patch
 import pytest
 
 from mira.exceptions import ProviderError
+from mira.models import PRInfo
 from mira.providers.forgejo import ForgejoProvider
+
+_PR = PRInfo(
+    title="t",
+    description="d",
+    base_branch="main",
+    head_branch="feat",
+    url="u",
+    number=7,
+    owner="group",
+    repo="proj",
+    head_sha="abc",
+)
 
 
 class _FakeResp:
@@ -90,3 +103,58 @@ class TestGetRepoPermission:
 
         with _patch(handler), pytest.raises(ProviderError, match="repository admin/owner"):
             await ForgejoProvider("tok").get_repo_permission("acme", "widgets", "alice")
+
+
+class TestActedBotReviewEvidence:
+    @pytest.mark.asyncio
+    async def test_only_human_agreement_with_reply_link_marks_bot_comment(self, monkeypatch):
+        provider = ForgejoProvider("tok")
+
+        async def comments(_pr):
+            review = {"id": 1}
+            yield (
+                review,
+                {
+                    "id": 10,
+                    "path": "app.py",
+                    "line": 4,
+                    "body": "Flag this issue",
+                    "user": {"username": "review-bot", "is_bot": True},
+                },
+            )
+            yield (
+                review,
+                {
+                    "id": 11,
+                    "in_reply_to_id": 10,
+                    "path": "app.py",
+                    "line": 4,
+                    "body": "Good catch, thanks.",
+                    "user": {"username": "dev"},
+                },
+            )
+            yield (
+                review,
+                {
+                    "id": 12,
+                    "path": "app.py",
+                    "line": 8,
+                    "body": "Another flag",
+                    "user": {"username": "review-bot", "is_bot": True},
+                },
+            )
+            yield (
+                review,
+                {
+                    "id": 13,
+                    "path": "app.py",
+                    "line": 8,
+                    "body": "Good catch, thanks.",
+                    "user": {"username": "other-bot", "is_bot": True},
+                },
+            )
+
+        monkeypatch.setattr(provider, "_iter_review_comments", comments)
+        comments_out = await provider.get_review_comments(_PR, "review-bot")
+        bot_comments = [comment for comment in comments_out if comment.author == "review-bot"]
+        assert [comment.human_acted for comment in bot_comments] == [True, False]

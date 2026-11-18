@@ -7,6 +7,7 @@ Reads through ``IndexStore.list_active_learned_rules()`` (a SELECT of
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -48,6 +49,11 @@ def import_learned_rules(
             continue
         try:
             rules = store.list_active_learned_rules()
+            suppressed = {
+                f"{platform}/{owner}/{repo}/{r.id}": r
+                for r in store.list_learned_rules()
+                if r.suppressed and r.active and r.status == "approved"
+            }
         finally:
             store.close()
         seen: set[str] = set()
@@ -78,23 +84,57 @@ def import_learned_rules(
             if "object_id" in res:
                 with registry._object_lock(res["object_id"]):
                     obj = registry.get(res["object_id"])  # current row, under the lock
-                    if obj["status"] == "retired" and obj["status_reason"] == "source_removed":
+                    registry.db.execute(
+                        "INSERT INTO registry_learned_rule_weights "
+                        "(object_id, weight, provenance, source_event_ids) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(object_id) DO UPDATE SET weight=excluded.weight, "
+                        "provenance=excluded.provenance, source_event_ids=excluded.source_event_ids",
+                        (
+                            obj["id"],
+                            rule.confidence,
+                            rule.provenance,
+                            json.dumps(rule.source_event_ids),
+                        ),
+                    )
+                    if obj["status"] == "retired" and obj["status_reason"] in (
+                        "source_removed",
+                        "source_suppressed",
+                    ):
                         obj.update(status="approved", status_reason="", sync_status="synced")
-                        registry._write(obj)
+                    registry._write(obj)
         prefix = f"{platform}/{owner}/{repo}/"
         for obj in registry._select(
-            "source_system = ? AND source_id LIKE ? AND status = 'approved'",
+            "source_system = ? AND source_id LIKE ? AND "
+            "(status = 'approved' OR (status = 'retired' AND status_reason = 'source_suppressed'))",
             (SOURCE_SYSTEM, prefix + "%"),
         ):
             if obj["source_id"] not in seen:
                 with registry._object_lock(obj["id"]):
                     fresh = registry.get(obj["id"])
-                    if fresh["status"] != "approved":
+                    if (
+                        fresh["status"] != "approved"
+                        and fresh["status_reason"] != "source_suppressed"
+                    ):
                         continue
+                    source = suppressed.get(fresh["source_id"])
+                    reason = "source_suppressed" if source else "source_removed"
+                    if source:
+                        registry.db.execute(
+                            "INSERT INTO registry_learned_rule_weights "
+                            "(object_id, weight, provenance, source_event_ids) VALUES (?, ?, ?, ?) "
+                            "ON CONFLICT(object_id) DO UPDATE SET weight=excluded.weight, "
+                            "provenance=excluded.provenance, source_event_ids=excluded.source_event_ids",
+                            (
+                                fresh["id"],
+                                source.confidence,
+                                source.provenance,
+                                json.dumps(source.source_event_ids),
+                            ),
+                        )
                     fresh.update(
                         status="retired",
-                        status_reason="source_removed",
-                        sync_status="source_removed",
+                        status_reason=reason,
+                        sync_status=reason,
                     )
                     registry._write(fresh)
                 totals["retired"] += 1

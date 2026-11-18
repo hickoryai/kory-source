@@ -41,6 +41,11 @@ from mira.providers.formatting import (
 from mira.providers.formatting import (
     format_key_issues as _format_key_issues,
 )
+from mira.providers.review_classification import (
+    classify_review_comment,
+    is_own_review,
+    normalize_login,
+)
 
 # Transient errors worth retrying — network issues and GitHub server errors.
 _RETRYABLE = (ConnectionError, TimeoutError, httpx.TransportError, GithubException)
@@ -65,14 +70,7 @@ _GRAPHQL_URL = os.environ.get(
 )
 
 
-def _normalize_login(login: str) -> str:
-    """Normalize a GitHub login for comparison.
-
-    GitHub Apps have a quirk: ``viewer.login`` returns ``app[bot]`` while
-    review-comment authors are stored as just ``app``.  Strip the ``[bot]``
-    suffix and lower-case so both forms match reliably.
-    """
-    return login.removesuffix("[bot]").lower()
+_normalize_login = normalize_login  # Backward-compatible private import.
 
 
 _REVIEW_THREADS_QUERY = """
@@ -131,6 +129,38 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   }
 }
 """
+
+# ``isResolved`` alone is not human-action evidence.  This query includes the
+# resolver identity and REST comment ids needed to verify that evidence.
+_ACTED_REVIEW_THREADS_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          isResolved
+          resolvedBy { login __typename }
+          comments(first: 100) { nodes { databaseId } }
+        }
+      }
+    }
+  }
+}
+"""
+
+_AGREEMENT_REPLY = re.compile(
+    r"^\s*(?:agreed|agree|good catch|fixed|addressed|done|makes sense)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_clear_agreement_reply(body: str) -> bool:
+    """Keep acknowledgement evidence conservative and explicit."""
+    return bool(_AGREEMENT_REPLY.match(body or "")) and not re.search(
+        r"\b(?:not|no|disagree|but|however|wrong|incorrect)\b", body or "", re.IGNORECASE
+    )
+
 
 # Matches: https://github.com/owner/repo/pull/123 or owner/repo#123
 _PR_URL_PATTERN = re.compile(
@@ -1249,38 +1279,146 @@ class GitHubProvider(BaseProvider):
 
         return {path: hist for path, hist in results if hist}
 
-    async def get_human_review_comments(
+    async def get_review_comments(
         self, pr_info: PRInfo, bot_login: str
     ) -> list[HumanReviewComment]:
-        """Fetch all non-bot review comments (line-level) on a PR."""
-        bot_norm = _normalize_login(bot_login)
+        """Fetch review comments with verified human acknowledgement evidence.
+
+        This does not infer a code fix from outdated/resolved state or a merge.
+        Code changes need separate verification; only explicit human replies or
+        an identified human thread resolver are recorded here.
+        """
 
         token = await self._resolve_token()
         gh = self._make_client(token)
 
         @_retry_transient
-        def _fetch() -> list[HumanReviewComment]:
+        def _fetch() -> list[tuple[HumanReviewComment, int | None, int | None]]:
             gh_repo = gh.get_repo(f"{pr_info.owner}/{pr_info.repo}")
             pr = gh_repo.get_pull(pr_info.number)
-            results: list[HumanReviewComment] = []
+            results: list[tuple[HumanReviewComment, int | None, int | None]] = []
             for c in pr.get_review_comments():
                 author = c.user.login if c.user else ""
-                if _normalize_login(author) == bot_norm:
-                    continue
+                account_type = getattr(c.user, "type", "") if c.user else ""
+                body = c.body or ""
                 results.append(
-                    HumanReviewComment(
-                        path=c.path or "",
-                        line=(c.line or c.original_line or 0),
-                        body=c.body or "",
-                        author=author,
+                    (
+                        HumanReviewComment(
+                            path=c.path or "",
+                            line=(c.line or c.original_line or 0),
+                            body=body,
+                            author=author,
+                            account_type=account_type or "",
+                            own_comment=is_own_review(author, bot_login),
+                        ),
+                        getattr(c, "id", None),
+                        getattr(c, "in_reply_to_id", None),
                     )
                 )
             return results
 
         try:
-            return await asyncio.to_thread(_fetch)
+            raw_comments = await asyncio.to_thread(_fetch)
         except Exception as e:
             raise ProviderError(f"Failed to fetch human review comments: {e}") from e
+
+        comments_by_id = {
+            comment_id: comment for comment, comment_id, _ in raw_comments if comment_id
+        }
+        acted_ids: set[int] = set()
+        for reply, _reply_id, parent_id in raw_comments:
+            if (
+                parent_id in comments_by_id
+                and classify_review_comment(
+                    comments_by_id[parent_id].author,
+                    comments_by_id[parent_id].body,
+                    account_type=comments_by_id[parent_id].account_type,
+                    bot_login=bot_login,
+                )
+                == "bot_review"
+                and classify_review_comment(
+                    reply.author, reply.body, account_type=reply.account_type, bot_login=bot_login
+                )
+                == "human_review"
+                and _is_clear_agreement_reply(reply.body)
+            ):
+                acted_ids.add(parent_id)
+
+        # A failed GraphQL lookup is non-fatal and supplies no resolver evidence.
+        try:
+            acted_ids.update(await self._human_resolved_comment_ids(pr_info, bot_login))
+        except Exception as exc:
+            logger.warning(
+                "Could not verify GitHub thread resolvers for PR %s: %s", pr_info.number, exc
+            )
+
+        return [
+            HumanReviewComment(
+                path=comment.path,
+                line=comment.line,
+                body=comment.body,
+                author=comment.author,
+                account_type=comment.account_type,
+                own_comment=comment.own_comment,
+                human_acted=comment_id in acted_ids,
+            )
+            for comment, comment_id, _ in raw_comments
+        ]
+
+    async def _human_resolved_comment_ids(self, pr_info: PRInfo, bot_login: str) -> set[int]:
+        """Return comment ids only where GraphQL explicitly names a human resolver."""
+        acted_ids: set[int] = set()
+        cursor: str | None = None
+        while True:
+            data = await self._graphql_request(
+                _ACTED_REVIEW_THREADS_QUERY,
+                {
+                    "owner": pr_info.owner,
+                    "repo": pr_info.repo,
+                    "number": pr_info.number,
+                    "cursor": cursor,
+                },
+            )
+            threads = data["repository"]["pullRequest"]["reviewThreads"]
+            for thread in threads["nodes"]:
+                resolver = thread.get("resolvedBy") or {}
+                resolver_type = "Bot" if resolver.get("__typename") == "Bot" else ""
+                if (
+                    not thread.get("isResolved")
+                    or not resolver.get("login")
+                    or classify_review_comment(
+                        resolver.get("login", ""),
+                        "",
+                        account_type=resolver_type,
+                        bot_login=bot_login,
+                    )
+                    != "human_review"
+                ):
+                    continue
+                acted_ids.update(
+                    node["databaseId"]
+                    for node in thread.get("comments", {}).get("nodes", [])
+                    if node.get("databaseId") is not None
+                )
+            page_info = threads["pageInfo"]
+            if not page_info.get("hasNextPage"):
+                return acted_ids
+            cursor = page_info.get("endCursor")
+
+    async def get_human_review_comments(
+        self, pr_info: PRInfo, bot_login: str
+    ) -> list[HumanReviewComment]:
+        return [
+            comment
+            for comment in await self.get_review_comments(pr_info, bot_login)
+            if classify_review_comment(
+                comment.author,
+                comment.body,
+                account_type=comment.account_type,
+                bot_login=bot_login,
+            )
+            == "human_review"
+        ]
 
     async def get_review_inline_comments(self, pr_info: PRInfo, review_id: int) -> list[str]:
         """Return the bodies of the inline comments that belong to one review

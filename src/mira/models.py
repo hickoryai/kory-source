@@ -510,12 +510,15 @@ class BotThreadRecord:
 
 @dataclass
 class HumanReviewComment:
-    """A review comment on a PR authored by a human (not the bot)."""
+    """A line-level review comment, with authorship classification metadata."""
 
     path: str
     line: int
     body: str
     author: str
+    account_type: str = ""
+    human_acted: bool = False
+    own_comment: bool = False
 
 
 @dataclass

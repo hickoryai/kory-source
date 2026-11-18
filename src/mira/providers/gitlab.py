@@ -28,8 +28,24 @@ from mira.models import (
 from mira.platforms import profiles
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
+from mira.providers.review_classification import (
+    classify_review_comment,
+    is_own_review,
+)
 
 logger = logging.getLogger(__name__)
+
+_AGREEMENT_REPLY = re.compile(
+    r"^\s*(?:agreed|agree|good catch|fixed|addressed|done|makes sense)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_clear_agreement_reply(body: str) -> bool:
+    return bool(_AGREEMENT_REPLY.match(body or "")) and not re.search(
+        r"\b(?:not|no|disagree|but|however|wrong|incorrect)\b", body or "", re.IGNORECASE
+    )
+
 
 # https://gitlab.com/group/sub/project/-/merge_requests/123  or  group/project!123
 _MR_URL_PATTERN = re.compile(
@@ -500,20 +516,38 @@ class GitLabProvider(BaseProvider):
                     return str(disc["id"])
         return None
 
-    async def get_human_review_comments(
+    async def get_review_comments(
         self, pr_info: PRInfo, bot_login: str
     ) -> list[HumanReviewComment]:
         try:
             discussions = await self._discussions(pr_info)
         except Exception as e:
             raise ProviderError(f"Failed to fetch human review comments: {e}") from e
-        bot_identities = {n for n in (await self._self_username(), bot_login) if n}
+        own_login = await self._self_username()
         out: list[HumanReviewComment] = []
         for disc in discussions:
-            for note in disc.get("notes", []):
+            notes = disc.get("notes", [])
+            human_acknowledgement = any(
+                not is_own_review((note.get("author") or {}).get("username", ""), own_login)
+                and classify_review_comment(
+                    (note.get("author") or {}).get("username", ""),
+                    note.get("body") or "",
+                    account_type=(
+                        "Bot"
+                        if (note.get("author") or {}).get("bot")
+                        else (note.get("author") or {}).get("type", "")
+                    ),
+                    bot_login=bot_login,
+                )
+                == "human_review"
+                and _is_clear_agreement_reply(note.get("body") or "")
+                for note in notes[1:]
+            )
+            for index, note in enumerate(notes):
                 pos = note.get("position")
-                author = (note.get("author") or {}).get("username", "")
-                if not pos or author in bot_identities or note.get("system"):
+                author_data = note.get("author") or {}
+                author = author_data.get("username", "")
+                if not pos or note.get("system"):
                     continue
                 out.append(
                     HumanReviewComment(
@@ -521,9 +555,64 @@ class GitLabProvider(BaseProvider):
                         line=int(pos.get("new_line") or pos.get("old_line") or 0),
                         body=note.get("body") or "",
                         author=author,
+                        account_type=(
+                            "Bot" if author_data.get("bot") else author_data.get("type", "")
+                        ),
+                        own_comment=(
+                            is_own_review(author, bot_login) or is_own_review(author, own_login)
+                        ),
+                        # Discussion ordering is the GitLab reply linkage.  A
+                        # resolved_by identity is sufficient even without text.
+                        human_acted=(
+                            index == 0
+                            and classify_review_comment(
+                                author,
+                                note.get("body") or "",
+                                account_type=(
+                                    "Bot" if author_data.get("bot") else author_data.get("type", "")
+                                ),
+                                bot_login=bot_login,
+                            )
+                            == "bot_review"
+                            and (
+                                human_acknowledgement
+                                or bool(
+                                    note.get("resolved")
+                                    and (note.get("resolved_by") or {}).get("username")
+                                    and not is_own_review(
+                                        (note.get("resolved_by") or {}).get("username", ""),
+                                        own_login,
+                                    )
+                                    and classify_review_comment(
+                                        (note.get("resolved_by") or {}).get("username", ""),
+                                        "",
+                                        account_type=(
+                                            "Bot"
+                                            if (note.get("resolved_by") or {}).get("bot")
+                                            else (note.get("resolved_by") or {}).get("type", "")
+                                        ),
+                                        bot_login=bot_login,
+                                    )
+                                    == "human_review"
+                                )
+                            )
+                        ),
                     )
                 )
         return out
+
+    async def get_human_review_comments(
+        self, pr_info: PRInfo, bot_login: str
+    ) -> list[HumanReviewComment]:
+        return [
+            comment
+            for comment in await self.get_review_comments(pr_info, bot_login)
+            if not comment.own_comment
+            and classify_review_comment(
+                comment.author, comment.body, account_type=comment.account_type, bot_login=bot_login
+            )
+            == "human_review"
+        ]
 
     # ── labels ──────────────────────────────────────────────────────
 

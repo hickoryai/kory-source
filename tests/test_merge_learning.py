@@ -223,11 +223,13 @@ class TestSynthesizeFromHumanReviews:
                         "rule": "Flag raw SQL queries outside the data layer.",
                         "rationale": "Reviewers consistently pushed back on them.",
                         "evidence_count": 3,
+                        "source_event_ids": [1, 2, 3],
                     },
                     {
                         "rule": "Prefer async/await over callback patterns.",
                         "rationale": "Team style.",
                         "evidence_count": 2,
+                        "source_event_ids": [1, 2],
                     },
                 ]
             }
@@ -471,7 +473,7 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
             ),
         ]
     )
-    mock_provider.get_human_review_comments = AsyncMock(
+    mock_provider.get_review_comments = AsyncMock(
         return_value=[
             HumanReviewComment(
                 path="src/auth.py",
@@ -513,6 +515,7 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
                         "rule": "Avoid raw SQL queries outside the data-access layer.",
                         "rationale": "Reviewers consistently push back on them.",
                         "evidence_count": 2,
+                        "source_event_ids": [4, 5],
                     },
                 ]
             }
@@ -577,7 +580,7 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
     # ── Dedup on retry ──
     fake_llm.complete.reset_mock()
     mock_provider.get_all_bot_threads.reset_mock()
-    mock_provider.get_human_review_comments.reset_mock()
+    mock_provider.get_review_comments.reset_mock()
 
     await handlers.handle_pr_merged(payload, app_auth, "mira")
 
@@ -587,7 +590,7 @@ async def test_handle_pr_merged_end_to_end(tmp_path, monkeypatch):
 
     # Provider fetch methods should not have been called (early return).
     mock_provider.get_all_bot_threads.assert_not_called()
-    mock_provider.get_human_review_comments.assert_not_called()
+    mock_provider.get_review_comments.assert_not_called()
     fake_llm.complete.assert_not_called()
 
     store.close()

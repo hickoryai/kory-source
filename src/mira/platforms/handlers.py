@@ -4,6 +4,7 @@ none is tied to a specific platform's payload shape."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -441,7 +442,8 @@ async def run_pr_merged_learning(
     try:
         existing = store.list_feedback(limit=2000)
         if any(
-            e.signal in ("accepted", "human_review") and e.pr_number == number for e in existing
+            e.signal in ("accepted", "human_review", "bot_review") and e.pr_number == number
+            for e in existing
         ):
             logger.info("PR %s already processed for merge-time learning", pr_url)
             return
@@ -474,32 +476,48 @@ async def run_pr_merged_learning(
                     "comment_severity": meta["severity"],
                     "comment_title": meta["title"],
                     "signal": "accepted",
+                    "own_comment": True,
                     "actor": merged_by,
                     "pr_author": pr_info.author,
                 }
             )
 
         try:
-            human_comments = await provider.get_human_review_comments(pr_info, bot_name)
+            human_comments = await provider.get_review_comments(pr_info, bot_name)
         except Exception as exc:
             logger.warning("Failed to fetch human review comments for %s: %s", pr_url, exc)
             human_comments = []
 
+        from mira.providers.review_classification import classify_review_comment, is_own_review
+
+        feedback_config = load_config().feedback
         human_events: list[dict] = []
         for hc in human_comments:
             body = (hc.body or "").strip()
             if not body:
                 continue
+            category = classify_review_comment(
+                hc.author,
+                body,
+                account_type=hc.account_type,
+                bot_login=bot_name,
+                known_ai_reviewers=feedback_config.known_ai_reviewers,
+            )
+            if hc.own_comment:
+                category = "bot_review"
             human_events.append(
                 {
                     "pr_number": number,
                     "pr_url": pr_url,
                     "comment_path": hc.path,
                     "comment_line": hc.line,
-                    "comment_category": "human_review",
+                    "comment_category": category,
                     "comment_severity": "",
                     "comment_title": body[:2000],
-                    "signal": "human_review",
+                    "signal": category,
+                    "account_type": hc.account_type,
+                    "human_acted": hc.human_acted,
+                    "own_comment": hc.own_comment or is_own_review(hc.author, bot_name),
                     "actor": hc.author,
                     "pr_author": pr_info.author,
                 }
@@ -523,13 +541,24 @@ async def run_pr_merged_learning(
 
                 indexing_llm = create_llm(llm_config_for("indexing", config.llm))
                 llm_rules = await synthesize_from_human_reviews(store, indexing_llm)
+                # Apply changed weights/suppression to an existing registry
+                # mirror now, rather than waiting for the hourly import job.
+                from mira import registry as registry_module
+                from mira.registry.learned import import_learned_rules
+
+                if registry_module._registry is not None:
+                    await asyncio.to_thread(
+                        import_learned_rules,
+                        registry_module._registry,
+                        [(platform, owner, repo)],
+                    )
             except Exception as exc:
                 logger.warning("LLM rule synthesis failed for %s: %s", pr_url, exc)
     finally:
         store.close()
 
     logger.info(
-        "PR merged %s: recorded %d accepted + %d human review events; "
+        "PR merged %s: recorded %d accepted + %d review events; "
         "upserted %d deterministic + %d LLM rules",
         pr_url,
         accepted,

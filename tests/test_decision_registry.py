@@ -726,3 +726,44 @@ def test_upstream_edit_stays_under_cap(path, cap):
     if changed is None:
         pytest.skip("fork base commit not available in this checkout")
     assert changed < cap
+
+
+def test_learned_rule_mirror_preserves_weight_and_suppression(reg, tmp_path):
+    from mira.index.store import IndexStore
+
+    store = IndexStore(str(tmp_path / "feedback.db"))
+    rule = store.create_learned_rule("Keep transactions explicit", "bot_review")
+    store.set_learned_rule_evidence(
+        rule.id, confidence=0.1, source_event_ids=[1, 2], provenance="bot"
+    )
+
+    class Proxy:
+        def __getattr__(self, name):
+            return getattr(store, name)
+
+        def close(self):
+            pass
+
+    repos = [("github", "example", "project")]
+    open_store = lambda *args: Proxy()  # noqa: E731
+    import_learned_rules(reg, repos, open_store=open_store)
+    [obj] = reg._select("source_system = ?", (SOURCE_SYSTEM,))
+    weighted = obj["confidence"]
+    assert 0 < weighted < 0.1
+    reg._write(obj)
+    assert reg.get(obj["id"])["confidence"] == weighted
+
+    store.set_learned_rule_evidence(
+        rule.id, confidence=0.1, source_event_ids=[1, 2], provenance="bot", suppressed=True
+    )
+    assert import_learned_rules(reg, repos, open_store=open_store)["retired"] == 1
+    assert reg.get(obj["id"])["status"] == "retired"
+    assert reg.get(obj["id"])["status_reason"] == "source_suppressed"
+    store.set_learned_rule_evidence(
+        rule.id, confidence=1.0, source_event_ids=[1, 2], provenance="human corroborated"
+    )
+    import_learned_rules(reg, repos, open_store=open_store)
+    restored = reg.get(obj["id"])
+    assert restored["status"] == "approved"
+    assert restored["confidence"] == pytest.approx(weighted * 10)
+    store.close()

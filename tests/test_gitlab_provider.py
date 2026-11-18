@@ -118,6 +118,54 @@ class TestBuildUnifiedDiff:
         assert len(files[0].hunks) == 1
 
 
+class TestActedBotReviewEvidence:
+    @pytest.mark.asyncio
+    async def test_human_agreement_or_resolver_marks_only_bot_root(self, monkeypatch):
+        provider = GitLabProvider("tok")
+
+        async def discussions(_pr):
+            return [
+                {
+                    "notes": [
+                        {
+                            "id": 1,
+                            "body": "Flag this issue",
+                            "position": {"new_path": "app.py", "new_line": 4},
+                            "author": {"username": "review-bot", "bot": True},
+                            "resolved_by": {"username": "dev"},
+                        },
+                        {
+                            "id": 2,
+                            "body": "Good catch, thanks.",
+                            "position": {"new_path": "app.py", "new_line": 4},
+                            "author": {"username": "dev"},
+                        },
+                    ]
+                },
+                {
+                    "notes": [
+                        {
+                            "id": 3,
+                            "body": "Another flag",
+                            "position": {"new_path": "app.py", "new_line": 8},
+                            "author": {"username": "review-bot", "bot": True},
+                        },
+                        {
+                            "id": 4,
+                            "body": "I changed something elsewhere.",
+                            "position": {"new_path": "app.py", "new_line": 8},
+                            "author": {"username": "dev"},
+                        },
+                    ]
+                },
+            ]
+
+        monkeypatch.setattr(provider, "_discussions", discussions)
+        comments = await provider.get_review_comments(_PR, "review-bot")
+        bot_comments = [comment for comment in comments if comment.author == "review-bot"]
+        assert [comment.human_acted for comment in bot_comments] == [True, False]
+
+
 class TestGetPrInfo:
     @pytest.mark.asyncio
     async def test_maps_iid_and_branches(self):

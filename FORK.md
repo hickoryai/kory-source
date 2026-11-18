@@ -517,3 +517,23 @@ cached immediately. Singleton timeouts remain auditable skips in import
 coverage, while execution-budget expiry leaves unfinished work resumable.
 `tests/test_decision_llm_timeouts.py` covers splitting, singleton skip replay,
 partial success, configuration and budget expiry.
+
+## Review feedback provenance
+
+The review-feedback correction changes `src/mira/config.py`, `models.py`,
+`providers/{base,github,gitlab,forgejo,review_classification}.py`,
+`platforms/handlers.py`, `analysis/{feedback,repair_review_feedback}.py`,
+`index/{store,pg_store}.py`, the feedback synthesis template, and
+`registry/{db,learned,service}.py`. Synthetic tests in
+`test_review_classification.py`, `test_review_feedback_learning.py`,
+`test_review_feedback_storage.py`, `test_merge_learning.py` and
+`test_decision_registry.py` cover the contract. These generic provider and
+learning fixes are candidates for upstream contribution.
+
+Human and external-bot comments remain separate audit signals. Learned rules
+retain source event IDs, confidence and suppression independently of admin
+approval. Default weights are human 1.0, bot with verified human action 0.5,
+and ignored bot 0.1, configurable under `feedback`. Own comments are audit-only.
+Historical rules without lineage retain original confidence and carry an
+explicit uncertainty flag when repaired. See `docs/review-feedback-repair.md`
+for the post-merge dev-only operation; no repair runs during startup.

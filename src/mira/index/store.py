@@ -193,6 +193,9 @@ CREATE TABLE IF NOT EXISTS feedback_events (
     -- GitHub login of the PR author (distinct from `actor`, who is the human
     -- that accepted/rejected). Lets accept/reject rate attribute to the author.
     pr_author TEXT NOT NULL DEFAULT '',
+    account_type TEXT NOT NULL DEFAULT '',
+    own_comment INTEGER NOT NULL DEFAULT 0,
+    human_acted INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL DEFAULT 0
 );
 
@@ -209,6 +212,11 @@ CREATE TABLE IF NOT EXISTS learned_rules (
     status TEXT NOT NULL DEFAULT 'approved',
     -- Username of the admin who authored a manual rule; '' for synthesized.
     created_by TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 1,
+    original_confidence REAL,
+    provenance TEXT NOT NULL DEFAULT '',
+    source_event_ids TEXT NOT NULL DEFAULT '[]',
+    suppressed INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL DEFAULT 0
 );
@@ -364,6 +372,9 @@ class FeedbackEventRow:
     signal: str
     actor: str
     pr_author: str = ""
+    account_type: str = ""
+    own_comment: bool = False
+    human_acted: bool = False
     created_at: float = 0.0
 
 
@@ -378,6 +389,11 @@ class LearnedRuleRow:
     active: bool = True
     status: str = "approved"  # 'pending' | 'approved' | 'rejected'
     created_by: str = ""
+    confidence: float = 1.0
+    original_confidence: float | None = None
+    provenance: str = ""
+    source_event_ids: list[int] = field(default_factory=list)
+    suppressed: bool = False
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -443,6 +459,13 @@ class IndexStore(_StoreSharedMixin):
             self._conn.execute(
                 "ALTER TABLE feedback_events ADD COLUMN pr_author TEXT NOT NULL DEFAULT ''"
             )
+        for col, definition in (
+            ("account_type", "TEXT NOT NULL DEFAULT ''"),
+            ("own_comment", "INTEGER NOT NULL DEFAULT 0"),
+            ("human_acted", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in feedback_cols:
+                self._conn.execute(f"ALTER TABLE feedback_events ADD COLUMN {col} {definition}")
         # learned_rules.status added post-schema. Default 'approved' so existing
         # rules keep feeding reviews; new synthesized rules are inserted 'pending'.
         lr_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(learned_rules)").fetchall()}
@@ -454,6 +477,15 @@ class IndexStore(_StoreSharedMixin):
             self._conn.execute(
                 "ALTER TABLE learned_rules ADD COLUMN created_by TEXT NOT NULL DEFAULT ''"
             )
+        for col, definition in (
+            ("confidence", "REAL NOT NULL DEFAULT 1"),
+            ("original_confidence", "REAL"),
+            ("provenance", "TEXT NOT NULL DEFAULT ''"),
+            ("source_event_ids", "TEXT NOT NULL DEFAULT '[]'"),
+            ("suppressed", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if col not in lr_cols:
+                self._conn.execute(f"ALTER TABLE learned_rules ADD COLUMN {col} {definition}")
         sym_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(symbols)").fetchall()}
         for col in ("qualified_name", "body_fingerprint", "body_simhash", "last_seen_commit"):
             if col not in sym_cols:
@@ -1378,6 +1410,9 @@ class IndexStore(_StoreSharedMixin):
                 e["signal"],
                 e["actor"],
                 e.get("pr_author", ""),
+                e.get("account_type", ""),
+                int(e.get("own_comment", False)),
+                int(e.get("human_acted", False)),
                 now,
             )
             for e in events
@@ -1385,20 +1420,26 @@ class IndexStore(_StoreSharedMixin):
         self._conn.executemany(
             "INSERT INTO feedback_events "
             "(pr_number, pr_url, comment_path, comment_line, comment_category, "
-            "comment_severity, comment_title, signal, actor, pr_author, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "comment_severity, comment_title, signal, actor, pr_author, account_type, "
+            "own_comment, human_acted, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         self._conn.commit()
         return len(rows)
 
-    def list_feedback(self, limit: int = 500) -> list[FeedbackEventRow]:
-        rows = self._conn.execute(
+    def list_feedback(self, limit: int | None = 500) -> list[FeedbackEventRow]:
+        query = (
             "SELECT id, pr_number, pr_url, comment_path, comment_line, "
-            "comment_category, comment_severity, comment_title, signal, actor, pr_author, created_at "
-            "FROM feedback_events ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+            "comment_category, comment_severity, comment_title, signal, actor, pr_author, "
+            "account_type, own_comment, human_acted, created_at "
+            "FROM feedback_events ORDER BY created_at DESC"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+            rows = self._conn.execute(query, (limit,)).fetchall()
+        else:
+            rows = self._conn.execute(query).fetchall()
         return [
             FeedbackEventRow(
                 id=r[0],
@@ -1412,10 +1453,32 @@ class IndexStore(_StoreSharedMixin):
                 signal=r[8],
                 actor=r[9],
                 pr_author=r[10],
-                created_at=r[11],
+                account_type=r[11],
+                own_comment=bool(r[12]),
+                human_acted=bool(r[13]),
+                created_at=r[14],
             )
             for r in rows
         ]
+
+    def list_all_feedback(self) -> list[FeedbackEventRow]:
+        """Return all feedback events for this repository."""
+        return self.list_feedback(limit=None)
+
+    def reclassify_feedback(
+        self,
+        event_id: int,
+        *,
+        signal: str,
+        comment_category: str,
+        own_comment: bool = False,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE feedback_events SET signal = ?, comment_category = ?, own_comment = ? "
+            "WHERE id = ?",
+            (signal, comment_category, int(own_comment), event_id),
+        )
+        self._conn.commit()
 
     def get_feedback_stats(self) -> dict:
         """Aggregate feedback counts by signal, category, and path directory."""
@@ -1497,20 +1560,27 @@ class IndexStore(_StoreSharedMixin):
             active=bool(r[6]),
             status=r[7],
             created_by=r[8],
-            created_at=r[9],
-            updated_at=r[10],
+            confidence=r[9],
+            original_confidence=r[10],
+            provenance=r[11],
+            source_event_ids=json.loads(r[12]),
+            suppressed=bool(r[13]),
+            created_at=r[14],
+            updated_at=r[15],
         )
 
     _LR_COLS = (
         "id, rule_text, source_signal, category, path_pattern, "
-        "sample_count, active, status, created_by, created_at, updated_at"
+        "sample_count, active, status, created_by, confidence, original_confidence, "
+        "provenance, source_event_ids, suppressed, created_at, updated_at"
     )
 
     def list_active_learned_rules(self) -> list[LearnedRuleRow]:
         # Only approved + enabled rules feed reviews.
         rows = self._conn.execute(
             f"SELECT {self._LR_COLS} FROM learned_rules "
-            "WHERE active = 1 AND status = 'approved' ORDER BY sample_count DESC"
+            "WHERE active = 1 AND status = 'approved' AND suppressed = 0 "
+            "ORDER BY confidence DESC, sample_count DESC"
         ).fetchall()
         return [self._row_to_learned_rule(r) for r in rows]
 
@@ -1590,6 +1660,32 @@ class IndexStore(_StoreSharedMixin):
         self._conn.execute(
             "UPDATE learned_rules SET active = ?, updated_at = ? WHERE id = ?",
             (int(active), time.time(), rule_id),
+        )
+        self._conn.commit()
+
+    def set_learned_rule_evidence(
+        self,
+        rule_id: int,
+        *,
+        confidence: float,
+        source_event_ids: list[int],
+        provenance: str = "",
+        suppressed: bool = False,
+        original_confidence: float | None = None,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE learned_rules SET confidence = ?, source_event_ids = ?, provenance = ?, "
+            "suppressed = ?, original_confidence = COALESCE(original_confidence, ?), "
+            "updated_at = ? WHERE id = ?",
+            (
+                confidence,
+                json.dumps(source_event_ids),
+                provenance,
+                int(suppressed),
+                original_confidence,
+                time.time(),
+                rule_id,
+            ),
         )
         self._conn.commit()
 
