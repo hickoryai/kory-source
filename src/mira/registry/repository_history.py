@@ -779,12 +779,14 @@ class RepositoryHistoryImporter:
         policy = require_import(self.access)
         if not policy.admits_repository(self.repo):
             raise AccessDenied("the repository is not in the approved corpus manifest")
-        frozen = self.reader.rev_parse(self.commit)
-        selected, skipped = inventory(self.reader, frozen, paths=self.paths)
         if self.classifier is None:
             self.classifier = decision_llm.default_classifier(
                 self.registry, corpus_id=policy.corpus_id
             )
+        if apply:
+            self.classifier.validate_configuration()
+        frozen = self.reader.rev_parse(self.commit)
+        selected, skipped = inventory(self.reader, frozen, paths=self.paths)
         self.classifier.deadline = started_run + self.max_seconds if self.max_seconds else None
         stats_before = Counter(getattr(self.classifier, "stats", {}))
         if self.classifier.corpus_id != policy.corpus_id:
@@ -890,9 +892,10 @@ class RepositoryHistoryImporter:
                 # Finished batches are cached even if a sibling batch failed.
                 # Report those successes and the unclassified remainder, rather
                 # than losing the entire failed group's nomination estimates.
+                cached = self.classifier.classification_outcomes
                 for kind, _, revisions, _ in group:
                     passages = [p for r in revisions for p in r[4]]
-                    outcomes = [self.classifier._cached(p.text) for p in passages]
+                    outcomes = [cached.get(decision_llm.passage_hash(p.text)) for p in passages]
                     skipped_outcomes = sum(
                         r is not None and r.get("outcome") == "skipped" for r in outcomes
                     )

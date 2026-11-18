@@ -103,7 +103,7 @@ def test_apply_stdout_previews_errors_and_the_row_keeps_the_full_text(
     )
 
 
-def test_sql_failed_group_counts_are_visible_and_resume_stores_sql(tmp_path):
+def test_sql_failed_group_counts_are_visible_and_resume_stores_sql(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init", "-q")
@@ -112,10 +112,19 @@ def test_sql_failed_group_counts_are_visible_and_resume_stores_sql(tmp_path):
     git(repo, "commit", "-qm", "Fixture")
     with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
         reg, importer = _importer(tmp_path, repo, rp.operator())
+        cache_reads = []
+        original = importer.classifier._cached
+
+        def cached(text):
+            cache_reads.append(text)
+            return original(text)
+
+        monkeypatch.setattr(importer.classifier, "_cached", cached)
         provider = importer.classifier._supplied_provider
         provider.malformed = True
         first = importer.run(apply=True)
         assert first["status"] == "incomplete"
+        assert len(cache_reads) == 2  # estimate + pending; diagnostics add no read
         assert first["coverage"]["candidate_passages"] >= 1
         assert first["per_source"]["sql"] == {
             "nominated": 1,
@@ -127,7 +136,9 @@ def test_sql_failed_group_counts_are_visible_and_resume_stores_sql(tmp_path):
             "stored_evidence": 0,
         }
         provider.malformed = False
+        cache_reads.clear()
         second = importer.run(apply=True)
+        assert len(cache_reads) == 3  # estimate + pending + extraction, as before diagnostics
         assert second["run_id"] == first["run_id"]
         assert second["status"] == "complete"
         assert second["per_source"]["sql"] == {
@@ -234,3 +245,27 @@ def test_json_and_jsonc_keep_exact_quotes_without_yaml(text, monkeypatch):
 def test_invalid_json_is_still_an_error():
     with pytest.raises(ValueError):
         data_candidates('{"reason": unquoted}', ".json")
+
+
+@pytest.mark.parametrize("router_url", [None, "https://router.example.test"])
+def test_apply_fails_before_inventory_or_run_creation_without_router_configuration(
+    tmp_path, monkeypatch, router_url
+):
+    for name in ("MIRA_ROUTER_ACP_URL", "MIRA_ROUTER_ACP_TOKEN", "MIRA_ROUTER_ACP_SESSION"):
+        monkeypatch.delenv(name, raising=False)
+    if router_url:
+        monkeypatch.setenv("MIRA_ROUTER_ACP_URL", router_url)
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
+        reg = registry(tmp_path)
+        classifier = DecisionClassifier(reg, corpus_id=rp.CORPUS, model="test/pinned")
+        importer = RepositoryHistoryImporter(
+            reg,
+            GitReader(tmp_path / "not-a-checkout"),
+            repo=REPO,
+            access=rp.operator(),
+            classifier=classifier,
+        )
+        with pytest.raises(RuntimeError, match="router.*not configured"):
+            importer.run(apply=True)
+        assert reg.db.execute("SELECT COUNT(*) FROM registry_import_runs") == [(0,)]
+        assert classifier.stats["llm_calls"] == 0

@@ -264,6 +264,11 @@ cumulative across resumes. `errors_by_type` summarizes the full error list,
 independently of the bounded error preview. These counters do not change the
 import scope, extractor version or checkpoint identity.
 
+An apply requires an explicitly configured router URL and authentication before
+inventory or run creation. Missing configuration fails once and makes no model
+call; imports never use the provider's loopback development fallback. Dry-run
+planning remains independent of router configuration.
+
 Classification retries workstation transport outages six times with 5, 10, 20,
 30, 30 and 30 seconds of backoff. Every attempt rechecks the execution deadline
 and reduces its call timeout to the remaining budget. No backoff starts when it

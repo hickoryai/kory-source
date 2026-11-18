@@ -143,6 +143,28 @@ class DecisionClassifier:
         self.skipped: dict[str, dict] = {}
         self.provider: Any = None
         self.deadline: float | None = None
+        self.classification_outcomes: dict[str, dict] = {}
+
+    def validate_configuration(self) -> None:
+        """Imports never silently dial the provider's local-development fallback."""
+        if self._supplied_provider is not None:
+            return  # Explicit transports are supplied by tests or the caller.
+        from mira.config import load_config
+
+        config = load_config().llm
+        if not (config.router_acp_url or os.environ.get("MIRA_ROUTER_ACP_URL")):
+            raise RuntimeError(
+                "Decision classification router is not configured: an explicit "
+                "MIRA_ROUTER_ACP_URL and authorized service authentication are required; "
+                "refusing the loopback fallback"
+            )
+        if not (
+            config.router_acp_token
+            or os.environ.get("MIRA_ROUTER_ACP_TOKEN")
+            or config.router_acp_session
+            or os.environ.get("MIRA_ROUTER_ACP_SESSION")
+        ):
+            raise RuntimeError("Decision classification router authentication is not configured")
 
     def _cached(self, text: str) -> dict | None:
         rows = self.registry.db.execute(
@@ -150,7 +172,10 @@ class DecisionClassifier:
             "AND passage_sha256 = ? AND extractor_version = ? AND model = ?",
             (self.corpus_id, passage_hash(text), EXTRACTOR_VERSION, self.model),
         )
-        return json.loads(rows[0][0]) if rows else None
+        result = json.loads(rows[0][0]) if rows else None
+        if result is not None:
+            self.classification_outcomes[passage_hash(text)] = result
+        return result
 
     def pending(
         self, passages: Sequence[Passage], *, seen: set[str] | None = None
@@ -323,6 +348,7 @@ class DecisionClassifier:
                         self.registry.clock(),
                     ),
                 )
+        self.classification_outcomes.update(validated)
 
     async def _classify_batches(self, pending: list[Passage]) -> None:
         queue = deque(batches(pending, batch_size=self.batch_size, batch_chars=self.batch_chars))
@@ -376,7 +402,9 @@ class DecisionClassifier:
     def classify(self, passages: Sequence[Passage]) -> list[Candidate]:
         # Persist each batch before materialization transactions. A later failed
         # evidence write must not spend seats again on the same passages.
+        self.validate_configuration()
         self.skipped = {}
+        self.classification_outcomes = {}
         pending = self.pending(passages)
         if pending:
             _run(self._classify_batches(pending))
