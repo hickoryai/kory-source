@@ -88,7 +88,18 @@ def delete_selected(api, expected: dict[int, str], *, out=print) -> None:
         # Recheck live identity and newest status immediately before each DELETE.
         validate({ident: digest}, api.versions())
         out(f"DELETE requested version_id={ident} digest={digest}", flush=True)
-        api.api(f"{PACKAGE_API}/versions/{ident}", method="DELETE")
+        try:
+            api.api(f"{PACKAGE_API}/versions/{ident}", method="DELETE")
+        except (Refused, OSError, subprocess.TimeoutExpired) as exc:
+            # A transport error may follow a successful server-side deletion.
+            outcome = "UNKNOWN"
+            try:
+                active = any(item["id"] == ident for item in api.versions())
+                outcome = "STILL_ACTIVE" if active else "DELETED"
+            except (Refused, OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+                pass
+            out(f"{outcome} version_id={ident} digest={digest} after_request_error", flush=True)
+            raise Refused("DELETE request failed; stopping after recording its outcome") from exc
         out(f"DELETED version_id={ident} digest={digest}", flush=True)
         if any(item["id"] == ident for item in api.versions()):
             raise Refused(f"version {ident} still active after DELETE")

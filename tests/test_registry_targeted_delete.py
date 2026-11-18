@@ -122,3 +122,29 @@ def test_combined_modes_refused_before_api(monkeypatch):
     monkeypatch.setenv("CONFIRM_PACKAGE", "kory-source")
     monkeypatch.setenv("VERSION_IDS", "1,2")
     assert main() == 1
+
+
+@pytest.mark.parametrize("deleted,read_fails", [(True, False), (False, False), (False, True)])
+def test_failed_request_reconciles_and_stops(deleted, read_fails, capsys):
+    api = FakeGitHub()
+    original_read = api.versions
+
+    def fail_request(path, *, method):
+        assert path == f"{PACKAGE_API}/versions/1"
+        if deleted:
+            api.entries = [item for item in api.entries if item["id"] != 1]
+        api.deleted.append(1)
+        raise Refused("synthetic transport failure")
+
+    def read():
+        if api.deleted and read_fails:
+            raise Refused("synthetic read failure")
+        return original_read()
+
+    api.api = fail_request
+    api.versions = read
+    with pytest.raises(Refused, match="recording its outcome"):
+        delete_selected(api, {1: DIGESTS[1], 2: DIGESTS[2]})
+    assert api.deleted == [1]
+    outcome = "UNKNOWN" if read_fails else "DELETED" if deleted else "STILL_ACTIVE"
+    assert f"{outcome} version_id=1 digest={DIGESTS[1]}" in capsys.readouterr().out
