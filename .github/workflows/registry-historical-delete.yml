@@ -5,18 +5,22 @@ name: Registry historical delete
 # audit. Manual dispatch only; dispatching it, in either mode, needs a
 # maintainer's approval on the record first.
 #
-# Dry run (version_ids empty): lists the package's live visibility and every
+# Dry run (both deletion inputs empty): lists live visibility and every
 #   active version to the job summary. Deletes nothing; the token can only
 #   read packages.
-# Real run (version_ids set): requires confirm_package == kory-source and the
+# Whole-package mode (version_ids set): requires confirm_package == kory-source and the
 #   supplied version ids to EXACTLY equal the live version id set, re-read in
 #   the deleting job. Any mismatch fails before anything is deleted. On a match
 #   it deletes the whole package in one call, then checks that it is gone.
 #
-# Only the package entity is deleted, never single versions. GitHub refuses to
+# In whole-package mode only the package entity is deleted. GitHub refuses to
 # delete the last tagged version of a package on its own (it answers 400 and
 # asks for the package to be deleted instead), so deleting the package is the
 # only way to remove every version, tagged and untagged, in one step.
+#
+# Targeted mode (target_versions set): verifies every requested id/digest pair,
+# refuses newest versions and never calls the whole-package DELETE endpoint.
+# The two deletion modes cannot be combined. Both require confirm_package.
 #
 # The target is hard-coded below and is never taken from inputs or from the
 # repository context, so no other owner or package can be targeted.
@@ -38,6 +42,13 @@ on:
         type: string
       confirm_package:
         description: Type the package name (kory-source) to confirm a real run.
+        required: false
+        default: ""
+        type: string
+      target_versions:
+        description: >-
+          Targeted mode: JSON object mapping explicit version ids to expected
+          sha256 digests. Leave version_ids empty. Never deletes the whole package.
         required: false
         default: ""
         type: string
@@ -65,8 +76,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION_IDS: ${{ inputs.version_ids }}
+          TARGET_VERSIONS: ${{ inputs.target_versions }}
         run: |
           set -euo pipefail
+          if [ -n "$VERSION_IDS" ] && [ -n "$TARGET_VERSIONS" ]; then
+            echo "::error::Choose whole-package or targeted mode, never both."
+            exit 1
+          fi
           package=$(gh api "$PACKAGE_API")
           versions=$(gh api --paginate "$PACKAGE_API/versions?per_page=100" | jq -s 'add')
           {
@@ -86,15 +102,40 @@ jobs:
             echo "failed the registry history audit."
             echo
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ -z "$VERSION_IDS" ]; then
+          if [ -z "$VERSION_IDS" ] && [ -z "$TARGET_VERSIONS" ]; then
             echo "**Dry run: nothing was deleted.**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  delete-targeted:
+    needs: inventory
+    if: inputs.target_versions != '' && inputs.version_ids == ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Delete only matching historical versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION_IDS: ${{ inputs.version_ids }}
+          TARGET_VERSIONS: ${{ inputs.target_versions }}
+          CONFIRM_PACKAGE: ${{ inputs.confirm_package }}
+        run: |
+          set -euo pipefail
+          python3 -I scripts/delete_registry_versions.py | tee /tmp/targeted-delete.txt
+      - name: Record deletion receipts, including partial failures
+        if: always()
+        run: |
+          if [ -f /tmp/targeted-delete.txt ]; then
+            { echo '```'; cat /tmp/targeted-delete.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           fi
 
   delete:
     needs: inventory
-    if: inputs.version_ids != ''
+    if: inputs.version_ids != '' && inputs.target_versions == ''
     runs-on: ubuntu-latest
-    # The only job that can write packages.
+    # Legacy whole-package mode; targeted mode has a separate job above.
     permissions:
       packages: write
     steps:
