@@ -16,7 +16,15 @@ from typing import Annotated, Any, Literal
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    field_validator,
+)
 
 from mira.dashboard.api import router
 from mira.review_api import service
@@ -36,6 +44,33 @@ class SubmitReview(BaseModel):
     repo: Annotated[StrictStr, Field(pattern=_REPO.pattern)]
     pr_number: Annotated[StrictInt, Field(gt=0)]
     head_sha: Annotated[StrictStr, Field(pattern=_SHA.pattern)]
+    role: Literal["opinion", "gate"] = "opinion"
+
+
+class SubmitLocal(BaseModel):
+    """A diff the caller already has. This job never reads GitHub and never posts."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo: Annotated[StrictStr, Field(pattern=_REPO.pattern)]
+    base_sha: Annotated[StrictStr, Field(pattern=_SHA.pattern)]
+    head_sha: Annotated[StrictStr, Field(pattern=_SHA.pattern)]
+    diff: Annotated[StrictStr, Field(min_length=1, max_length=2_000_000)]
+    role: Literal["opinion", "gate"] = "opinion"
+
+    @field_validator("diff")
+    @classmethod
+    def _diff_has_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("diff is empty")
+        return value
+
+
+_SUBMIT_MESSAGE = (
+    "Body must be a pull request {repo, pr_number, head_sha} or a local snapshot "
+    "{repo, base_sha, head_sha, diff}. SHAs are 40 lowercase hex characters. "
+    "role, when set, is opinion or gate."
+)
 
 
 class WorkAnswer(BaseModel):
@@ -99,6 +134,8 @@ def _job_view(job: ReviewJob, base: str, store: ReviewJobStore | None = None) ->
         "reviewed_head_sha": job.reviewed_head_sha or None,
         "base_sha": job.base_sha or None,
         "merge_base_sha": job.merge_base_sha or None,
+        "role": job.role,
+        "local": bool(job.snapshot_diff),
         "principal": job.principal,
         "created_at": job.created_at,
         "started_at": job.started_at or None,
@@ -121,6 +158,28 @@ def _job_view(job: ReviewJob, base: str, store: ReviewJobStore | None = None) ->
     }
 
 
+def _validation_fields(exc: ValidationError) -> list[dict[str, str]]:
+    return [
+        {"field": ".".join(map(str, item["loc"])), "problem": item["msg"]} for item in exc.errors()
+    ]
+
+
+def _parse_submit(raw: Any) -> SubmitReview | SubmitLocal | JSONResponse:
+    try:
+        return SubmitReview.model_validate(raw)
+    except ValidationError as pr_error:
+        pr_fields = _validation_fields(pr_error)
+    try:
+        return SubmitLocal.model_validate(raw)
+    except ValidationError as local_error:
+        return _error(
+            422,
+            "invalid_request",
+            _SUBMIT_MESSAGE,
+            fields=pr_fields + _validation_fields(local_error),
+        )
+
+
 def _visible(request: Request, job: ReviewJob) -> bool:
     principal = _principal(request)
     if principal is not None:
@@ -134,20 +193,13 @@ async def submit_review(request: Request) -> JSONResponse:
     if principal is None:
         return _error(403, "token_required", "Submit reviews with a review API bearer token.")
     try:
-        body = SubmitReview.model_validate(await request.json())
-    except (ValidationError, ValueError) as exc:
-        detail = (
-            [{"field": ".".join(map(str, e["loc"])), "problem": e["msg"]} for e in exc.errors()]
-            if isinstance(exc, ValidationError)
-            else []
-        )
-        return _error(
-            422,
-            "invalid_request",
-            "Body must be exactly {repo, pr_number, head_sha} with a full 40-character "
-            "lowercase SHA.",
-            fields=detail,
-        )
+        raw = await request.json()
+    except ValueError:
+        return _error(422, "invalid_request", _SUBMIT_MESSAGE, fields=[])
+    parsed = _parse_submit(raw)
+    if isinstance(parsed, JSONResponse):
+        return parsed
+    body = parsed
     owner, repo = body.repo.split("/", 1)
     if not principal.allows(owner, repo):
         return _error(403, "repo_not_allowed", f"This token cannot review {body.repo}.")
@@ -160,10 +212,39 @@ async def submit_review(request: Request) -> JSONResponse:
             "Review execution is not enabled on this deployment.",
         )
 
-    existing = svc.store.find_active(principal.name, owner, repo, body.pr_number, body.head_sha)
+    pr_number = body.pr_number if isinstance(body, SubmitReview) else 0
+    existing = svc.store.find_active(principal.name, owner, repo, pr_number, body.head_sha)
     if existing is not None:
         view = _job_view(existing, _base_url(request, svc), svc.store)
         return JSONResponse(status_code=202, content={**view, "deduplicated": True})
+
+    if isinstance(body, SubmitLocal):
+        job = svc.store.create(
+            principal=principal.name,
+            owner=owner,
+            repo=repo,
+            pr_number=0,
+            head_sha=body.head_sha,
+            base_sha=body.base_sha,
+            max_queued=svc.settings.max_queued,
+            role=body.role,
+            snapshot_diff=body.diff,
+        )
+        if job is None:
+            return _error(429, "review_queue_full", "Too many reviews are queued. Retry later.")
+        svc.executor.wake()
+        logger.info(
+            "review API: %s queued local %s/%s@%s role=%s as %s",
+            principal.name,
+            owner,
+            repo,
+            body.head_sha[:12],
+            body.role,
+            job.id,
+        )
+        return JSONResponse(
+            status_code=202, content=_job_view(job, _base_url(request, svc), svc.store)
+        )
 
     try:
         reader = await svc.reader_factory(owner, repo)
@@ -192,6 +273,7 @@ async def submit_review(request: Request) -> JSONResponse:
         head_sha=body.head_sha,
         base_sha=meta.base_sha,
         max_queued=svc.settings.max_queued,
+        role=body.role,
     )
     if job is None:
         return _error(429, "review_queue_full", "Too many reviews are queued. Retry later.")
@@ -299,10 +381,16 @@ def review_report(job_id: str, request: Request) -> HTMLResponse:
     else:
         findings_html = "<ol>" + "".join(rows) + "</ol>"
     error = view["error"]
+    heading = (
+        f"{view['repo']} local snapshot review"
+        if job.pr_number == 0
+        else f"{view['repo']}#{job.pr_number} review"
+    )
     page = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Review {e(job.id)}</title></head><body>
-<h1>{e(view["repo"])}#{job.pr_number} review</h1>
+<h1>{e(heading)}</h1>
 <p>State: <b>{e(job.state)}</b> (stage {e(job.stage)})</p>
+<p>Role: {e(view["role"])}</p>
 <p>Requested head <code>{e(job.requested_head_sha)}</code>;
 reviewed head <code>{e(job.reviewed_head_sha or "-")}</code>;
 base <code>{e(job.base_sha or "-")}</code></p>

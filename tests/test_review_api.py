@@ -390,6 +390,59 @@ def test_review_succeeds_without_touching_github(env):
             assert path.endswith(f"{BASE}...{HEAD}")
 
 
+def test_local_snapshot_reviews_without_github(env):
+    diff = "diff --git a/app/handler.py b/app/handler.py\n@@ -1 +1 @@\n-old\n+new\n"
+    with _client() as client:
+        resp = client.post(
+            "/api/reviews",
+            json={
+                "repo": f"{OWNER}/{REPO}",
+                "base_sha": BASE,
+                "head_sha": HEAD,
+                "diff": diff,
+                "role": "gate",
+            },
+            headers=_auth(),
+        )
+        assert resp.status_code == 202, resp.text
+        created = resp.json()
+        assert created["pr_number"] == 0
+        assert created["local"] is True
+        assert created["role"] == "gate"
+        assert "diff" not in created
+        assert created["base_sha"] == BASE
+        done = _wait(client, created["id"])
+        assert done["state"] == "succeeded", done.get("error")
+        assert done["reviewed_head_sha"] == HEAD
+        assert done["merge_base_sha"] == BASE
+        assert done["models"]["requested"] == ["auto"]
+        report = client.get(f"/api/reviews/{created['id']}/report", headers=_auth())
+        assert report.status_code == 200
+        assert "local snapshot review" in report.text
+        assert "Role: gate" in report.text
+        assert "Nothing was posted to GitHub." in report.text
+        assert diff not in report.text
+    assert env["github"].requests == []
+    assert env["github"].writes == []
+    assert env["seat"].prompts
+    assert all(prompt.startswith("[router: skill=review-gate]\n") for prompt in env["seat"].prompts)
+
+
+def test_dashboard_model_pin_is_requested_as_auto(env):
+    env["db"].set_setting("review_model", "grok/grok-4.7")
+    env["db"].set_setting("indexing_model", "grok/grok-4.7")
+    env["db"].set_setting("security_model", "grok/grok-4.7")
+    with _client() as client:
+        done = _wait(client, _submit(client).json()["id"])
+    assert done["state"] == "succeeded", done.get("error")
+    assert done["role"] == "opinion"
+    assert done["local"] is False
+    assert done["models"]["requested"] == ["auto"]
+    assert all(
+        prompt.startswith("[router: skill=review-opinion]\n") for prompt in env["seat"].prompts
+    )
+
+
 def test_zero_findings_is_an_empty_list(env):
     env["seat"].findings = []
     with _client() as client:
@@ -836,7 +889,8 @@ def test_unanswered_work_times_out_without_findings(env, monkeypatch):
     assert {r[0] for r in rows} <= {"failed", "answered", "expired"}
 
 
-def test_pinned_model_answered_by_another_fails(env, monkeypatch):
+def test_configured_model_is_requested_as_auto(env, monkeypatch):
+    """A deployment pin must not reject the router's fallback model."""
     monkeypatch.setattr(
         mira.config,
         "_global_defaults",
@@ -848,10 +902,9 @@ def test_pinned_model_answered_by_another_fails(env, monkeypatch):
     env["seat"].actual_model = "claude/sonnet-5.5"
     with _client() as client:
         done = _wait(client, _submit(client).json()["id"])
-    assert done["state"] == "failed"
-    assert done["error"]["code"] == "model_mismatch"
-    assert done["findings"] is None
-    assert done["models"]["requested"] == ["grok/grok-4.6"]
+    assert done["state"] == "succeeded", done.get("error")
+    assert done["models"]["requested"] == ["auto"]
+    assert done["models"]["actual"] == ["claude/sonnet-5.5"]
 
 
 def test_retry_opens_a_new_work_item(env):

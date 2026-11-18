@@ -19,16 +19,14 @@ from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 from scripts.audit_public_image import scan
 
 from mira.auto_review.config import (
-    ENV_ACCOUNT,
     ENV_WORKER_HOST,
-    MODEL_NAME,
     REVIEW_EVENT,
     SECONDARY_LABEL,
     enablement_steps,
     ownership,
-    pinned_model,
     review_preamble,
     set_paused,
+    skill_line,
     trial_filter,
     trial_mira_config,
     worker_host,
@@ -59,7 +57,7 @@ HEAD = "a" * 40
 HEAD_NEXT = "b" * 40
 BASE = "c" * 40
 ROUTEABLE_ACCOUNT = "grok@" + "ab" * 16
-ROUTEABLE_MODEL = f"{ROUTEABLE_ACCOUNT}/{MODEL_NAME}"
+ROUTEABLE_MODEL = f"{ROUTEABLE_ACCOUNT}/grok-4.7"
 
 
 @pytest.fixture
@@ -67,7 +65,6 @@ def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppDatabase:
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW", raising=False)
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", raising=False)
-    monkeypatch.delenv(ENV_ACCOUNT, raising=False)
     database = AppDatabase(url="", admin_password="admin")
     monkeypatch.setattr("mira.dashboard.api._app_db", database)
     return database
@@ -81,7 +78,6 @@ def _enable(
     monkeypatch: pytest.MonkeyPatch, database: AppDatabase, installation_id: int = 42
 ) -> None:
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
-    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
     database.register_repo("hickoryai", "hickory-ai", installation_id=installation_id)
 
 
@@ -221,9 +217,13 @@ class _Engine:
         self.write = write
         self.snapshot_calls = 0
         self.pr_calls = 0
+        self.skill_line = None
         self.llm = SimpleNamespace(close_conversations=AsyncMock())
 
     async def review_snapshot(self, pr_info: PRInfo, diff_text: str, **kwargs) -> ReviewResult:
+        from mira.llm.router_acp import review_skill_line
+
+        self.skill_line = review_skill_line.get()
         self.snapshot_calls += 1
         if self.write and self.provider is not None:
             self.provider.write_attempts.append(self.write)  # type: ignore[attr-defined]
@@ -314,8 +314,9 @@ def test_enablement_steps_need_no_code_reconstruction(
     assert "KORY_SOURCE_AUTO_REVIEW" in text
     assert "KORY_SOURCE_AUTO_REVIEW_REPOS" not in text
     assert "installed on" in text
-    assert ENV_ACCOUNT in text
-    assert MODEL_NAME in text
+    assert "KORY_SOURCE_AUTO_REVIEW_ACCOUNT" not in text
+    assert "grok-4.7" not in text
+    assert "stays auto" in text
     assert "hickory" not in text.lower()
     assert "No code reconstruction" in text
     assert "branch-protection" in text
@@ -325,6 +326,10 @@ def test_enablement_steps_need_no_code_reconstruction(
     preamble = review_preamble(HEAD)
     assert preamble.startswith(f"**{SECONDARY_LABEL}**")
     assert HEAD in preamble
+    assert "Role: opinion" in preamble
+    assert "Role: gate" in review_preamble(HEAD, "gate")
+    assert skill_line("opinion") == "[router: skill=review-opinion]"
+    assert skill_line("gate") == "[router: skill=review-gate]"
 
 
 def test_flag_off_keeps_today_reviewer(db: AppDatabase, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -349,9 +354,8 @@ def test_ownership_gates(db: AppDatabase, monkeypatch: pytest.MonkeyPatch) -> No
     assert ownership(db, "acme", "widgets", 7) == "ignore"
     set_paused(db, False)
     assert ownership(db, "acme", "widgets", 7) == "enqueue"
-    monkeypatch.delenv(ENV_ACCOUNT)
-    assert ownership(db, "acme", "widgets", 7) == "ignore"
-    assert pinned_model() is None
+    monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_ACCOUNT", raising=False)
+    assert ownership(db, "acme", "widgets", 7) == "enqueue"
 
 
 async def test_webhook_enqueues_one_row_and_skips_legacy_handler(
@@ -543,6 +547,7 @@ def test_existing_table_gains_the_interruption_column(db: AppDatabase) -> None:
     _store(db)
     conn = db._sqlite_conn
     assert conn is not None
+    conn.execute("ALTER TABLE auto_review_requests DROP COLUMN role")
     conn.execute("ALTER TABLE auto_review_requests DROP COLUMN interrupt_count")
     conn.commit()
     store = _store(db)
@@ -558,6 +563,7 @@ def test_existing_table_gains_the_interruption_column(db: AppDatabase) -> None:
     job = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
     assert job is not None
     assert job.interrupt_count == 0
+    assert job.role == "opinion"
 
 
 def test_third_interruption_skips_the_head(db: AppDatabase) -> None:
@@ -743,27 +749,17 @@ def test_running_head_is_not_cancelled_and_one_newer_head_waits(db: AppDatabase)
     assert store.get(first_wait.id).state == "superseded"
 
 
-def test_pinned_model_rejects_substitution(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert pinned_model() is None
-    for value in (
-        "auto",
-        "",
-        "grok@AUTO",
-        "claude@" + "ab" * 16,
-        "grok@" + "AB" * 16,
-        "grok@" + "ab" * 15,
-        f"{ROUTEABLE_ACCOUNT}/other-model",
-        "grok@59aa6fc18f3f4b929dd9d59a6f3bfc11/grok-4.7",
-    ):
-        monkeypatch.setenv(ENV_ACCOUNT, value)
-        assert pinned_model() is None
-    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
-    assert pinned_model() == ROUTEABLE_MODEL
+def test_trial_config_stays_unpinned_without_an_account(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_ACCOUNT", raising=False)
+    config = trial_mira_config()
+    assert config.llm.model == "auto"
+    assert config.llm.review_model == "auto"
+    assert config.llm.indexing_model == "auto"
+    assert config.llm.security_model == "auto"
     compiled = "\n".join(path.read_text() for path in Path("src/mira/auto_review").rglob("*.py"))
     assert "59aa6fc18f3f4b929dd9d59a6f3bfc11" not in compiled
-    monkeypatch.delenv(ENV_ACCOUNT)
-    with pytest.raises(RuntimeError, match=MODEL_NAME):
-        trial_mira_config()
+    with pytest.raises(ValueError, match="unknown review role"):
+        skill_line("other")
 
 
 def test_trial_filter_is_fixed_and_ignores_dashboard_overrides(
@@ -774,13 +770,11 @@ def test_trial_filter_is_fixed_and_ignores_dashboard_overrides(
     )
     loaded = load_config()
     assert loaded.filter.max_comments == 50
-    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
     trial = trial_mira_config()
     assert trial.filter.confidence_threshold == 0.7
     assert trial.filter.max_comments == 5
     assert trial.filter.min_severity == "suggestion"
-    assert trial.llm.model == ROUTEABLE_MODEL
-    assert trial.llm.model.endswith(f"/{MODEL_NAME}")
+    assert trial.llm.model == "auto"
     assert trial.llm.router_acp_conversations is True
     assert trial.llm.router_acp_timeout_seconds == 1800
     assert trial.review.agentic_tools is True
@@ -826,7 +820,6 @@ def test_build_trial_engine_does_not_load_dashboard_config(
         raise AssertionError("load_config called")
 
     monkeypatch.setattr("mira.config.load_config", _boom)
-    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
     engine = build_trial_engine(provider=MagicMock(), transport=AsyncMock())
     assert isinstance(engine, ReviewEngine)
     assert engine.dry_run is True
@@ -835,7 +828,7 @@ def test_build_trial_engine_does_not_load_dashboard_config(
     assert engine.config.review.agentic_tools is True
     assert engine.config.llm.router_acp_conversations is True
     assert engine.config.llm.router_acp_timeout_seconds == 1800
-    assert engine.config.llm.model == ROUTEABLE_MODEL
+    assert engine.config.llm.model == "auto"
     assert engine.llm.config.router_acp_conversations is True
     assert engine.llm is engine.indexing_llm
     assert engine.llm is engine.security_llm
@@ -871,7 +864,6 @@ async def test_registry_context_skips_registry_hooks(
     monkeypatch.setattr("mira.registry.prompt.with_registry_tool", _wrap)
     monkeypatch.setattr("mira.core.engine.agentic_review_loop", _loop)
     monkeypatch.setattr("mira.core.engine.build_code_context", _context)
-    monkeypatch.setenv(ENV_ACCOUNT, ROUTEABLE_ACCOUNT)
 
     config = trial_mira_config()
     config.review.security_pass = False
@@ -937,8 +929,13 @@ async def test_execute_posts_frozen_sha_once(
     assert poster.calls == [HEAD]
     assert poster.bot_name == "kory-source"
     assert HEAD in poster.review_body
+    assert "Role: opinion" in poster.review_body
     assert SECONDARY_LABEL in poster.review_body
     assert poster.comment_prefix.startswith(f"**{SECONDARY_LABEL}**")
+    assert engine.skill_line == "[router: skill=review-opinion]"
+    from mira.llm.router_acp import review_skill_line
+
+    assert review_skill_line.get() is None
     posted = store.get(job.id)
     assert posted is not None
     assert posted.state == "posted"

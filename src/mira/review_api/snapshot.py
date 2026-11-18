@@ -243,10 +243,71 @@ class SnapshotReader:
         return entries
 
 
-class ReadOnlySnapshotProvider(BaseProvider):
-    """Engine-facing provider for one frozen snapshot. Reads only."""
+def changed_paths_from_diff(diff: str) -> list[str]:
+    """Paths named by ``diff --git`` lines. The ``b/`` prefix is removed."""
+    paths: list[str] = []
+    for line in diff.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        path = _diff_b_path(line[len("diff --git ") :])
+        if path and path not in paths:
+            paths.append(path)
+    return paths
 
-    def __init__(self, reader: SnapshotReader, snapshot: FrozenSnapshot) -> None:  # type: ignore[override]
+
+def _diff_b_path(rest: str) -> str:
+    if rest.startswith('"'):
+        end = rest.find('" ', 1)
+        if end < 0:
+            return ""
+        second = rest[end + 2 :]
+        if len(second) >= 2 and second[0] == '"' and second[-1] == '"':
+            second = second[1:-1]
+    else:
+        parts = rest.split(" ")
+        second = parts[-1] if parts else ""
+    if second.startswith("b/"):
+        return second[2:]
+    return ""
+
+
+def local_snapshot(
+    owner: str, repo: str, base_sha: str, head_sha: str, diff: str
+) -> FrozenSnapshot:
+    """A snapshot the caller already captured. It does not read GitHub."""
+    paths = changed_paths_from_diff(diff)
+    meta = PullMeta(
+        owner=owner,
+        repo=repo,
+        number=0,
+        title="",
+        description="",
+        state="local",
+        head_sha=head_sha,
+        head_ref="",
+        head_repo="",
+        base_sha=base_sha,
+        base_ref="",
+        url="",
+        author="",
+        changed_files=len(paths),
+    )
+    return FrozenSnapshot(
+        meta=meta,
+        merge_base_sha=base_sha,
+        diff_text=diff,
+        changed_paths=paths,
+    )
+
+
+class ReadOnlySnapshotProvider(BaseProvider):
+    """Engine-facing provider for one frozen snapshot. Reads only.
+
+    A local snapshot has no reader. File content and history are empty, and
+    the tree is the changed paths in the diff. Writes still raise.
+    """
+
+    def __init__(self, reader: SnapshotReader | None, snapshot: FrozenSnapshot) -> None:  # type: ignore[override]
         self._reader = reader
         self._snapshot = snapshot
         self.write_attempts: list[str] = []
@@ -267,14 +328,20 @@ class ReadOnlySnapshotProvider(BaseProvider):
         return self._snapshot.meta.description
 
     async def get_file_content(self, pr_info: PRInfo, path: str, ref: str) -> str:
+        if self._reader is None:
+            return ""
         return await self._reader.file_content(path, self._snapshot.meta.head_sha)
 
     async def get_repo_tree(self, pr_info: PRInfo, ref: str) -> list[str]:
+        if self._reader is None:
+            return list(self._snapshot.changed_paths)
         return await self._reader.tree(self._snapshot.meta.head_sha)
 
     async def get_file_history(
         self, pr_info: PRInfo, paths: list[str], max_per_file: int = 5
     ) -> dict[str, list[FileHistoryEntry]]:
+        if self._reader is None:
+            return {}
         out: dict[str, list[FileHistoryEntry]] = {}
         for path in paths:
             hist = await self._reader.history(path, self._snapshot.meta.head_sha, max_per_file)

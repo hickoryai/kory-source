@@ -10,14 +10,12 @@ Nothing here turns the flag on.
 from __future__ import annotations
 
 import os
-import re
 from typing import Any
 
 from mira.config import FilterConfig, LLMConfig, MiraConfig, OverlapConfig, ReviewConfig
 
 ENV_FLAG = "KORY_SOURCE_AUTO_REVIEW"
 ENV_TOKEN = "KORY_SOURCE_AUTO_REVIEW_TOKEN"
-ENV_ACCOUNT = "KORY_SOURCE_AUTO_REVIEW_ACCOUNT"
 ENV_SOURCE_URL = "KORY_SOURCE_URL"
 ENV_WORKER_HOST = "KORY_SOURCE_WORKER_HOST"
 PAUSE_SETTING = "auto_review_paused"
@@ -25,10 +23,9 @@ PAUSE_SETTING = "auto_review_paused"
 # No organization default. Deployments name the seat-worker machine at runtime.
 GENERIC_WORKER_HOST = "the workstation with the logged-in router account pool"
 
-# The model stays this name. The account id is local to the worker's router
-# and is supplied at enablement. Nothing here fills in another account or model.
-MODEL_NAME = "grok-4.7"
-_ACCOUNT = re.compile(r"grok@[0-9a-f]{32}\Z")
+# The request stays unpinned. The router selects the seat from the skill line.
+DEFAULT_ROLE = "opinion"
+ROLE_SKILL = {"opinion": "review-opinion", "gate": "review-gate"}
 CALL_TIMEOUT_SECONDS = 1800
 REVIEW_EVENT = "COMMENT"
 SECONDARY_LABEL = "Kory Source (secondary reviewer)"
@@ -65,11 +62,9 @@ def enablement_steps() -> tuple[str, ...]:
         "Install the GitHub App on the repositories Kory should review. "
         "The installation is the scope: Kory reviews every repository the App "
         "is installed on.",
-        "On the Kory Source service set KORY_SOURCE_AUTO_REVIEW=1, "
-        "KORY_SOURCE_AUTO_REVIEW_TOKEN to a shared secret, and "
-        "KORY_SOURCE_AUTO_REVIEW_ACCOUNT to the routeable grok@ account on the "
-        "worker host. The model is grok-4.7. An unset account does not select "
-        "another model. Restart the service.",
+        "On the Kory Source service set KORY_SOURCE_AUTO_REVIEW=1 and "
+        "KORY_SOURCE_AUTO_REVIEW_TOKEN to a shared secret. The review request "
+        "stays auto. The router picks the seat. Restart the service.",
         f"On {place} start the seat worker with KORY_SOURCE_AUTO_REVIEW=1, the same "
         "token, KORY_SOURCE_URL pointing at the service, and the local relay "
         "credentials. Run `python -m mira.auto_review.worker`. A worker outage "
@@ -97,18 +92,6 @@ def flag_on() -> bool:
     return os.environ.get(ENV_FLAG) == "1"
 
 
-def pinned_model() -> str | None:
-    """The one review model, or None when the account is not configured.
-
-    The value is ``grok@<32 hex>/<MODEL_NAME>``. ``auto``, a different model,
-    and a missing account all return None. This does not substitute another id.
-    """
-    account = os.environ.get(ENV_ACCOUNT, "").strip()
-    if _ACCOUNT.fullmatch(account) is None:
-        return None
-    return f"{account}/{MODEL_NAME}"
-
-
 def paused(db: Any) -> bool:
     try:
         return db.get_setting(PAUSE_SETTING) == "1"
@@ -133,20 +116,15 @@ def trial_mira_config() -> MiraConfig:
     """Engine settings for one frozen head.
 
     Built here, not via ``load_config()``, so a dashboard override cannot
-    lower the floor, raise the cap, or turn nitpicks back on. Refuses to build
-    a config when the account env does not name a grok account.
+    lower the floor, raise the cap, or turn nitpicks back on. The model stays
+    ``auto`` so the router can fall through the skill route.
     """
-    model = pinned_model()
-    if model is None:
-        raise RuntimeError(
-            f"{ENV_ACCOUNT} must be a grok@ account id. The model stays {MODEL_NAME}."
-        )
     llm = LLMConfig(
         provider="router-acp",
-        model=model,
-        review_model=model,
-        indexing_model=model,
-        security_model=model,
+        model="auto",
+        review_model="auto",
+        indexing_model="auto",
+        security_model="auto",
         router_acp_conversations=True,
         router_acp_timeout_seconds=CALL_TIMEOUT_SECONDS,
         router_acp_priority="review",
@@ -164,38 +142,46 @@ def ownership(db: Any, owner: str, repo: str, installation_id: int) -> str | Non
 
     ``None`` means the flag is off, so today's webhook reviewer runs.
     ``enqueue`` queues one secondary review and must not call that reviewer.
-    ``ignore`` means the flag is on, but the pause bit or the account does
-    not allow a review, so neither reviewer runs. The GitHub App installation
-    is the scope: ``owner``, ``repo``, and ``installation_id`` are not a filter.
+    ``ignore`` means the flag is on and the pause bit is set, so neither
+    reviewer runs. The GitHub App installation is the scope: ``owner``,
+    ``repo``, and ``installation_id`` are not a filter.
     """
     del owner, repo, installation_id
     if not flag_on():
         return None
-    if paused(db) or pinned_model() is None:
+    if paused(db):
         return "ignore"
     return "enqueue"
 
 
-def review_preamble(head_sha: str) -> str:
-    return f"**{SECONDARY_LABEL}**\n\nReviewed head `{head_sha}`"
+def skill_line(role: str) -> str:
+    """One stripped router directive for this role. The model does not see it."""
+    skill = ROLE_SKILL.get(role)
+    if skill is None:
+        raise ValueError(f"unknown review role {role!r}")
+    return f"[router: skill={skill}]"
+
+
+def review_preamble(head_sha: str, role: str = DEFAULT_ROLE) -> str:
+    if role not in ROLE_SKILL:
+        raise ValueError(f"unknown review role {role!r}")
+    return f"**{SECONDARY_LABEL}**\n\nReviewed head `{head_sha}`\nRole: {role}"
 
 
 def switch_view(db: Any) -> dict[str, Any]:
     """Admin view of the env and pause gate.
 
     ``effective`` is that gate. While the flag is on, each delivery from an
-    installed repository is queued unless this view says it is paused or the
-    account is unset.
+    installed repository is queued unless this view says it is paused.
     """
     enabled = flag_on()
     is_paused = paused(db)
-    model = pinned_model()
     return {
         "env_enabled": enabled,
         "paused": is_paused,
-        "effective": enabled and not is_paused and model is not None,
+        "effective": enabled and not is_paused,
         "worker_host": worker_host(),
-        "model": model,
+        "model": "auto",
         "timeout_seconds": CALL_TIMEOUT_SECONDS,
         "review_event": REVIEW_EVENT,
         "conversations": True,
