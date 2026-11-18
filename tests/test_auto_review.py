@@ -223,7 +223,7 @@ class _Engine:
         self.pr_calls = 0
         self.llm = SimpleNamespace(close_conversations=AsyncMock())
 
-    async def review_snapshot(self, pr_info: PRInfo, diff_text: str) -> ReviewResult:
+    async def review_snapshot(self, pr_info: PRInfo, diff_text: str, **kwargs) -> ReviewResult:
         self.snapshot_calls += 1
         if self.write and self.provider is not None:
             self.provider.write_attempts.append(self.write)  # type: ignore[attr-defined]
@@ -247,6 +247,7 @@ class _Poster:
         commit_sha: str | None = None,
         review_body: str | None = None,
         comment_prefix: str | None = None,
+        require_current_head: bool = False,
     ) -> list[int]:
         self.calls.append(commit_sha or "")
         self.last_review_id = 77
@@ -283,7 +284,13 @@ async def _run(
         return await post_if_current(store_arg, request_id, poster, pr_info, result, head_sha)
 
     async def _reader(_owner: str, _repo: str, _installation: int) -> object:
-        return SimpleNamespace()
+        queued = store.get_by_head(job.owner, job.repo, job.pr_number, HEAD_NEXT)
+        snapshot = _frozen(HEAD_NEXT if queued and queued.state == "queued" else job.head_sha)
+        return SimpleNamespace(
+            get_pull=AsyncMock(return_value=snapshot.meta),
+            freeze=AsyncMock(return_value=snapshot),
+            incremental=AsyncMock(return_value=snapshot),
+        )
 
     await execute_request(store, job, _reader, engine_factory=factory, poster=_post)
     engine.seen = seen  # type: ignore[attr-defined]
@@ -949,7 +956,7 @@ async def test_execute_posts_frozen_sha_once(
     assert poster.calls == [HEAD]
 
 
-async def test_execute_posts_running_head_and_skips_paused_or_writes(
+async def test_execute_advances_running_head_and_skips_paused_or_writes(
     db: AppDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = _store(db)
@@ -964,13 +971,10 @@ async def test_execute_posts_running_head_and_skips_paused_or_writes(
         installation_id=42,
     )
     engine, poster = await _run(store, job, monkeypatch)
-    assert engine.snapshot_calls == 1
-    assert poster.calls == [HEAD]
-    posted = store.get(job.id)
-    assert posted is not None
-    assert posted.state == "posted"
-    assert posted.head_sha == HEAD
-    assert store.get(newer.id).state == "queued"
+    assert engine.snapshot_calls == 2
+    assert poster.calls == [HEAD_NEXT]
+    assert store.get(job.id).state == "superseded"
+    assert store.get(newer.id).state == "posted"
     _drain(store)
 
     current = _running(store, sha=HEAD, number=10)
@@ -1232,7 +1236,7 @@ async def test_executor_runs_bounded_reviews_and_cancels_all_on_stop(
     cancelled: list[str] = []
     full = asyncio.Event()
 
-    async def execute(store, job, reader_factory):
+    async def execute(store, job, reader_factory, **_kwargs):
         started.append(job.id)
         if len(started) == 3:
             full.set()
@@ -1280,7 +1284,7 @@ async def test_executor_refills_after_one_review_finishes(
     full = asyncio.Event()
     refilled = asyncio.Event()
 
-    async def execute(store, job, reader_factory):
+    async def execute(store, job, reader_factory, **_kwargs):
         started.append(job.id)
         if len(started) == 2:
             full.set()

@@ -24,6 +24,7 @@ from mira.auto_review.config import (
     paused,
     trial_mira_config,
 )
+from mira.auto_review.incremental import carry_findings
 from mira.auto_review.poster import post_if_current
 from mira.auto_review.store import AutoReviewRequest, AutoReviewStore, AutoReviewWork
 from mira.review_api.snapshot import (
@@ -43,6 +44,9 @@ LEASE_SECONDS = 120.0
 ROLLOUT_GRACE_SECONDS = 60.0
 DEADLINE_SECONDS = 3 * 60 * 60
 POLL_SECONDS = 2.0
+POST_RETRY_MAX_ATTEMPTS = 5
+POST_RETRY_TIMEOUT_SECONDS = 60.0
+POST_RETRY_BACKOFF_SECONDS = 2.0
 
 ReaderFactory = Callable[[str, str, int], Awaitable[SnapshotReader]]
 _executor: AutoReviewExecutor | None = None
@@ -172,6 +176,7 @@ async def execute_request(
     *,
     engine_factory: Callable[..., Any] = build_trial_engine,
     poster: Callable[..., Any] | None = None,
+    on_request_changed: Callable[[AutoReviewRequest], None] | None = None,
 ) -> None:
     """Review one running head and post it only if that head is still current."""
     current = store.get(req.id)
@@ -194,39 +199,132 @@ async def execute_request(
         fresh = store.get(req.id)
         if fresh is None or fresh.state != "running":
             return
-        provider = ReadOnlySnapshotProvider(reader, snapshot)
-        engine = engine_factory(provider, seat_transport(store, req.id))
-        # Round 1, full diff, no GitHub writes, no in-place walkthrough edit.
-        result = await engine.review_snapshot(snapshot.pr_info(), snapshot.diff_text)
-        if provider.write_attempts:
-            store.mark_skipped(
-                req.id,
-                "write_blocked",
-                "review tried to write to GitHub: " + ", ".join(provider.write_attempts),
+        from mira.core.engine import _restrict_diff_to_paths
+
+        result = None
+        carried = None
+        diff_text = snapshot.diff_text
+        while True:
+            provider = ReadOnlySnapshotProvider(reader, snapshot)
+            engine = engine_factory(provider, seat_transport(store, req.id))
+            kwargs: dict[str, Any] = (
+                {"previous_result": carried, "full_diff_text": snapshot.diff_text}
+                if carried is not None
+                else {}
             )
-            return
-        fresh = store.get(req.id)
-        if fresh is None or fresh.state != "running":
-            return
-        # Pause stops a review that has not posted yet. No code change required.
-        if paused(store._db):
-            store.mark_skipped(
-                req.id,
-                "paused",
-                "auto review was paused before this head posted",
-            )
-            return
-        if poster is None:
-            await post_if_current(
-                store,
-                req.id,
-                _posting_provider(req),
-                snapshot.pr_info(),
-                result,
-                req.head_sha,
-            )
-        else:
-            await poster(store, req.id, snapshot.pr_info(), result, req.head_sha)
+            result = await engine.review_snapshot(snapshot.pr_info(), diff_text, **kwargs)
+            if provider.write_attempts:
+                store.mark_skipped(
+                    req.id,
+                    "write_blocked",
+                    "review tried to write to GitHub: " + ", ".join(provider.write_attempts),
+                )
+                return
+            # Close before checking the head: cleanup can itself take a seat call.
+            await _close_seats(engine)
+            engine = None
+            posting_deadline = time.monotonic() + POST_RETRY_TIMEOUT_SECONDS
+            advanced = False
+            for attempt in range(POST_RETRY_MAX_ATTEMPTS):
+                fresh = store.get(req.id)
+                if fresh is None or fresh.state != "running":
+                    return
+                if fresh.posted_review_id == "pending":
+                    # The previous write may have reached GitHub before its
+                    # process died. Clear the reservation without resubmitting.
+                    store.mark_skipped(
+                        req.id,
+                        "post_reservation_unknown",
+                        "Posting reservation has no recorded outcome; not resubmitting an uncertain write",
+                    )
+                    return
+                if attempt:
+                    remaining = posting_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(
+                        min(POST_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1), remaining)
+                    )
+                if time.monotonic() >= posting_deadline:
+                    break
+                if paused(store._db):
+                    store.mark_skipped(req.id, "paused", "auto review was paused before posting")
+                    return
+                meta = await reader.get_pull(req.pr_number)
+                if meta.head_sha != snapshot.meta.head_sha:
+                    latest = await reader.freeze(meta)
+                    store.enqueue(
+                        platform=req.platform,
+                        owner=req.owner,
+                        repo=req.repo,
+                        pr_number=req.pr_number,
+                        head_sha=meta.head_sha,
+                        base_sha=meta.base_sha,
+                        installation_id=req.installation_id,
+                        title=meta.title,
+                    )
+                    carried = None
+                    diff_text = latest.diff_text
+                    try:
+                        delta = await reader.incremental(meta, snapshot.meta.head_sha)
+                        carried = carry_findings(result, delta.diff_text, set(latest.changed_paths))
+                        diff_text = _restrict_diff_to_paths(
+                            delta.diff_text, set(latest.changed_paths)
+                        )
+                    except SnapshotError as exc:
+                        logger.info(
+                            "auto review full fallback request=%s reason=%s", req.id, exc.code
+                        )
+                    next_req = store.advance(req.id, meta.head_sha)
+                    if next_req is None:
+                        # Another push can supersede the captured target while
+                        # its diff is being fetched. Keep the finished result
+                        # and compare directly to the next live head instead.
+                        continue
+                    logger.info(
+                        "auto review advanced request=%s head=%s next_request=%s next_head=%s incremental=%s",
+                        req.id,
+                        snapshot.meta.head_sha,
+                        next_req.id,
+                        meta.head_sha,
+                        carried is not None,
+                    )
+                    req = next_req
+                    if on_request_changed is not None:
+                        on_request_changed(req)
+                    snapshot = latest
+                    advanced = True
+                    break
+                store.supersede_queued_except(fresh, meta.head_sha)
+                if poster is None:
+                    posted = await post_if_current(
+                        store,
+                        req.id,
+                        _posting_provider(req),
+                        snapshot.pr_info(),
+                        result,
+                        snapshot.meta.head_sha,
+                    )
+                else:
+                    posted = await poster(
+                        store,
+                        req.id,
+                        snapshot.pr_info(),
+                        result,
+                        snapshot.meta.head_sha,
+                    )
+                if posted is not None:
+                    return
+                # Re-read after backoff if a push raced posting preparation.
+                # The attempt and wall-clock budgets also cover failed adoption.
+            if not advanced:
+                store.mark_skipped(
+                    req.id,
+                    "post_retry_exhausted",
+                    f"Posting or head adoption refused within {POST_RETRY_MAX_ATTEMPTS} attempts "
+                    f"or {POST_RETRY_TIMEOUT_SECONDS:g}s budget",
+                )
+                return
     except asyncio.CancelledError:
         store.requeue_unposted(req.id)
         raise
@@ -337,6 +435,10 @@ class AutoReviewExecutor:
                 raise
 
     async def _run(self, job: AutoReviewRequest) -> None:
+        def request_changed(request: AutoReviewRequest) -> None:
+            nonlocal job
+            job = request
+
         async def heartbeat() -> None:
             while True:
                 await asyncio.sleep(max(1.0, LEASE_SECONDS / 3))
@@ -346,7 +448,9 @@ class AutoReviewExecutor:
         pulse = asyncio.create_task(heartbeat())
         try:
             await asyncio.wait_for(
-                execute_request(self.store, job, self.reader_factory),
+                execute_request(
+                    self.store, job, self.reader_factory, on_request_changed=request_changed
+                ),
                 timeout=DEADLINE_SECONDS,
             )
         except TimeoutError:

@@ -69,3 +69,7 @@ class ProviderError(MiraError):
 
 class WebhookError(MiraError):
     """Error processing a webhook event."""
+
+
+class StaleReviewError(ProviderError):
+    """The frozen review head changed before its GitHub write."""

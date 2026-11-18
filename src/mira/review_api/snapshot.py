@@ -199,6 +199,17 @@ class SnapshotReader:
             unavailable_paths=unavailable,
         )
 
+    async def incremental(self, meta: PullMeta, previous_sha: str) -> FrozenSnapshot:
+        """Compare descendant heads. A rewritten history requires a full review."""
+        from dataclasses import replace
+
+        delta = await self.freeze(replace(meta, base_sha=previous_sha, changed_files=0))
+        if delta.merge_base_sha != previous_sha or delta.unavailable_paths:
+            raise SnapshotError(
+                "incremental_unavailable", "Commit delta is not complete and linear"
+            )
+        return delta
+
     async def file_content(self, path: str, ref: str) -> str:
         resp = await self._get(f"/contents/{path}", params={"ref": ref})
         if resp.status_code >= 400:

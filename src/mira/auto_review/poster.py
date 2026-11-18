@@ -11,6 +11,7 @@ import logging
 
 from mira.auto_review.config import REVIEW_EVENT, review_preamble
 from mira.auto_review.store import AutoReviewStore
+from mira.exceptions import StaleReviewError
 from mira.models import PRInfo, ReviewResult
 from mira.providers.formatting import format_key_issues
 
@@ -48,6 +49,7 @@ async def post_secondary_review(
         commit_sha=head_sha,
         review_body=_review_body(result, head_sha),
         comment_prefix=preamble,
+        require_current_head=True,
     )
     _ = review_id_list
     return int(getattr(provider, "last_review_id", 0) or 0)
@@ -89,9 +91,14 @@ async def post_if_current(
         return int(existing.posted_review_id or 0)
     if not store.begin_post(request_id):
         return None
-    result.actual_models = actual_models_from_work(store, request_id)
+    result.actual_models = list(
+        dict.fromkeys(result.actual_models + actual_models_from_work(store, request_id))
+    )
     try:
         review_id = await post_secondary_review(provider, pr_info, result, head_sha)
+    except StaleReviewError:
+        store.cancel_post(request_id)
+        return None
     except Exception as exc:
         store.mark_skipped(request_id, "post_failed", str(exc))
         raise
