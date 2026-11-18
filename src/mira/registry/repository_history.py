@@ -875,6 +875,7 @@ class RepositoryHistoryImporter:
             extractor_version=decision_llm.EXTRACTOR_VERSION,
             extractor_model=self.classifier.model,
         )
+        self.classifier.import_run_id = run["run_id"]
         done = set((run["checkpoint"] or {}).get("done") or [])
         coverage_before = Counter(run["coverage"])
         errors: list[str] = []

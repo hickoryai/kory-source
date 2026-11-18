@@ -29,6 +29,7 @@ NEW_TABLES = (
     "registry_corpus_policy",
     "registry_corpus_members",
     "registry_decision_classifications",
+    "registry_import_work",
 )
 
 

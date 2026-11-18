@@ -143,10 +143,21 @@ class DecisionClassifier:
         self.skipped: dict[str, dict] = {}
         self.provider: Any = None
         self.deadline: float | None = None
+        self.import_run_id: str | None = None
+        self.worker_transport = (
+            os.environ.get("REGISTRY_EXTRACTION_TRANSPORT", "router") == "worker"
+        )
         self.classification_outcomes: dict[str, dict] = {}
 
     def validate_configuration(self) -> None:
         """Imports never silently dial the provider's local-development fallback."""
+        if self.worker_transport:
+            from mira.registry.access import operator_context, require_import
+
+            policy = require_import(operator_context())
+            if policy.corpus_id != self.corpus_id:
+                raise RuntimeError("classification worker corpus mismatch")
+            return
         if self._supplied_provider is not None:
             return  # Explicit transports are supplied by tests or the caller.
         from mira.config import load_config
@@ -235,6 +246,19 @@ class DecisionClassifier:
                 "relay": supplied._relay,
             }
         )
+        if self.worker_transport:
+            from mira.registry.import_work import ImportWorkStore
+
+            if not self.import_run_id:
+                raise RuntimeError("classification worker requires an import run")
+            kwargs.update(
+                {
+                    "transport": ImportWorkStore(self.registry).transport(
+                        self.import_run_id, self.corpus_id, lambda: self.deadline
+                    ),
+                    "relay": False,
+                }
+            )
         provider = RequiredTracingProvider(config, **kwargs)
         # Retain this inspection hook for existing callers, but never reuse it
         # for a later completion.

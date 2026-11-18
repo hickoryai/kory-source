@@ -43,6 +43,14 @@ def _store() -> AutoReviewStore:
     return AutoReviewStore(_db())
 
 
+def _import_store():
+    from mira.registry import get_registry
+    from mira.registry.import_work import ImportWorkStore
+
+    registry = get_registry()
+    return ImportWorkStore(registry) if registry is not None else None
+
+
 def _error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": {"code": code, "message": message}})
 
@@ -85,13 +93,22 @@ async def post_switch(request: Request) -> JSONResponse:
 
 @router.get("/work")
 def poll_work(
-    request: Request, exclude: Annotated[list[str] | None, Query(max_length=20)] = None
+    request: Request,
+    exclude: Annotated[list[str] | None, Query(max_length=20)] = None,
+    import_capacity: Annotated[int, Query(ge=0, le=1)] = 0,
 ) -> Response:
     """The seat worker's next relay body, or 204 when there is nothing to run."""
     if not getattr(request.state, "auto_review_worker", False):
         return _error(401, "worker_token_required", "The seat worker token is required.")
     work = _store().next_pending(tuple(exclude or ()))
     if work is None:
+        # Old workers never receive import envelopes. Never skip review work
+        # merely because that worker already has it in flight.
+        if import_capacity and _store().next_pending() is None:
+            imports = _import_store()
+            item = imports.claim() if imports is not None else None
+            if item is not None:
+                return JSONResponse(item)
         return Response(status_code=204)
     return JSONResponse(
         {
@@ -111,8 +128,10 @@ async def answer_work(work_id: str, request: Request) -> JSONResponse:
     if not getattr(request.state, "auto_review_worker", False):
         return _error(401, "worker_token_required", "The seat worker token is required.")
     store = _store()
-    work = store.get_work(work_id)
-    if work is None:
+    imports = _import_store() if work_id.startswith("iw_") else None
+    is_import = imports is not None
+    work = None if is_import else store.get_work(work_id)
+    if work is None and not is_import:
         return _error(404, "work_not_found", "No such work item.")
     try:
         raw = await request.json()
@@ -124,13 +143,19 @@ async def answer_work(work_id: str, request: Request) -> JSONResponse:
         code = str(raw.get("error") or "")
         if code not in WORK_ERRORS:
             return _error(422, "invalid_request", "Unknown work error.")
-        accepted = store.answer_work(
-            work_id,
-            actual_model=str(raw.get("actual_model") or "unknown"),
-            error_code=code,
+        accepted = (
+            imports.answer(
+                work_id, {"error": code, "actual_model": str(raw.get("actual_model") or "unknown")}
+            )
+            if is_import
+            else store.answer_work(
+                work_id,
+                actual_model=str(raw.get("actual_model") or "unknown"),
+                error_code=code,
+            )
         )
         content: dict[str, Any] = {"work_id": work_id, "state": "failed", "error": code}
-    elif work.is_close or raw.get("state") == "closed":
+    elif not is_import and (work.is_close or raw.get("state") == "closed"):
         accepted = store.answer_work(work_id, state=str(raw.get("state") or "closed"))
         content = {"work_id": work_id, "state": "answered"}
     else:
@@ -151,10 +176,16 @@ async def answer_work(work_id: str, request: Request) -> JSONResponse:
         conversation = raw.get("conversation")
         if conversation is not None and not isinstance(conversation, dict):
             return _error(422, "invalid_request", "conversation must be an object.")
-        accepted = store.answer_work(
-            work_id, text=text, actual_model=actual, conversation=conversation
+        accepted = (
+            imports.answer(work_id, {"text": text, "actual_model": actual})
+            if is_import
+            else store.answer_work(
+                work_id, text=text, actual_model=actual, conversation=conversation
+            )
         )
         content = {"work_id": work_id, "state": "answered"}
     if not accepted:
         return _error(409, "work_not_pending", "This work item is no longer waiting for an answer.")
+    if is_import:
+        content["state"] = imports.get(work_id.partition(":")[0])["state"]
     return JSONResponse(content)
