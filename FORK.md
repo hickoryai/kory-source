@@ -201,12 +201,17 @@ follow-up gives them one.
 
 ## Release workflow (HAI-12329)
 
-`.github/workflows/release.yml` gates the image on an inline `tests` job
-that runs plain `uv run pytest` on Python 3.12 (installing the `dev`,
-`serve`, and `bedrock` extras, as CI does). Pyproject `addopts`
-deselects the `eval` and `benchmark` markers, so the gate needs no provider
-API key, no `production` environment, and no inherited secrets. A
-`vX.Y.Z` tag pushes `ghcr.io/hickoryai/kory-source:X.Y.Z` and `:X.Y`.
+`release-preflight.yml` is a main-only manual, read-only gate. It tests and
+audits source, effective context, a wheel and its metadata, frontend assets,
+the complete tagged/untagged package history, and every layer/config/history
+of one Docker-save candidate. It retains that tar, manifest, checksums, wheel,
+and audit inventory as an Actions artifact. `release.yml` is also main-only
+and manual: after the protected `release` environment records a maintainer's
+version-specific approval, it validates the selected successful preflight run
+and artifact against current main, loads that exact tar without rebuilding it,
+pushes `X.Y.Z` and `X.Y`, then creates the `vX.Y.Z` tag. Configure required
+maintainers on the `release` environment; a workflow input is only a binding
+to the approved version, not substitute authority.
 
 `evals.yml` and `release-beta.yml` are unchanged: beta tags (`v*-beta*`)
 still call `evals.yml` and still need `OPENROUTER_API_KEY` in the

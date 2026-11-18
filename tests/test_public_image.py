@@ -80,24 +80,20 @@ def test_current_build_inputs():
     assert audit_source(Path(__file__).resolve().parents[1]) == []
 
 
-def test_release_build_omits_attestations_and_still_audits_layers():
-    """The candidate layer audit stays after the local build and before push.
-
-    Provenance and SBOM stay off on that build. Those blobs are not layers of
-    the candidate this step audits.
-    """
+def test_release_only_pushes_the_retained_preflight_candidate():
+    """Stable releases cannot rebuild or use an arbitrary run artifact."""
     root = Path(__file__).resolve().parents[1]
-    text = (root / ".github/workflows/release.yml").read_text()
-    build_at = text.index("name: Build candidate locally")
-    audit_name = "name: Audit every candidate layer before pushing the same image"
-    audit_at = text.index(audit_name)
-    script = "python3 scripts/audit_public_image.py --image /tmp/candidate.tar"
-    script_at = text.index(script)
-    push_at = text.index('docker push "$tag"')
-    build = text[build_at:audit_at]
-    assert "provenance: false" in build
-    assert "sbom: false" in build
-    assert build_at < audit_at < script_at < push_at
+    release = (root / ".github/workflows/release.yml").read_text()
+    preflight = (root / ".github/workflows/release-preflight.yml").read_text()
+    assert "docker build" not in release
+    assert "actions/download-artifact@v8" in release
+    assert "scripts/release_candidate.py validate" in release
+    assert 'git push origin "refs/tags/$VERSION"' in release
+    assert release.index("scripts/release_candidate.py validate") < release.index("docker load")
+    assert "docker build" in preflight
+    assert "audit_registry_history.py" in preflight
+    assert "docker save" in preflight
+    assert "actions/upload-artifact@v7" in preflight
 
 
 def test_indexing_requires_explicit_repository():
