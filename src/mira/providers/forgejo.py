@@ -33,8 +33,24 @@ from mira.models import (
 from mira.platforms import profiles
 from mira.providers.base import BaseProvider
 from mira.providers.formatting import format_comment_body, format_key_issues
+from mira.providers.review_classification import (
+    classify_review_comment,
+    is_own_review,
+)
 
 logger = logging.getLogger(__name__)
+
+_AGREEMENT_REPLY = re.compile(
+    r"^\s*(?:agreed|agree|good catch|fixed|addressed|done|makes sense)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_clear_agreement_reply(body: str) -> bool:
+    return bool(_AGREEMENT_REPLY.match(body or "")) and not re.search(
+        r"\b(?:not|no|disagree|but|however|wrong|incorrect)\b", body or "", re.IGNORECASE
+    )
+
 
 # https://forgejo.example.com/owner/repo/pulls/123
 _PR_URL_PATTERN = re.compile(
@@ -490,21 +506,70 @@ class ForgejoProvider(BaseProvider):
 
         return None
 
-    async def get_human_review_comments(
+    async def get_review_comments(
         self, pr_info: PRInfo, bot_login: str
     ) -> list[HumanReviewComment]:
-        bot_identities = {n for n in (await self._self_username(), bot_login) if n}
+        own_login = await self._self_username()
         out: list[HumanReviewComment] = []
 
         try:
-            async for review, comment in self._iter_review_comments(pr_info):
-                review_user = (review.get("user") or {}).get("username", "")
-                if review_user in bot_identities:
-                    continue
+            raw_comments: list[dict[str, Any]] = []
+            async for _review, comment in self._iter_review_comments(pr_info):
+                raw_comments.append(comment)
+            by_id = {
+                comment.get("id"): comment
+                for comment in raw_comments
+                if comment.get("id") is not None
+            }
+            acted_ids: set[Any] = set()
+            for reply in raw_comments:
+                nested_parent = reply.get("reply_to") or reply.get("parent") or {}
+                parent_id = next(
+                    (
+                        value
+                        for value in (
+                            reply.get("in_reply_to_id"),
+                            reply.get("reply_to_id"),
+                            reply.get("parent_id"),
+                            nested_parent.get("id")
+                            if isinstance(nested_parent, dict)
+                            else nested_parent,
+                        )
+                        if value is not None
+                    ),
+                    None,
+                )
+                parent = by_id.get(parent_id)
+                reply_user = reply.get("user") or {}
+                parent_user = (parent or {}).get("user") or {}
+                if (
+                    parent
+                    and classify_review_comment(
+                        parent_user.get("username", ""),
+                        parent.get("body") or "",
+                        account_type=(
+                            "Bot" if parent_user.get("is_bot") else parent_user.get("type", "")
+                        ),
+                        bot_login=bot_login,
+                    )
+                    == "bot_review"
+                    and not is_own_review(reply_user.get("username", ""), own_login)
+                    and classify_review_comment(
+                        reply_user.get("username", ""),
+                        reply.get("body") or "",
+                        account_type=(
+                            "Bot" if reply_user.get("is_bot") else reply_user.get("type", "")
+                        ),
+                        bot_login=bot_login,
+                    )
+                    == "human_review"
+                    and _is_clear_agreement_reply(reply.get("body") or "")
+                ):
+                    acted_ids.add(parent_id)
 
-                comment_user = (comment.get("user") or {}).get("username", "")
-                if comment_user in bot_identities:
-                    continue
+            for comment in raw_comments:
+                comment_user_data = comment.get("user") or {}
+                comment_user = comment_user_data.get("username", "")
 
                 line = comment.get("new_position") or comment.get("line") or 0
                 out.append(
@@ -513,12 +578,35 @@ class ForgejoProvider(BaseProvider):
                         line=int(line),
                         body=comment.get("body") or "",
                         author=comment_user,
+                        account_type=(
+                            "Bot"
+                            if comment_user_data.get("is_bot")
+                            else comment_user_data.get("type", "")
+                        ),
+                        own_comment=(
+                            is_own_review(comment_user, bot_login)
+                            or is_own_review(comment_user, own_login)
+                        ),
+                        human_acted=comment.get("id") in acted_ids,
                     )
                 )
         except Exception as e:
             raise ProviderError(f"Failed to fetch reviews for human comments: {e}") from e
 
         return out
+
+    async def get_human_review_comments(
+        self, pr_info: PRInfo, bot_login: str
+    ) -> list[HumanReviewComment]:
+        return [
+            comment
+            for comment in await self.get_review_comments(pr_info, bot_login)
+            if not comment.own_comment
+            and classify_review_comment(
+                comment.author, comment.body, account_type=comment.account_type, bot_login=bot_login
+            )
+            == "human_review"
+        ]
 
     # ── labels ──────────────────────────────────────────────────────
 

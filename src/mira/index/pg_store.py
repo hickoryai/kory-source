@@ -231,6 +231,9 @@ CREATE TABLE IF NOT EXISTS feedback_events (
     signal TEXT NOT NULL DEFAULT '',
     actor TEXT NOT NULL DEFAULT '',
     pr_author TEXT NOT NULL DEFAULT '',
+    account_type TEXT NOT NULL DEFAULT '',
+    own_comment INTEGER NOT NULL DEFAULT 0,
+    human_acted INTEGER NOT NULL DEFAULT 0,
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
 
@@ -246,6 +249,11 @@ CREATE TABLE IF NOT EXISTS learned_rules (
     active INTEGER NOT NULL DEFAULT 1,
     status TEXT NOT NULL DEFAULT 'approved',
     created_by TEXT NOT NULL DEFAULT '',
+    confidence DOUBLE PRECISION NOT NULL DEFAULT 1,
+    original_confidence DOUBLE PRECISION,
+    provenance TEXT NOT NULL DEFAULT '',
+    source_event_ids TEXT NOT NULL DEFAULT '[]',
+    suppressed INTEGER NOT NULL DEFAULT 0,
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0
 );
@@ -329,6 +337,14 @@ def _get_conn(url: str) -> Any:
                     "ALTER TABLE feedback_events ADD COLUMN IF NOT EXISTS pr_author "
                     "TEXT NOT NULL DEFAULT ''"
                 )
+                for col, definition in (
+                    ("account_type", "TEXT NOT NULL DEFAULT ''"),
+                    ("own_comment", "INTEGER NOT NULL DEFAULT 0"),
+                    ("human_acted", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    cur.execute(
+                        f"ALTER TABLE feedback_events ADD COLUMN IF NOT EXISTS {col} {definition}"
+                    )
                 cur.execute(
                     "ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS status "
                     "TEXT NOT NULL DEFAULT 'approved'"
@@ -337,6 +353,16 @@ def _get_conn(url: str) -> Any:
                     "ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS created_by "
                     "TEXT NOT NULL DEFAULT ''"
                 )
+                for col, definition in (
+                    ("confidence", "DOUBLE PRECISION NOT NULL DEFAULT 1"),
+                    ("original_confidence", "DOUBLE PRECISION"),
+                    ("provenance", "TEXT NOT NULL DEFAULT ''"),
+                    ("source_event_ids", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("suppressed", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    cur.execute(
+                        f"ALTER TABLE learned_rules ADD COLUMN IF NOT EXISTS {col} {definition}"
+                    )
                 for col in (
                     "qualified_name",
                     "body_fingerprint",
@@ -1442,6 +1468,9 @@ class PgIndexStore(_StoreSharedMixin):
                 e["signal"],
                 e["actor"],
                 e.get("pr_author", ""),
+                e.get("account_type", ""),
+                int(e.get("own_comment", False)),
+                int(e.get("human_acted", False)),
                 now,
             )
             for e in events
@@ -1451,21 +1480,26 @@ class PgIndexStore(_StoreSharedMixin):
                 "INSERT INTO feedback_events "
                 "(owner, repo, pr_number, pr_url, comment_path, comment_line, "
                 "comment_category, comment_severity, comment_title, signal, actor, pr_author, "
-                "created_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "account_type, own_comment, human_acted, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 rows,
             )
         self._commit()
         return len(rows)
 
-    def list_feedback(self, limit: int = 500) -> list[FeedbackEventRow]:
-        rows = self._fetchall(
+    def list_feedback(self, limit: int | None = 500) -> list[FeedbackEventRow]:
+        query = (
             "SELECT id, pr_number, pr_url, comment_path, comment_line, "
-            "comment_category, comment_severity, comment_title, signal, actor, created_at "
+            "comment_category, comment_severity, comment_title, signal, actor, pr_author, "
+            "account_type, own_comment, human_acted, created_at "
             "FROM feedback_events WHERE owner=%s AND repo=%s "
-            "ORDER BY created_at DESC LIMIT %s",
-            (self._owner, self._repo, limit),
+            "ORDER BY created_at DESC"
         )
+        params: tuple = (self._owner, self._repo)
+        if limit is not None:
+            query += " LIMIT %s"
+            params += (limit,)
+        rows = self._fetchall(query, params)
         return [
             FeedbackEventRow(
                 id=r[0],
@@ -1478,10 +1512,34 @@ class PgIndexStore(_StoreSharedMixin):
                 comment_title=r[7],
                 signal=r[8],
                 actor=r[9],
-                created_at=r[10],
+                pr_author=r[10],
+                account_type=r[11],
+                own_comment=bool(r[12]),
+                human_acted=bool(r[13]),
+                created_at=r[14],
             )
             for r in rows
         ]
+
+    def list_all_feedback(self) -> list[FeedbackEventRow]:
+        """Return all feedback events for this repository."""
+        return self.list_feedback(limit=None)
+
+    def reclassify_feedback(
+        self,
+        event_id: int,
+        *,
+        signal: str,
+        comment_category: str,
+        own_comment: bool = False,
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE feedback_events SET signal=%s, comment_category=%s, own_comment=%s "
+                "WHERE id=%s AND owner=%s AND repo=%s",
+                (signal, comment_category, int(own_comment), event_id, self._owner, self._repo),
+            )
+        self._commit()
 
     def get_feedback_stats(self) -> dict:
         rows = self._fetchall(
@@ -1569,7 +1627,8 @@ class PgIndexStore(_StoreSharedMixin):
 
     _LR_COLS = (
         "id, rule_text, source_signal, category, path_pattern, "
-        "sample_count, active, status, created_by, created_at, updated_at"
+        "sample_count, active, status, created_by, confidence, original_confidence, "
+        "provenance, source_event_ids, suppressed, created_at, updated_at"
     )
 
     def _row_to_learned_rule(self, r: tuple) -> LearnedRuleRow:
@@ -1583,15 +1642,20 @@ class PgIndexStore(_StoreSharedMixin):
             active=bool(r[6]),
             status=r[7],
             created_by=r[8],
-            created_at=r[9],
-            updated_at=r[10],
+            confidence=r[9],
+            original_confidence=r[10],
+            provenance=r[11],
+            source_event_ids=json.loads(r[12]),
+            suppressed=bool(r[13]),
+            created_at=r[14],
+            updated_at=r[15],
         )
 
     def list_active_learned_rules(self) -> list[LearnedRuleRow]:
         rows = self._fetchall(
             f"SELECT {self._LR_COLS} FROM learned_rules "
-            "WHERE owner=%s AND repo=%s AND active=1 AND status='approved' "
-            "ORDER BY sample_count DESC",
+            "WHERE owner=%s AND repo=%s AND active=1 AND status='approved' AND suppressed=0 "
+            "ORDER BY confidence DESC, sample_count DESC",
             (self._owner, self._repo),
         )
         return [self._row_to_learned_rule(r) for r in rows]
@@ -1679,6 +1743,35 @@ class PgIndexStore(_StoreSharedMixin):
                 "UPDATE learned_rules SET active=%s, updated_at=%s "
                 "WHERE id=%s AND owner=%s AND repo=%s",
                 (int(active), time.time(), rule_id, self._owner, self._repo),
+            )
+        self._commit()
+
+    def set_learned_rule_evidence(
+        self,
+        rule_id: int,
+        *,
+        confidence: float,
+        source_event_ids: list[int],
+        provenance: str = "",
+        suppressed: bool = False,
+        original_confidence: float | None = None,
+    ) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE learned_rules SET confidence=%s, source_event_ids=%s, provenance=%s, "
+                "suppressed=%s, original_confidence=COALESCE(original_confidence, %s), "
+                "updated_at=%s WHERE id=%s AND owner=%s AND repo=%s",
+                (
+                    confidence,
+                    json.dumps(source_event_ids),
+                    provenance,
+                    int(suppressed),
+                    original_confidence,
+                    time.time(),
+                    rule_id,
+                    self._owner,
+                    self._repo,
+                ),
             )
         self._commit()
 

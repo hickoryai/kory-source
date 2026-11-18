@@ -10,7 +10,7 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from mira.exceptions import ConfigError
 
@@ -369,6 +369,27 @@ class IndexConfig(BaseModel):
     max_file_size: int = Field(default=1024 * 1024, ge=0)
 
 
+class FeedbackConfig(BaseModel):
+    known_ai_reviewers: list[str] = Field(
+        default_factory=lambda: [
+            "greptile-apps",
+            "copilot-pull-request-reviewer",
+            "claude",
+            "coderabbitai",
+            "kory-source",
+        ]
+    )
+    human_weight: float = Field(default=1.0, gt=0, le=1)
+    bot_weight: float = Field(default=0.1, ge=0, le=1)
+    acted_bot_weight: float = Field(default=0.5, ge=0, le=1)
+
+    @model_validator(mode="after")
+    def ordered_weights(self) -> FeedbackConfig:
+        if not self.bot_weight < self.acted_bot_weight < self.human_weight:
+            raise ValueError("weights must satisfy bot_weight < acted_bot_weight < human_weight")
+        return self
+
+
 class ProviderConfig(BaseModel):
     type: str = "github"
 
@@ -381,6 +402,7 @@ class DatabaseConfig(BaseModel):
 
 
 class MiraConfig(BaseModel):
+    feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filter: FilterConfig = Field(default_factory=FilterConfig)
     commands: CommandsConfig = Field(default_factory=CommandsConfig)

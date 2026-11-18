@@ -17,6 +17,14 @@ from typing import Any
 
 SCHEMA = [
     """
+    CREATE TABLE IF NOT EXISTS registry_learned_rule_weights (
+        object_id TEXT PRIMARY KEY,
+        weight DOUBLE PRECISION NOT NULL DEFAULT 1,
+        provenance TEXT NOT NULL DEFAULT '',
+        source_event_ids TEXT NOT NULL DEFAULT '[]'
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS registry_objects (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,

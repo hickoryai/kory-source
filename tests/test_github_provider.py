@@ -1806,3 +1806,40 @@ class TestPRDescription:
             pytest.raises(ProviderError, match="Failed to fetch PR description"),
         ):
             await provider.get_pr_description(_make_pr_info())
+
+
+class TestActedBotReviewEvidence:
+    @pytest.mark.asyncio
+    async def test_only_explicit_human_resolver_marks_thread_comments(self):
+        provider = GitHubProvider.__new__(GitHubProvider)
+
+        async def graphql(_query, _variables):
+            return {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [
+                                {
+                                    "isResolved": True,
+                                    "resolvedBy": {"login": "dev", "__typename": "User"},
+                                    "comments": {"nodes": [{"databaseId": 10}]},
+                                },
+                                {
+                                    "isResolved": True,
+                                    "resolvedBy": {"login": "other[bot]", "__typename": "Bot"},
+                                    "comments": {"nodes": [{"databaseId": 11}]},
+                                },
+                                {
+                                    "isResolved": True,
+                                    "resolvedBy": None,
+                                    "comments": {"nodes": [{"databaseId": 12}]},
+                                },
+                            ],
+                        }
+                    }
+                }
+            }
+
+        provider._graphql_request = graphql
+        assert await provider._human_resolved_comment_ids(_make_pr_info(), "review-bot") == {10}

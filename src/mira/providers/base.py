@@ -134,6 +134,12 @@ class BaseProvider(abc.ABC):
         """Non-bot line-level review comments, for merge-time learning."""
         return []
 
+    async def get_review_comments(
+        self, pr_info: PRInfo, bot_login: str
+    ) -> list[HumanReviewComment]:
+        """All line-level review comments, including bots, for audit."""
+        return await self.get_human_review_comments(pr_info, bot_login)
+
     async def get_repo_tree(self, pr_info: PRInfo, ref: str) -> list[str]:
         """Every file path in the repo at a ref, for JIT cross-file context."""
         return []
