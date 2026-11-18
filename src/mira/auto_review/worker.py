@@ -84,21 +84,24 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=httpx.Timeout(CALL_TIMEOUT, connect=10.0))
     active: dict[str, asyncio.Task[None]] = {}
+    import_ids: set[str] = set()
     try:
         while True:
             try:
                 for work_id, task in list(active.items()):
                     if task.done():
                         del active[work_id]
+                        import_ids.discard(work_id)
                         try:
                             task.result()
                         except Exception:
                             logger.exception("seat work %s failed", work_id)
-                if len(active) < limit:
+                if len(active) - len(import_ids) < limit:
                     response = await http.get(
                         f"{source}/api/auto-review/work",
                         headers=_source_headers(),
-                        params=[("exclude", work_id) for work_id in active],
+                        params=[("exclude", work_id) for work_id in active]
+                        + [("import_capacity", "0" if import_ids else "1")],
                     )
                     if response.status_code != 204:
                         response.raise_for_status()
@@ -107,6 +110,8 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
                         # Also safe during a rolling upgrade with an old service
                         # that ignores the exclusion query parameter.
                         if work_id not in active:
+                            if item.get("kind") == "corpus_import":
+                                import_ids.add(work_id)
                             logger.info(
                                 "auto review work received request=%s work=%s queue_wait_seconds=%.3f active=%d",
                                 item.get("request_id"),

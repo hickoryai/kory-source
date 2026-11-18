@@ -292,3 +292,37 @@ cold-cache seat work from source/Git processing time: the initial backfill can
 require many bounded executions, whereas unchanged passages require no further
 model calls. A bounded sample is not a complete history inventory or permission
 to run a shared-environment import.
+
+
+### Classification through the existing seat worker
+
+Set `REGISTRY_EXTRACTION_TRANSPORT=worker` on the import job to use its existing
+registry database connection instead of a direct relay credential. The default
+remains the configured direct router transport. The worker mode does not need a
+relay URL, a new secret, or a new IAM grant on the job. It still constructs the
+strictly traced classifier provider and requires its tracer to be available.
+
+Migration `003_import_work.sql` adds the additive classification queue. Each
+batch binds a corpus, live policy hash, admitted repository import run, operator,
+model, and deadline. Polls and answers recheck admission. The worker bearer still
+has access only to the existing work routes, not corpus read or enqueue APIs.
+Removing admission prevents both fetching prompts and submitting results.
+
+Updated workers advertise `import_capacity=1` only while they have no import
+batch in flight. Old workers receive review work only. The service always
+returns pending review work first, including work excluded because it is already
+in flight, before considering an import. Imports have one global in-flight
+lease and do not consume the worker's configured review concurrency. An import
+already forwarded to the relay is not preempted when a review arrives.
+
+A timed-out lease or worker-reported timeout requeues the batch once. The second
+timeout records a visible terminal failure. Attempt-specific work ids reject
+late answers from the first attempt. The import deadline bounds queue waiting
+and retries. If no worker claims the batch, the import reports
+`no_worker_before_deadline`. Cancelling a waiter expires its pending work.
+
+The seat worker runs from its own installed checkout. Deploying the service image
+does not update that process. Update the worker checkout and restart only its
+worker service through the deployment's supported operator mechanism before the
+first apply. A relay restart is unnecessary. Keep the apply held when no supported
+worker update mechanism is available.
