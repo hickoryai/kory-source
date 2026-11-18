@@ -15,6 +15,22 @@ from typing import Any
 from mira.registry.access import AccessDenied, current_policy, operator_context, require_import
 
 POLL_SECONDS = 0.5
+_DETAIL_CHARS = 500
+
+
+def _worker_detail(raw: str | None) -> str:
+    try:
+        body = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    detail = body.get("detail")
+    if not isinstance(detail, str):
+        return ""
+    return " ".join(detail.split())[:_DETAIL_CHARS]
+
+
 _COLUMNS = (
     "id",
     "run_id",
@@ -248,9 +264,13 @@ class ImportWorkStore:
                         return json.loads(row["result_json"])
                     if row["state"] == "failed":
                         # Queue exhaustion is terminal, not a classifier split/retry.
-                        raise RouterTransportError(
-                            f"import worker: {row['error_code']}", kind="router_failed"
-                        )
+                        # workstation_outage stays failed. Only a timeout answer is requeued.
+                        code = row["error_code"] or "router_failed"
+                        detail = _worker_detail(row.get("result_json"))
+                        message = f"import worker: {code}"
+                        if detail:
+                            message = f"{message}: {detail}"
+                        raise RouterTransportError(message, kind="router_failed")
                     await asyncio.sleep(POLL_SECONDS)
             finally:
                 self.db.execute(

@@ -127,6 +127,89 @@ def test_worker_reported_timeout_requeues_only_once(queue):
     assert store.get(work_id)["state"] == "failed"
 
 
+def test_workstation_outage_is_not_requeued(queue):
+    store, _ = queue
+    work_id = enqueue(queue)
+    detail = "relay connection reset by peer"
+    assert store.answer(
+        store.claim()["work_id"],
+        {"error": "workstation_outage", "detail": detail, "actual_model": "unknown"},
+    )
+    row = store.get(work_id)
+    assert row["state"] == "failed"
+    assert row["error_code"] == "workstation_outage"
+    assert json.loads(row["result_json"])["detail"] == detail
+    assert store.claim() is None
+
+
+async def test_worker_outage_detail_reaches_the_waiter(queue, monkeypatch):
+    monkeypatch.setattr("mira.registry.import_work.POLL_SECONDS", 0.01)
+    store, run = queue
+    detail = "relay connection reset by peer"
+    transport = store.transport(run["run_id"], rp.CORPUS, lambda: time.monotonic() + 30)
+
+    async def answer():
+        for _ in range(100):
+            item = store.claim()
+            if item:
+                assert store.answer(
+                    item["work_id"],
+                    {"error": "workstation_outage", "detail": detail, "actual_model": "unknown"},
+                )
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail("import work was not enqueued")
+
+    waiter = asyncio.create_task(answer())
+    with pytest.raises(RouterTransportError) as caught:
+        await transport(
+            {"body": {"prompt": "x", "model": "grok-4.7", "timeout_seconds": 10}, "timeout": 10}
+        )
+    await waiter
+    assert caught.value.kind == "router_failed"
+    assert "import worker: workstation_outage" in str(caught.value)
+    assert detail in str(caught.value)
+
+
+async def test_complete_item_keeps_http_and_transport_detail():
+    from mira.auto_review.worker import _complete_item
+
+    async def recorded(fail):
+        captured = {}
+
+        def handle(request):
+            if request.url.path.endswith("llm-complete"):
+                return fail()
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={})
+
+        item = {"work_id": "iw_detail:1", "body": {"prompt": "classify"}, "timeout_seconds": 10}
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            await _complete_item(client, "https://source.test", "https://relay.test", item)
+        return captured["body"]
+
+    def connect_error():
+        raise httpx.ConnectError("relay connection reset by peer")
+
+    transport_body = await recorded(connect_error)
+    assert transport_body["error"] == "workstation_outage"
+    assert transport_body["detail"] == "ConnectError: relay connection reset by peer"
+
+    def http_error():
+        return httpx.Response(
+            503,
+            json={
+                "state": "workstation_outage",
+                "error": "workstation_outage",
+                "detail": "relay connection reset by peer",
+            },
+        )
+
+    http_body = await recorded(http_error)
+    assert http_body["error"] == "workstation_outage"
+    assert http_body["detail"] == "http 503: relay connection reset by peer"
+
+
 async def test_no_worker_deadline_is_visible(queue):
     store, run = queue
     transport = store.transport(run["run_id"], rp.CORPUS, lambda: time.monotonic() - 1)

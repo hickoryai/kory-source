@@ -69,8 +69,10 @@ def _record_error(errors: list[str], message: str) -> None:
 
 def _error_preview(errors: list[str]) -> dict[str, Any]:
     def kind(message):
-        if "Router workstation outage" in message:
-            return "router_outage"
+        if "workstation_outage" in message or "Router workstation outage" in message:
+            return "workstation_outage"
+        if "no_worker_before_deadline" in message:
+            return "no_worker_before_deadline"
         if "time budget reached" in message:
             return "time_budget"
         if "git " in message and " failed:" in message:
@@ -91,6 +93,10 @@ def _error_preview(errors: list[str]) -> dict[str, Any]:
 SOURCE_SYSTEM = "git"
 IMPORTER = "kory-source.repository-history"
 IMPORTER_VERSION = "5"
+# A group is the most a killed process can drop. The following unit pages
+# commit the cursor, so earlier groups stay finished.
+_GROUP_PASSAGES = 32
+_GROUP_FILES = 8
 _READ_ONLY = {"log", "show", "ls-tree", "rev-parse", "cat-file", "diff", "blame"}
 _MARKDOWN = (".md", ".mdx", ".markdown")
 # Comment syntax per language. Anything else is reported as unsupported.
@@ -755,10 +761,14 @@ class RepositoryHistoryImporter:
         classifier: Any = None,
         paths: list[str] | None = None,
         max_seconds: float = 0,
+        max_units: int = 0,
     ) -> None:
         if max_seconds < 0:
             raise ValueError("max_seconds must be nonnegative")
+        if max_units < 0:
+            raise ValueError("max_units must be nonnegative (0 means no unit cap)")
         self.max_seconds = max_seconds
+        self.max_units = max_units
         self.paths = sorted(set(paths or []))
         self.classifier = classifier
         self.registry = registry
@@ -789,6 +799,7 @@ class RepositoryHistoryImporter:
         selected, skipped = inventory(self.reader, frozen, paths=self.paths)
         self.classifier.deadline = started_run + self.max_seconds if self.max_seconds else None
         stats_before = Counter(getattr(self.classifier, "stats", {}))
+        self._stats_flushed = Counter(stats_before)
         if self.classifier.corpus_id != policy.corpus_id:
             raise AccessDenied("classifier cache belongs to another corpus")
         if not apply:
@@ -879,7 +890,9 @@ class RepositoryHistoryImporter:
         done = set((run["checkpoint"] or {}).get("done") or [])
         coverage_before = Counter(run["coverage"])
         errors: list[str] = []
+        units_read: Counter[str] = Counter()
         units = selected + [("log", "")]
+        stop = False
         for group in self._prepared_groups(frozen, units, done, errors):
             prepared = [revision for _, _, revisions, _ in group for revision in revisions]
             for kind, _, revisions, _ in group:
@@ -888,6 +901,7 @@ class RepositoryHistoryImporter:
                 classified, estimates = self._classify_prepared(prepared, apply=True)
             except (RuntimeError, ValueError) as exc:
                 _record_error(errors, f"classification group: {exc}")
+                self._flush_stats(run)
                 continue
             finally:
                 # Finished batches are cached even if a sibling batch failed.
@@ -913,6 +927,8 @@ class RepositoryHistoryImporter:
                 run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
                 try:
                     with self.runs.page(run, self.access) as counts:
+                        counts.update(self._stat_delta())
+                        counts[f"units_read_{kind}"] += 1
                         counts.update(observations)
                         for sha, old_path, text, commit, candidates in kept:
                             if kind == "log":
@@ -931,26 +947,43 @@ class RepositoryHistoryImporter:
                                     identity=identity,
                                     candidates=candidates,
                                 )
+                    self._mark_stats_flushed()
+                    units_read[kind] += 1
+                    if self.max_units and sum(units_read.values()) >= self.max_units:
+                        stop = True
+                        break
                 except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
                     done.discard(key)
                     run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
                     _record_error(errors, f"{key}: {exc}")
+            if stop:
+                break
+        llm_calls_delta = (
+            Counter(getattr(self.classifier, "stats", {}))["llm_calls"] - stats_before["llm_calls"]
+        )
+        batch = {
+            "units_read": dict(units_read),
+            "llm_calls_delta": llm_calls_delta,
+            "errors_by_type": _error_preview(errors)["errors_by_type"],
+        }
         with self.runs.page(run, self.access) as counts:
+            counts.update(self._stat_delta())
             counts.update(self.attempt_estimates)
             for kind, stages in self.stages.items():
                 counts.update({f"{kind}_passages_{stage}": n for stage, n in stages.items()})
-            counts.update(Counter(getattr(self.classifier, "stats", {})) - stats_before)
-            if not (run.get("checkpoint") or {}).get("skips_recorded"):
+            checkpoint = dict(run.get("checkpoint") or {})
+            if not checkpoint.get("skips_recorded"):
                 counts["excluded_scope"] += sum(skipped.values())
                 counts.update({f"skipped_{key}": value for key, value in skipped.items()})
-                run["next_checkpoint"] = {
-                    **(run.get("checkpoint") or {}),
-                    "done": sorted(done),
-                    "skips_recorded": True,
-                }
+                checkpoint["skips_recorded"] = True
+            checkpoint["done"] = sorted(done)
+            checkpoint["last_batch"] = batch
+            run["next_checkpoint"] = checkpoint
+        self._mark_stats_flushed()
+        remaining = any(f"{kind}:{path}" not in done for kind, path in units)
         final = self.runs.finish(
             run,
-            complete=self.max_commits == 0 and not self.paths,
+            complete=(not remaining) and self.max_commits == 0 and not self.paths,
             errors=errors,
             unknown_totals=(["history_before_max_commits"] if self.max_commits else [])
             + (["unselected_paths"] if self.paths else []),
@@ -964,6 +997,15 @@ class RepositoryHistoryImporter:
                 watermark=watermark,
                 cursor=frozen,
             )
+        logger.info(
+            "repository history batch run_id=%s status=%s units_read=%s "
+            "llm_calls_delta=%s errors_by_type=%s",
+            final["run_id"],
+            final["status"],
+            dict(units_read),
+            llm_calls_delta,
+            batch["errors_by_type"],
+        )
         return {
             "run_id": final["run_id"],
             "status": final["status"],
@@ -993,8 +1035,28 @@ class RepositoryHistoryImporter:
                 }
                 for kind, stages in self.stages.items()
             },
+            "units_read": dict(units_read),
+            "llm_calls_delta": llm_calls_delta,
             **_error_preview(errors),
         }
+
+    def _stat_delta(self) -> Counter[str]:
+        current = Counter(getattr(self.classifier, "stats", {}) or {})
+        return Counter(
+            {key: value for key, value in (current - self._stats_flushed).items() if value > 0}
+        )
+
+    def _mark_stats_flushed(self) -> None:
+        self._stats_flushed = Counter(getattr(self.classifier, "stats", {}) or {})
+
+    def _flush_stats(self, run: dict) -> None:
+        """Commit classifier counters that a failed group would otherwise drop."""
+        delta = self._stat_delta()
+        if not delta:
+            return
+        with self.runs.page(run, self.access) as counts:
+            counts.update(delta)
+        self._mark_stats_flushed()
 
     def _git_attrs(self, eid: str, commit: dict) -> list[attr.Attribution]:
         found = attr.markers(commit.get("message") or "")
@@ -1118,7 +1180,7 @@ class RepositoryHistoryImporter:
         return result, observations
 
     def _prepared_groups(self, frozen, units, done, errors):
-        """Bound source-memory lookahead while packing small files together."""
+        """Pack a short wave, then let the caller checkpoint it."""
         group, count, chars = [], 0, 0
         for number, (kind, path) in enumerate(units, 1):
             key = f"{kind}:{path}"
@@ -1139,7 +1201,7 @@ class RepositoryHistoryImporter:
             group.append((kind, path, prepared, observations))
             count += sum(len(passages) for _, _, _, _, passages in prepared)
             chars += sum(len(text) for _, _, text, _, _ in prepared)
-            if count >= 512 or len(group) >= 256 or chars >= 8 * 1024 * 1024:
+            if count >= _GROUP_PASSAGES or len(group) >= _GROUP_FILES or chars >= 8 * 1024 * 1024:
                 yield group
                 group, count, chars = [], 0, 0
         if group:
@@ -1345,6 +1407,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         help="Optional run budget; incomplete apply runs resume",
     )
+    parser.add_argument(
+        "--max-units",
+        type=int,
+        default=0,
+        help="Stop after this many stored units; 0 means no unit cap. An unfinished apply resumes.",
+    )
     parser.add_argument("--path", action="append", help="Limit to a file or directory; repeatable")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
@@ -1364,6 +1432,7 @@ def main(argv: list[str] | None = None) -> int:
         max_commits=args.max_commits,
         paths=args.path,
         max_seconds=args.max_seconds,
+        max_units=args.max_units,
     ).run(apply=args.apply)
     json.dump(out, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")

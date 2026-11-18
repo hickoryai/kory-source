@@ -30,6 +30,17 @@ from mira.auto_review.config import (
 logger = logging.getLogger(__name__)
 
 POLL_SECONDS = 2.0
+_DETAIL_CHARS = 500
+
+
+def _detail_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:_DETAIL_CHARS]
+
+
+def _failure_detail(*parts: str) -> str:
+    return ": ".join(part for part in parts if part)[:_DETAIL_CHARS]
 
 
 def _source_url() -> str:
@@ -181,12 +192,16 @@ async def _complete_item(
             http, source, item["work_id"], {"error": "timeout", "actual_model": "unknown"}
         )
         return
-    except httpx.TransportError:
+    except httpx.TransportError as exc:
         await _answer(
             http,
             source,
             item["work_id"],
-            {"error": "workstation_outage", "actual_model": "unknown"},
+            {
+                "error": "workstation_outage",
+                "actual_model": "unknown",
+                "detail": _failure_detail(type(exc).__name__, str(exc)),
+            },
         )
         return
     payload: dict[str, Any]
@@ -202,11 +217,21 @@ async def _complete_item(
             if kind in {"seat_exhausted", "workstation_outage", "model_mismatch", "timeout"}
             else "workstation_outage"
         )
+        specific = ""
+        for key in ("detail", "error", "message"):
+            candidate = _detail_text(payload.get(key))
+            if candidate and candidate not in {error, "workstation outage", "workstation_outage"}:
+                specific = candidate
+                break
         await _answer(
             http,
             source,
             item["work_id"],
-            {"error": error, "actual_model": str(payload.get("actual_model") or "unknown")},
+            {
+                "error": error,
+                "actual_model": str(payload.get("actual_model") or "unknown"),
+                "detail": _failure_detail(f"http {relay_response.status_code}", specific),
+            },
         )
         return
     if body.get("close"):
