@@ -252,6 +252,34 @@ a file page has not materialized. Resuming the same scope skips completed pages
 and classifications. Path-filtered and positive-commit-limit runs remain
 incomplete and never advance the full repository cursor.
 
+Each apply prints `per_source` counts for the current execution attempt:
+`nominated`, `grouped`, `classified_ok`, `classified_failed`, `classified_skipped`,
+`stored` (accepted passages written with evidence, including replays), and
+`stored_evidence` (new immutable source revisions). Classification counts include
+cached outcomes. A failed group can contain completed cached batches, but none
+of that group's file pages are stored until classification succeeds on resume.
+Failed groups retain their nomination estimates in coverage. `slice_coverage`
+reports this execution's increments, including `llm_calls`; `coverage` remains
+cumulative across resumes. `errors_by_type` summarizes the full error list,
+independently of the bounded error preview. These counters do not change the
+import scope, extractor version or checkpoint identity.
+
+An apply requires an explicitly configured router URL and authentication before
+inventory or run creation. Missing configuration fails once and makes no model
+call; imports never use the provider's loopback development fallback. Dry-run
+planning remains independent of router configuration.
+
+Classification retries workstation transport outages six times with 5, 10, 20,
+30, 30 and 30 seconds of backoff. Every attempt rechecks the execution deadline
+and reduces its call timeout to the remaining budget. No backoff starts when it
+would exhaust that budget. Authentication, model mismatch, malformed output and
+intrinsic call timeouts do not use this outage retry loop.
+
+JSON values use JSON semantics, never YAML, with comments and trailing commas
+accepted for JSONC configuration files. Quotes retain original lexical offsets.
+A historical path absent at a deletion or rename commit is an explicit
+`skipped_history_absent_path`; git object and command failures remain errors.
+
 Code at the frozen commit shares one commit metadata lookup. Provenance lookup
 runs one Git blame command for all extracted decision lines in each file revision,
 with cached origins and commit metadata, instead of one command per decision.

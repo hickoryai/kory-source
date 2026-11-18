@@ -1,5 +1,6 @@
 """Offline classifier for legacy importer fixtures; never calls a seat."""
 
+from mira.registry.decision_llm import passage_hash
 from mira.registry.decision_passages import Passage
 from mira.registry.imports import Candidate, extract_decisions
 
@@ -9,6 +10,10 @@ class LegacyFixtureClassifier:
 
     def __init__(self, corpus_id):
         self.corpus_id = corpus_id
+        self.classification_outcomes = {}
+
+    def validate_configuration(self):
+        pass
 
     def estimate(self, passages, *, seen=None):
         return {
@@ -18,6 +23,7 @@ class LegacyFixtureClassifier:
         }
 
     def classify(self, passages: list[Passage]):
+        self.classification_outcomes = {passage_hash(p.text): {} for p in passages}
         out = []
         for passage in passages:
             if passage.section.startswith("/"):
