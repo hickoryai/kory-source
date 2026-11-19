@@ -145,10 +145,12 @@ async def answer_work(work_id: str, request: Request) -> JSONResponse:
         code = str(raw.get("error") or "")
         if code not in WORK_ERRORS:
             return _error(422, "invalid_request", "Unknown work error.")
+        failure = {"error": code, "actual_model": str(raw.get("actual_model") or "unknown")}
+        # The worker's detail carries the relay's reason. The importer puts it in the run error.
+        if isinstance(raw.get("detail"), str):
+            failure["detail"] = raw["detail"]
         accepted = (
-            imports.answer(
-                work_id, {"error": code, "actual_model": str(raw.get("actual_model") or "unknown")}
-            )
+            imports.answer(work_id, failure)
             if is_import
             else store.answer_work(
                 work_id,
