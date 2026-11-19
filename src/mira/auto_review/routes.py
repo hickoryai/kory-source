@@ -100,15 +100,17 @@ def poll_work(
     """The seat worker's next relay body, or 204 when there is nothing to run."""
     if not getattr(request.state, "auto_review_worker", False):
         return _error(401, "worker_token_required", "The seat worker token is required.")
+    # Review work this worker is not already running still comes first.
+    # In-flight review rows stay pending until answered. An unfiltered
+    # next_pending() would treat those rows as a queue and never claim import.
     work = _store().next_pending(tuple(exclude or ()))
+    if work is None and import_capacity:
+        # Workers that omit import_capacity never receive an import envelope.
+        imports = _import_store()
+        item = imports.claim() if imports is not None else None
+        if item is not None:
+            return JSONResponse(item)
     if work is None:
-        # Old workers never receive import envelopes. Never skip review work
-        # merely because that worker already has it in flight.
-        if import_capacity and _store().next_pending() is None:
-            imports = _import_store()
-            item = imports.claim() if imports is not None else None
-            if item is not None:
-                return JSONResponse(item)
         return Response(status_code=204)
     return JSONResponse(
         {

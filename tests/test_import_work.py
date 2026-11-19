@@ -262,6 +262,61 @@ async def test_routes_review_first_opt_in_and_no_unadmitted_answers(queue, monke
         assert store.get(work_id)["result_json"] == "{}"
 
 
+async def test_in_flight_review_does_not_block_an_import_claim(queue, monkeypatch):
+    from types import SimpleNamespace
+
+    store, _run = queue
+    work_id = enqueue(queue)
+    review = SimpleNamespace(
+        id="aw_review",
+        request_id="review",
+        is_close=False,
+        seat_body=lambda: {"prompt": "review"},
+        timeout_seconds=10,
+        created_at=time.time(),
+    )
+
+    def next_pending(exclude=()):
+        if "aw_review" in exclude:
+            return None
+        return review
+
+    reviews = SimpleNamespace(next_pending=next_pending, get_work=lambda _: None)
+    monkeypatch.setattr(routes, "_store", lambda: reviews)
+    monkeypatch.setattr(routes, "_import_store", lambda: store)
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def worker(request, call_next):
+        request.state.auto_review_worker = True
+        return await call_next(request)
+
+    app.include_router(routes.router)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/auto-review/work", params={"import_capacity": 1})
+        assert response.status_code == 200
+        assert response.json()["work_id"] == "aw_review"
+        assert store.get(work_id)["state"] == "pending"
+        response = await client.get("/api/auto-review/work", params={"exclude": "aw_review"})
+        assert response.status_code == 204
+        assert store.get(work_id)["state"] == "pending"
+        item = (
+            await client.get(
+                "/api/auto-review/work",
+                params={"exclude": "aw_review", "import_capacity": 1},
+            )
+        ).json()
+        assert item["kind"] == "corpus_import"
+        assert store.get(work_id)["state"] == "leased"
+        response = await client.get(
+            "/api/auto-review/work",
+            params={"exclude": "aw_review", "import_capacity": 1},
+        )
+        assert response.status_code == 204
+
+
 async def test_worker_reserves_review_capacity_during_import(monkeypatch):
     from mira.auto_review.worker import run_worker
 

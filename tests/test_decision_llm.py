@@ -12,6 +12,7 @@ from mira.registry import decision_llm
 from mira.registry.db import RegistryDB
 from mira.registry.decision_llm import DecisionClassifier
 from mira.registry.decision_passages import Passage, nominate
+from mira.registry.imports import ImportRuns
 from mira.registry.provenance import ProvenanceStore
 from mira.registry.repository_history import GitReader, RepositoryHistoryImporter
 from mira.registry.service import Registry
@@ -257,16 +258,7 @@ def test_non_router_injection_and_malformed_negative_are_refused(tmp_path):
         )
 
 
-def test_history_revisions_share_batches_and_failed_checkpoint_retries(tmp_path):
-    class FailingLogProvider(FakeProvider):
-        failures = 2
-
-        async def respond(self, request):
-            if "We chose the log policy" in request["body"]["prompt"] and self.failures:
-                self.failures -= 1
-                raise RuntimeError("synthetic router failure")
-            return await super().respond(request)
-
+def _history_repo(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init", "-q")
@@ -274,29 +266,67 @@ def test_history_revisions_share_batches_and_failed_checkpoint_retries(tmp_path)
         (repo / "README.md").write_text(f"# Compatibility\n\nWe use version {i} because it fits.\n")
         git(repo, "add", ".")
         git(repo, "commit", "-qm", "We chose the log policy" if i == 0 else f"Fixture revision {i}")
+    return repo
+
+
+def test_history_revisions_share_one_classification_batch(tmp_path):
+    repo = _history_repo(tmp_path)
     reg = registry(tmp_path)
-    provider = FailingLogProvider()
+    provider = FakeProvider()
     with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": "example/sample"}])):
-        classifier = DecisionClassifier(
-            reg, corpus_id=rp.CORPUS, model="test/pinned", provider=provider
-        )
         importer = RepositoryHistoryImporter(
             reg,
             GitReader(repo),
             repo="example/sample",
             access=rp.operator(),
             max_commits=0,
-            classifier=classifier,
+            classifier=DecisionClassifier(
+                reg, corpus_id=rp.CORPUS, model="test/pinned", provider=provider
+            ),
         )
         plan = importer.run()
         assert plan["candidate_passages"] == 4
         assert plan["estimated_llm_calls"] == 1  # README revisions and log packed together
-        assert importer.run(apply=True)["status"] == "incomplete"
-        assert not provider.calls
-        assert importer.run(apply=True)["status"] == "incomplete"
         assert importer.run(apply=True)["status"] == "complete"
         assert len(provider.calls) == 1 and len(provider.calls[0]) == 4
-        assert provider.traces == 3  # one packed success, two failed attempts
+
+
+def test_failed_history_group_is_recorded_and_not_retried(tmp_path):
+    class FailingLogProvider(FakeProvider):
+        async def respond(self, request):
+            if "We chose the log policy" in request["body"]["prompt"]:
+                raise RuntimeError("synthetic router failure")
+            return await super().respond(request)
+
+    repo = _history_repo(tmp_path)
+    reg = registry(tmp_path)
+    provider = FailingLogProvider()
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": "example/sample"}])):
+        importer = RepositoryHistoryImporter(
+            reg,
+            GitReader(repo),
+            repo="example/sample",
+            access=rp.operator(),
+            max_commits=0,
+            classifier=DecisionClassifier(
+                reg, corpus_id=rp.CORPUS, model="test/pinned", provider=provider
+            ),
+        )
+        first = importer.run(apply=True)
+        assert first["status"] == "incomplete"
+        assert not provider.calls
+        assert provider.traces == 1
+        stored = ImportRuns(reg).get(first["run_id"])
+        assert stored["checkpoint"]["failed"]["md:README.md"].endswith("synthetic router failure")
+        assert "log:" in stored["checkpoint"]["failed"]
+        second = importer.run(apply=True)
+        assert second["run_id"] == first["run_id"]
+        assert second["status"] == "incomplete"
+        assert not provider.calls
+        assert provider.traces == 1
+        resumed = ImportRuns(reg).get(second["run_id"])
+        assert "md:README.md" in resumed["checkpoint"]["failed"]
+        assert any("synthetic router failure" in item for item in resumed["errors"])
 
 
 def test_blame_is_batched_and_bounded_paths_and_history_are_applied(tmp_path):

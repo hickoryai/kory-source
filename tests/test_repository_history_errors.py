@@ -186,7 +186,7 @@ def test_max_units_resume_skips_units_committed_before_finish(tmp_path):
         }
 
 
-def test_sql_failed_group_counts_are_visible_and_resume_stores_sql(tmp_path, monkeypatch):
+def test_sql_failed_group_is_recorded_and_resume_skips_it(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     git(repo, "init", "-q")
@@ -209,6 +209,7 @@ def test_sql_failed_group_counts_are_visible_and_resume_stores_sql(tmp_path, mon
         assert first["status"] == "incomplete"
         assert len(cache_reads) == 2  # estimate + pending; diagnostics add no read
         assert first["coverage"]["candidate_passages"] >= 1
+        assert first["errors_by_type"] == {"classification_failure": 1}
         assert first["per_source"]["sql"] == {
             "nominated": 1,
             "grouped": 1,
@@ -218,23 +219,129 @@ def test_sql_failed_group_counts_are_visible_and_resume_stores_sql(tmp_path, mon
             "stored": 0,
             "stored_evidence": 0,
         }
+        stored = ImportRuns(reg).get(first["run_id"])
+        assert stored["checkpoint"]["failed"]["sql:policy.sql"].endswith(
+            "one classification is required for every passage"
+        )
+        assert "sql:policy.sql" not in stored["checkpoint"]["done"]
+        assert reg.db.execute(
+            "SELECT COUNT(*) FROM registry_source_revisions WHERE import_run_id = ?",
+            (first["run_id"],),
+        ) == [(0,)]
         provider.malformed = False
         cache_reads.clear()
         second = importer.run(apply=True)
-        assert len(cache_reads) == 3  # estimate + pending + extraction, as before diagnostics
+        assert cache_reads == []
         assert second["run_id"] == first["run_id"]
-        assert second["status"] == "complete"
+        assert second["status"] == "incomplete"
         assert second["per_source"]["sql"] == {
-            "nominated": 1,
-            "grouped": 1,
-            "classified_ok": 1,
+            "nominated": 0,
+            "grouped": 0,
+            "classified_ok": 0,
             "classified_failed": 0,
             "classified_skipped": 0,
-            "stored": 1,
-            "stored_evidence": 1,
+            "stored": 0,
+            "stored_evidence": 0,
         }
-        assert second["slice_coverage"]["llm_calls"] == 1
+        assert "sql_versions" not in second["coverage"]
+        resumed = ImportRuns(reg).get(second["run_id"])
+        assert (
+            resumed["checkpoint"]["failed"]["sql:policy.sql"]
+            == (stored["checkpoint"]["failed"]["sql:policy.sql"])
+        )
+        assert any(
+            "sql:policy.sql" in item and "one classification is required for every passage" in item
+            for item in resumed["errors"]
+        )
+
+
+def test_classification_time_budget_is_retried_and_then_stored(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "policy.sql").write_text("-- We use stable keys because clients retain them.\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "Fixture")
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
+        reg, importer = _importer(tmp_path, repo, rp.operator())
+        provider = importer.classifier._supplied_provider
+        calls = {"n": 0}
+
+        async def transport(request):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError(
+                    "classification time budget reached; resume reuses completed batches"
+                )
+            return await provider.respond(request)
+
+        provider._transport = transport
+        first = importer.run(apply=True)
+        assert first["status"] == "incomplete"
+        assert first["errors_by_type"] == {"time_budget": 1}
+        stored = ImportRuns(reg).get(first["run_id"])
+        assert (stored["checkpoint"] or {}).get("failed") in (None, {})
+        assert "sql:policy.sql" not in ((stored["checkpoint"] or {}).get("done") or [])
+        second = importer.run(apply=True)
+        assert second["run_id"] == first["run_id"]
+        assert second["status"] == "complete"
+        assert second["per_source"]["sql"]["stored"] == 1
         assert second["coverage"]["sql_versions"] == 1
+
+
+def test_failed_file_does_not_block_the_next_file(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "a.md").write_text("We use stable names because clients retain them.\n")
+    (repo / "b.md").write_text("We use stable labels because reports retain them.\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "Fixture")
+    monkeypatch.setattr("mira.registry.repository_history._GROUP_FILES", 1)
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
+        reg, importer = _importer(tmp_path, repo, rp.operator())
+        provider = importer.classifier._supplied_provider
+        respond = provider.respond
+
+        async def transport(request):
+            if "clients retain them" in request["body"]["prompt"]:
+                return {"actual_model": request["body"]["model"], "text": '{"results": []}'}
+            return await respond(request)
+
+        provider._transport = transport
+        first = importer.run(apply=True)
+        assert first["status"] == "incomplete"
+        stored = ImportRuns(reg).get(first["run_id"])
+        assert stored["checkpoint"]["failed"]["md:a.md"].endswith(
+            "one classification is required for every passage"
+        )
+        assert "md:b.md" in stored["checkpoint"]["done"]
+        assert "md:a.md" not in stored["checkpoint"]["done"]
+        revisions = [
+            row[0]
+            for row in reg.db.execute(
+                "SELECT source_id FROM registry_source_revisions WHERE import_run_id = ?",
+                (first["run_id"],),
+            )
+        ]
+        assert revisions.count("example/sample:b.md") == 1
+        assert "example/sample:a.md" not in revisions
+        second = importer.run(apply=True)
+        assert second["run_id"] == first["run_id"]
+        assert second["status"] == "incomplete"
+        assert second["units_read"].get("md", 0) == 0
+        resumed = ImportRuns(reg).get(second["run_id"])
+        assert "md:a.md" in resumed["checkpoint"]["failed"]
+        assert any("md:a.md" in item for item in resumed["errors"])
+        revisions = [
+            row[0]
+            for row in reg.db.execute(
+                "SELECT source_id FROM registry_source_revisions WHERE import_run_id = ?",
+                (first["run_id"],),
+            )
+        ]
+        assert revisions.count("example/sample:b.md") == 1
+        assert "example/sample:a.md" not in revisions
 
 
 def test_deleted_historical_path_is_counted_but_git_failures_raise(tmp_path, monkeypatch):

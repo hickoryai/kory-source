@@ -77,7 +77,8 @@ def _error_preview(errors: list[str]) -> dict[str, Any]:
             return "time_budget"
         if "git " in message and " failed:" in message:
             return "git_failure"
-        if message.startswith("classification group:"):
+        # A later batch prefixes the unit key. The group text still names the type.
+        if "classification group:" in message:
             return "classification_failure"
         if message.startswith("data:"):
             return "data_parse_or_store_failure"
@@ -888,20 +889,30 @@ class RepositoryHistoryImporter:
         )
         self.classifier.import_run_id = run["run_id"]
         done = set((run["checkpoint"] or {}).get("done") or [])
+        failed = dict((run["checkpoint"] or {}).get("failed") or {})
         coverage_before = Counter(run["coverage"])
         errors: list[str] = []
         units_read: Counter[str] = Counter()
         units = selected + [("log", "")]
         stop = False
-        for group in self._prepared_groups(frozen, units, done, errors):
+        for group in self._prepared_groups(frozen, units, done, errors, failed):
             prepared = [revision for _, _, revisions, _ in group for revision in revisions]
             for kind, _, revisions, _ in group:
                 self.stages[kind]["grouped"] += sum(len(r[4]) for r in revisions)
             try:
                 classified, estimates = self._classify_prepared(prepared, apply=True)
             except (RuntimeError, ValueError) as exc:
-                _record_error(errors, f"classification group: {exc}")
-                self._flush_stats(run)
+                message = f"classification group: {exc}"
+                _record_error(errors, message)
+                # A budget stop is resumable. Completed batches stay cached, so
+                # the same files are nominated again. Any other group failure is
+                # recorded and skipped, or one file would consume every later batch.
+                if "time budget reached" in str(exc):
+                    self._flush_stats(run)
+                    continue
+                for kind, path, _, _ in group:
+                    failed[f"{kind}:{path}"] = message
+                self._commit_cursor(run, done, failed)
                 continue
             finally:
                 # Finished batches are cached even if a sibling batch failed.
@@ -977,13 +988,22 @@ class RepositoryHistoryImporter:
                 counts.update({f"skipped_{key}": value for key, value in skipped.items()})
                 checkpoint["skips_recorded"] = True
             checkpoint["done"] = sorted(done)
+            if failed:
+                checkpoint["failed"] = {key: failed[key] for key in sorted(failed)}
             checkpoint["last_batch"] = batch
             run["next_checkpoint"] = checkpoint
         self._mark_stats_flushed()
-        remaining = any(f"{kind}:{path}" not in done for kind, path in units)
+        # A later batch must keep the recorded failure text. finish() replaces
+        # the errors column, and an empty list would look like a clean run.
+        for key, message in sorted(failed.items()):
+            line = f"{key}: {message}"
+            if line not in errors and message not in errors:
+                errors.append(line)
+        finished = set(done) | set(failed)
+        remaining = any(f"{kind}:{path}" not in finished for kind, path in units)
         final = self.runs.finish(
             run,
-            complete=(not remaining) and self.max_commits == 0 and not self.paths,
+            complete=(not remaining) and not failed and self.max_commits == 0 and not self.paths,
             errors=errors,
             unknown_totals=(["history_before_max_commits"] if self.max_commits else [])
             + (["unselected_paths"] if self.paths else []),
@@ -1056,6 +1076,22 @@ class RepositoryHistoryImporter:
             return
         with self.runs.page(run, self.access) as counts:
             counts.update(delta)
+        self._mark_stats_flushed()
+
+    def _commit_cursor(self, run: dict, done: set[str], failed: dict[str, str]) -> None:
+        """Record a failed group before the next file is nominated.
+
+        The keys stay out of ``done`` so nothing is stored for them. Resume
+        skips them. A kill after this page cannot nominate the same files again.
+        """
+        checkpoint = dict(run.get("checkpoint") or {})
+        checkpoint["done"] = sorted(done)
+        checkpoint["failed"] = {key: failed[key] for key in sorted(failed)}
+        run["next_checkpoint"] = checkpoint
+        delta = self._stat_delta()
+        with self.runs.page(run, self.access) as counts:
+            if delta:
+                counts.update(delta)
         self._mark_stats_flushed()
 
     def _git_attrs(self, eid: str, commit: dict) -> list[attr.Attribution]:
@@ -1179,12 +1215,13 @@ class RepositoryHistoryImporter:
         observations.update(estimates)
         return result, observations
 
-    def _prepared_groups(self, frozen, units, done, errors):
+    def _prepared_groups(self, frozen, units, done, errors, failed=None):
         """Pack a short wave, then let the caller checkpoint it."""
+        failed = failed or {}
         group, count, chars = [], 0, 0
         for number, (kind, path) in enumerate(units, 1):
             key = f"{kind}:{path}"
-            if key in done:
+            if key in done or key in failed:
                 continue
             if (
                 self.classifier.deadline is not None
