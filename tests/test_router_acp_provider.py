@@ -68,6 +68,49 @@ async def test_factory_provider_has_no_requester_and_reads_no_relay(monkeypatch)
     assert RouterAcpProvider.call_log == deque()
 
 
+async def test_review_skill_line_prefixes_unpinned_prompts_only():
+    from mira.auto_review.config import skill_line
+    from mira.llm.router_acp import review_skill_line
+
+    sent: list[dict] = []
+
+    async def transport(request):  # type: ignore[no-untyped-def]
+        sent.append(request["body"])
+        return {"text": "ok", "actual_model": "grok/grok-4.7"}
+
+    provider = RouterAcpProvider(
+        _config(router_acp_timeout_seconds=30),
+        transport=transport,
+        relay=False,
+        sleep=_no_sleep,
+    )
+    token = review_skill_line.set(skill_line("opinion"))
+    try:
+        payload = await provider._post_once("review the diff", provider._requested_model())
+    finally:
+        review_skill_line.reset(token)
+    assert provider._requested_model() == "auto"
+    assert sent[0]["model"] == "auto"
+    assert sent[0]["prompt"] == "[router: skill=review-opinion]\nreview the diff"
+    assert payload["text"] == "ok"
+    token = review_skill_line.set(skill_line("gate"))
+    try:
+        await provider._post_once("review the diff", "auto")
+    finally:
+        review_skill_line.reset(token)
+    assert sent[1]["prompt"] == "[router: skill=review-gate]\nreview the diff"
+    token = review_skill_line.set(skill_line("opinion"))
+    try:
+        await provider._post_once(sent[0]["prompt"], "auto")
+    finally:
+        review_skill_line.reset(token)
+    assert sent[2]["prompt"] == sent[0]["prompt"]
+    close = provider._close_request("conv-1")
+    assert close["body"] == {"conversation_id": "conv-1", "close": True}
+    await provider._post_once("plain", "auto")
+    assert sent[3]["prompt"] == "plain"
+
+
 def test_refuse_unrequested_seat_only_for_router_acp():
     with pytest.raises(LLMError) as exc:
         refuse_unrequested_seat(_config(), "webhook review")

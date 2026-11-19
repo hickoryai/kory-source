@@ -114,25 +114,46 @@ HAI-11602.
 
 ## `POST /api/reviews`
 
-The body must be exactly these three fields. Extra fields and wrong types are
-rejected.
+Send one of two bodies. Extra fields and wrong types are rejected. Neither
+body posts to GitHub.
+
+A pull request:
 
 ```json
 {
-  "repo": "hickoryai/kory-source",
+  "repo": "acme/widgets",
   "pr_number": 42,
   "head_sha": "0123456789abcdef0123456789abcdef01234567"
 }
 ```
 
+A local snapshot. The service stores the diff and does not read GitHub:
+
+```json
+{
+  "repo": "acme/widgets",
+  "base_sha": "89abcdef0123456789abcdef0123456789abcdef",
+  "head_sha": "0123456789abcdef0123456789abcdef01234567",
+  "diff": "diff --git a/app.py b/app.py\n..."
+}
+```
+
 - `repo`: `owner/repo`.
 - `pr_number`: a JSON integer greater than zero. Strings and booleans are
-  rejected.
-- `head_sha`: the full 40-character lowercase hex SHA.
+  rejected. A local snapshot is stored with `pr_number` 0.
+- `head_sha` and `base_sha`: the full 40-character lowercase hex SHA.
+- `diff`: the patch to review. It is not returned by the job view or the
+  HTML report.
+- `role`: optional. `opinion` (the default) or `gate`. The model calls for
+  that job start with `[router: skill=review-opinion]` or
+  `[router: skill=review-gate]`. The router removes that line before the
+  model reads the prompt. The request model stays `auto`.
 
 `202 Accepted` returns the job view (below) in state `queued`. Submitting the
-same principal, repository, PR, and SHA while that job is still queued or
-running returns the existing job with `"deduplicated": true`.
+same principal, repository, PR number, and SHA while that job is still queued
+or running returns the existing job with `"deduplicated": true`. A local
+snapshot uses PR number 0, so a second snapshot of the same head returns the
+first job even when the diff differs.
 
 Errors use one shape:
 
@@ -146,7 +167,7 @@ Errors use one shape:
 | 403 | (plain `error` string) | Token sent over plain HTTP to a non-loopback host. |
 | 403 | `token_required` | A dashboard session tried to submit. |
 | 403 | `repo_not_allowed` | The token's allowlist does not include the repository. No GitHub read happened. |
-| 422 | `invalid_request` | The body is not exactly `{repo, pr_number, head_sha}`. `fields` lists the problems. |
+| 422 | `invalid_request` | The body is neither a pull request nor a local snapshot. `fields` lists the problems. |
 | 503 | `review_execution_unavailable` | The executor is off on this deployment. No GitHub read happened. |
 | 404 | `repo_not_installed` | The GitHub App is not installed on the repository. |
 | 404 | `pr_not_found` | The PR does not exist. |
@@ -164,6 +185,8 @@ Errors use one shape:
   "stage": "done",
   "repo": "hickoryai/kory-source",
   "pr_number": 42,
+  "role": "opinion",
+  "local": false,
   "requested_head_sha": "0123...",
   "reviewed_head_sha": "0123...",
   "base_sha": "89ab...",
@@ -215,6 +238,8 @@ Errors use one shape:
 }
 ```
 
+- `role` is `opinion` or `gate`. `local` is true when the job was a snapshot.
+  The raw diff is not in this view.
 - `findings` is `null` until the job succeeds, and stays `null` if it fails.
   `[]` means the review succeeded and found nothing.
 - `registry_ids` is always `[]` for now. Validated registry citations arrive
@@ -334,9 +359,15 @@ Kory Source does not call a relay for API reviews. It does not call
 Each attempt of each logical model call is one work item:
 
 ```json
-{"work_id": "wrk_<32 hex>", "prompt": "<full prompt, untruncated>", "model": "auto", "timeout_seconds": 900}
+{"work_id": "wrk_<32 hex>", "prompt": "[router: skill=review-opinion]\n<full prompt, untruncated>", "model": "auto", "timeout_seconds": 900}
 ```
 
+- The prompt starts with one skill line, `[router: skill=review-opinion]`
+  or `[router: skill=review-gate]`. Send that line to the router. The router
+  strips it. The rest of the prompt is unchanged.
+- Review jobs request `auto`, including when a dashboard model is set. A
+  pin still fails with `model_mismatch` if a caller sends one and a different
+  model answers.
 - `model` is the requested router model: `auto`, or a pin such as
   `grok/grok-4.6`. `auto`, `default`, `router-default`, and
   `router-acp-default` are unpinned.
@@ -485,7 +516,7 @@ curl -sS -X POST "$KORY_SOURCE_URL/api/reviews" -H "$AUTH" \
 # 2. Poll until work appears.
 curl -sS "$KORY_SOURCE_URL/api/reviews/rev_5f0c..." -H "$AUTH"
 # {"state": "running", "stage": "reviewing",
-#  "pending_work": [{"work_id": "wrk_9a1e...", "prompt": "You are running as Mira's ...",
+#  "pending_work": [{"work_id": "wrk_9a1e...", "prompt": "[router: skill=review-opinion]\nYou are running as Mira's ...",
 #                    "model": "auto", "timeout_seconds": 900}], ...}
 
 # 3. Run the prompt on your own seat (priority review), then post the result.

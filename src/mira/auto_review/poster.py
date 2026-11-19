@@ -18,8 +18,8 @@ from mira.providers.formatting import format_key_issues
 logger = logging.getLogger(__name__)
 
 
-def _review_body(result: ReviewResult, head_sha: str) -> str:
-    parts = [review_preamble(head_sha)]
+def _review_body(result: ReviewResult, head_sha: str, role: str) -> str:
+    parts = [review_preamble(head_sha, role)]
     if result.summary:
         parts.append(result.summary)
     if result.key_issues:
@@ -37,17 +37,18 @@ async def post_secondary_review(
     pr_info: PRInfo,
     result: ReviewResult,
     head_sha: str,
+    role: str = "opinion",
 ) -> int:
     """Post the frozen review. The provider must accept ``commit_sha``."""
     if REVIEW_EVENT != "COMMENT":
         raise RuntimeError("secondary review event must stay COMMENT")
-    preamble = review_preamble(head_sha)
+    preamble = review_preamble(head_sha, role)
     review_id_list = await provider.post_review(  # type: ignore[attr-defined]
         pr_info,
         result,
         bot_name="kory-source",
         commit_sha=head_sha,
-        review_body=_review_body(result, head_sha),
+        review_body=_review_body(result, head_sha, role),
         comment_prefix=preamble,
         require_current_head=True,
     )
@@ -95,7 +96,9 @@ async def post_if_current(
         dict.fromkeys(result.actual_models + actual_models_from_work(store, request_id))
     )
     try:
-        review_id = await post_secondary_review(provider, pr_info, result, head_sha)
+        review_id = await post_secondary_review(
+            provider, pr_info, result, head_sha, existing.role or "opinion"
+        )
     except StaleReviewError:
         store.cancel_post(request_id)
         return None

@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS auto_review_requests (
     started_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     finished_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     interrupt_count INTEGER NOT NULL DEFAULT 0,
+    role TEXT NOT NULL DEFAULT 'opinion',
     UNIQUE (platform, owner, repo, pr_number, head_sha)
 );
 CREATE INDEX IF NOT EXISTS auto_review_requests_state_idx
@@ -88,7 +89,7 @@ CREATE INDEX IF NOT EXISTS auto_review_work_request_idx
 _REQUEST_COLUMNS = (
     "id, platform, owner, repo, pr_number, head_sha, base_sha, title, installation_id, "
     "state, posted_review_id, error_code, error_message, lease_owner, lease_expires_at, "
-    "created_at, updated_at, started_at, finished_at, interrupt_count"
+    "created_at, updated_at, started_at, finished_at, interrupt_count, role"
 )
 
 _WORK_COLUMNS = (
@@ -121,6 +122,7 @@ class AutoReviewRequest:
     started_at: float
     finished_at: float
     interrupt_count: int
+    role: str
 
 
 @dataclass
@@ -198,6 +200,7 @@ class AutoReviewStore:
                 if statement.strip():
                     cur.execute(statement)
             self._ensure_interrupt_count(cur)
+            self._ensure_role(cur)
 
     @contextmanager
     def _cursor(self) -> Iterator[Any]:
@@ -360,6 +363,25 @@ class AutoReviewStore:
         cur.execute(
             "ALTER TABLE auto_review_requests ADD COLUMN IF NOT EXISTS "
             "interrupt_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+    def _ensure_role(self, cur: Any) -> None:
+        """Add the review role on a database created before it existed.
+
+        The default is opinion. One row per head stays the unique key.
+        """
+        column = "role TEXT NOT NULL DEFAULT 'opinion'"
+        if self._db._backend == "sqlite":
+            cur.execute("PRAGMA table_info(auto_review_requests)")
+            names = {row[1] for row in cur.fetchall()}
+            if "role" in names:
+                return
+            cur.execute(
+                "ALTER TABLE auto_review_requests ADD COLUMN " + column  # noqa: S608
+            )
+            return
+        cur.execute(
+            "ALTER TABLE auto_review_requests ADD COLUMN IF NOT EXISTS " + column  # noqa: S608
         )
 
     def _skip_interrupted(self, cur: Any, extra_where: str, params: tuple, now: float) -> int:

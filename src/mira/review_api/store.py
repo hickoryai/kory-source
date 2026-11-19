@@ -56,7 +56,9 @@ CREATE TABLE IF NOT EXISTS review_api_jobs (
     created_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     started_at DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at DOUBLE PRECISION NOT NULL DEFAULT 0,
-    finished_at DOUBLE PRECISION NOT NULL DEFAULT 0
+    finished_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    role TEXT NOT NULL DEFAULT 'opinion',
+    snapshot_diff TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS review_api_jobs_state_idx ON review_api_jobs (state, created_at);
 CREATE TABLE IF NOT EXISTS review_api_work (
@@ -88,7 +90,7 @@ _COLUMNS = (
     "id, principal, platform, owner, repo, pr_number, requested_head_sha, reviewed_head_sha, "
     "base_sha, merge_base_sha, state, stage, error_code, error_message, result_json, "
     "model_calls_json, lease_owner, lease_expires_at, deadline_at, created_at, started_at, "
-    "updated_at, finished_at"
+    "updated_at, finished_at, role, snapshot_diff"
 )
 
 
@@ -117,6 +119,8 @@ class ReviewJob:
     started_at: float
     updated_at: float
     finished_at: float
+    role: str
+    snapshot_diff: str
 
     @property
     def result(self) -> dict[str, Any] | None:
@@ -150,6 +154,30 @@ class ReviewJobStore:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     cur.execute(statement)
+            self._ensure_job_columns(cur)
+
+    def _ensure_job_columns(self, cur: Any) -> None:
+        """Add role and the local snapshot on a database created before them.
+
+        Both columns append. ``role`` defaults to opinion. ``snapshot_diff``
+        stays empty for a pull-request job. The active-job lookup is unchanged.
+        """
+        columns = (
+            "role TEXT NOT NULL DEFAULT 'opinion'",
+            "snapshot_diff TEXT NOT NULL DEFAULT ''",
+        )
+        for column in columns:
+            name = column.split(" ", 1)[0]
+            if self._db._backend == "sqlite":
+                cur.execute("PRAGMA table_info(review_api_jobs)")
+                names = {row[1] for row in cur.fetchall()}
+                if name in names:
+                    continue
+                cur.execute("ALTER TABLE review_api_jobs ADD COLUMN " + column)  # noqa: S608
+                continue
+            cur.execute(
+                "ALTER TABLE review_api_jobs ADD COLUMN IF NOT EXISTS " + column  # noqa: S608
+            )
 
     @property
     def backend(self) -> str:
@@ -217,15 +245,18 @@ class ReviewJobStore:
         head_sha: str,
         base_sha: str,
         max_queued: int,
+        role: str = "opinion",
+        snapshot_diff: str = "",
     ) -> ReviewJob | None:
         """Insert a queued job, or return ``None`` when the queue is full."""
         job_id = "rev_" + uuid.uuid4().hex
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
-                "INSERT INTO review_api_jobs (id, principal, platform, owner, repo, pr_number, "
-                "requested_head_sha, base_sha, state, stage, created_at, updated_at) "
-                "SELECT ?, ?, 'github', ?, ?, ?, ?, ?, 'queued', 'queued', ?, ? "
+                "INSERT INTO review_api_jobs (id, principal, platform, owner, repo, pr_number, "  # noqa: S608
+                "requested_head_sha, base_sha, state, stage, created_at, updated_at, role, "
+                "snapshot_diff) "
+                "SELECT ?, ?, 'github', ?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ? "  # noqa: S608
                 "WHERE (SELECT COUNT(*) FROM review_api_jobs WHERE state = 'queued') < ?",
                 (
                     job_id,
@@ -237,6 +268,8 @@ class ReviewJobStore:
                     base_sha,
                     now,
                     now,
+                    role,
+                    snapshot_diff,
                     max_queued,
                 ),
             )

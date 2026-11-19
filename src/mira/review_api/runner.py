@@ -30,6 +30,7 @@ from mira.review_api.snapshot import (
     ReadOnlyViolation,
     SnapshotError,
     SnapshotReader,
+    local_snapshot,
 )
 from mira.review_api.store import ReviewJob, ReviewJobStore
 
@@ -157,7 +158,7 @@ def _build_engine(provider: ReadOnlySnapshotProvider, job_id: str):  # type: ign
     transport = requester_transport(_work_store(), job_id)
     llms = {}
     for role in ("review", "indexing", "security"):
-        role_config = llm_config_for(role, config.llm)
+        role_config = llm_config_for(role, config.llm).model_copy(update={"model": "auto"})
         if role_config.provider not in {"router-acp", "router_acp"}:
             raise JobFailure(
                 "seat_provider_unconfigured", f"The {role} model is not a router-acp seat."
@@ -239,26 +240,41 @@ def _failed_call(calls: list[dict[str, Any]]) -> JobFailure | None:
 async def run_job(
     job: ReviewJob, reader_factory: ReaderFactory, set_stage: StageCallback
 ) -> JobOutcome:
-    from mira.llm.router_acp import call_observer, job_llm
+    from mira.auto_review.config import DEFAULT_ROLE, ROLE_SKILL, skill_line
+    from mira.llm.router_acp import call_observer, job_llm, review_skill_line
 
     calls: list[dict[str, Any]] = []
+    role = job.role if job.role in ROLE_SKILL else DEFAULT_ROLE
+    skill_token = review_skill_line.set(skill_line(role))
     try:
-        reader = await reader_factory(job.owner, job.repo)
-        meta = await reader.get_pull(job.pr_number)
-        if meta.head_sha != job.requested_head_sha:
-            raise JobFailure(
-                "head_sha_mismatch",
-                f"PR head moved to {meta.head_sha} before capture; requested "
-                f"{job.requested_head_sha}. Nothing was reviewed.",
+        if job.snapshot_diff:
+            snapshot = local_snapshot(
+                job.owner, job.repo, job.base_sha, job.requested_head_sha, job.snapshot_diff
             )
-        snapshot = await reader.freeze(meta)
-        set_stage(
-            "reviewing",
-            reviewed_head_sha=meta.head_sha,
-            base_sha=meta.base_sha,
-            merge_base_sha=snapshot.merge_base_sha,
-        )
-        provider = ReadOnlySnapshotProvider(reader, snapshot)
+            set_stage(
+                "reviewing",
+                reviewed_head_sha=snapshot.meta.head_sha,
+                base_sha=snapshot.meta.base_sha,
+                merge_base_sha=snapshot.merge_base_sha,
+            )
+            provider = ReadOnlySnapshotProvider(None, snapshot)
+        else:
+            reader = await reader_factory(job.owner, job.repo)
+            meta = await reader.get_pull(job.pr_number)
+            if meta.head_sha != job.requested_head_sha:
+                raise JobFailure(
+                    "head_sha_mismatch",
+                    f"PR head moved to {meta.head_sha} before capture; requested "
+                    f"{job.requested_head_sha}. Nothing was reviewed.",
+                )
+            snapshot = await reader.freeze(meta)
+            set_stage(
+                "reviewing",
+                reviewed_head_sha=meta.head_sha,
+                base_sha=meta.base_sha,
+                merge_base_sha=snapshot.merge_base_sha,
+            )
+            provider = ReadOnlySnapshotProvider(reader, snapshot)
         engine = _build_engine(provider, job.id)
         extra_rules: list[dict[str, str]] = []
         for rules_provider in custom_rules_providers:
@@ -319,3 +335,5 @@ async def run_job(
         if failure is not None:
             return JobOutcome("failed", failure.code, failure.message, model_calls=calls)
         return JobOutcome("failed", "review_failed", exc.safe_message, model_calls=calls)
+    finally:
+        review_skill_line.reset(skill_token)

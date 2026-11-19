@@ -132,6 +132,9 @@ call_observer: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
     "mira_router_acp_call_observer", default=None
 )
 job_llm: ContextVar[Any] = ContextVar("mira_router_acp_job_llm", default=None)
+# A review job sets this to one stripped skill line. Completions prepend it.
+# Close requests do not. The router removes the line before the model reads it.
+review_skill_line: ContextVar[str | None] = ContextVar("mira_review_skill_line", default=None)
 _turn: ContextVar[str] = ContextVar("mira_router_acp_turn", default="")
 _REJECTED_QUOTE_CHARS = 1_500
 _tracing_ready = False
@@ -466,9 +469,15 @@ class RouterAcpProvider:
             raise RouterTransportError(detail, kind=state, body=payload)
         return payload
 
+    def _prompt_with_skill_line(self, prompt: str) -> str:
+        line = review_skill_line.get()
+        if not line or prompt.startswith(line):
+            return prompt
+        return f"{line}\n{prompt}"
+
     async def _post_once(self, prompt: str, requested: str) -> dict[str, Any]:
         body = {
-            "prompt": prompt,
+            "prompt": self._prompt_with_skill_line(prompt),
             "model": requested,
             "priority": self._priority(),
             "timeout_seconds": self.config.router_acp_timeout_seconds,

@@ -189,6 +189,11 @@ async def execute_request(
         req.id,
         max(0, time.time() - req.created_at),
     )
+    from mira.auto_review.config import DEFAULT_ROLE, ROLE_SKILL, skill_line
+    from mira.llm.router_acp import review_skill_line
+
+    role = req.role if req.role in ROLE_SKILL else DEFAULT_ROLE
+    skill_token = review_skill_line.set(skill_line(role))
     try:
         reader = await reader_factory(req.owner, req.repo, req.installation_id)
         fetch_started = time.monotonic()
@@ -334,6 +339,7 @@ async def execute_request(
         logger.exception("auto review %s failed", req.id)
         store.mark_skipped(req.id, "review_failed", "review_failed")
     finally:
+        review_skill_line.reset(skill_token)
         if engine is not None:
             await _close_seats(engine)
         final = store.get(req.id)
