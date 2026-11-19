@@ -254,6 +254,8 @@ class RegistryDB:
         """Run the enclosed statements atomically. Nested calls join the outer one.
 
         Holds the connection lock for the whole block, so other threads wait.
+        A Postgres socket that is already dead reconnects once before any
+        statement runs. A failure after that still raises.
         """
         with self._lock:
             if self._depth:
@@ -264,7 +266,7 @@ class RegistryDB:
                     self._depth -= 1
                 return
             if self.postgres:
-                with self._conn.transaction():
+                with self._postgres_transaction():
                     self._depth = 1
                     try:
                         yield
@@ -282,6 +284,31 @@ class RegistryDB:
                 self._conn.execute("COMMIT")
             finally:
                 self._depth = 0
+
+    @contextmanager
+    def _postgres_transaction(self) -> Iterator[None]:
+        """Enter one Postgres transaction.
+
+        The server can close an idle socket. The next ``transaction()`` then
+        raises OperationalError before any statement runs. Reconnect once and
+        enter again. A failure after the body starts still raises: reconnecting
+        there would drop statements already run.
+        """
+        import psycopg
+
+        from mira.db.postgres import reconnect
+
+        started = False
+        try:
+            with self._conn.transaction():
+                started = True
+                yield
+        except psycopg.OperationalError:
+            if started:
+                raise
+            self._conn = reconnect(self._url or "", self._conn)
+            with self._conn.transaction():
+                yield
 
     def close(self) -> None:
         with self._lock:

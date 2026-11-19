@@ -4,17 +4,24 @@ These encode the production failure mode on upstream main: long-lived psycopg
 handles in AppDatabase and pg_store go dead after idle, and the next real query
 raises OperationalError until the process restarts. A correct fix reconnects
 transparently on that error without adding per-query liveness probes.
+
+A registry transaction reconnects once when its socket is already dead, and
+does not reconnect after the body has started.
 """
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from unittest.mock import patch
 
 import psycopg
+import pytest
 
 from mira.dashboard.db import AppDatabase, _hash_password
 from mira.index import pg_store
+from mira.registry.db import RegistryDB
 
 _ADMIN_HASH = _hash_password("admin")
 
@@ -240,3 +247,147 @@ def test_refresh_conn_replaces_stale_handle() -> None:
     assert live.conn_id == 2
     assert live is not connections[0]
     assert connections[0].closed
+
+
+class _RegistryCursor:
+    def __init__(self, conn: _RegistryConnection) -> None:
+        self._conn = conn
+        self.description = None
+
+    def __enter__(self) -> _RegistryCursor:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def execute(self, sql: str, params: tuple = ()) -> None:
+        if self._conn.dead:
+            raise psycopg.OperationalError("the connection is lost")
+        self._conn.statements.append(sql)
+
+    def fetchall(self) -> list:
+        return []
+
+
+class _RegistryConnection:
+    """Postgres handle whose transaction() dies the way a dropped socket does."""
+
+    def __init__(self, conn_id: int) -> None:
+        self.conn_id = conn_id
+        self.dead = False
+        self.closed = False
+        self.statements: list[str] = []
+        self.enters = 0
+        self.exits = 0
+
+    def cursor(self) -> _RegistryCursor:
+        return _RegistryCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+    @contextmanager
+    def transaction(self):
+        if self.dead:
+            raise psycopg.OperationalError("the connection is lost")
+        self.enters += 1
+        try:
+            yield self
+        finally:
+            self.exits += 1
+
+
+def _registry_db(
+    first: _RegistryConnection,
+) -> tuple[RegistryDB, Callable[[str], _RegistryConnection], list[_RegistryConnection]]:
+    opened: list[_RegistryConnection] = []
+
+    def factory(url: str) -> _RegistryConnection:
+        conn = _RegistryConnection(len(opened) + 2)
+        opened.append(conn)
+        return conn
+
+    db = RegistryDB.__new__(RegistryDB)
+    db._lock = threading.RLock()
+    db._depth = 0
+    db.postgres = True
+    db._url = "postgresql://example/db"
+    db._conn = first
+    return db, factory, opened
+
+
+def test_registry_transaction_reconnects_once_when_the_socket_is_already_dead() -> None:
+    """Poll 500: entering the transaction raises before any statement."""
+    first = _RegistryConnection(1)
+    first.dead = True
+    db, factory, opened = _registry_db(first)
+
+    with patch("mira.db.postgres.connect", side_effect=factory), db.transaction():
+        assert db.execute("SELECT 1") == []
+
+    assert len(opened) == 1
+    assert db._conn is opened[0]
+    assert opened[0].statements == ["SELECT 1"]
+    assert opened[0].enters == 1
+    assert opened[0].exits == 1
+    assert first.closed
+    assert first.statements == []
+    assert first.enters == 0
+
+
+def test_registry_transaction_raises_when_the_new_socket_is_also_dead() -> None:
+    first = _RegistryConnection(1)
+    first.dead = True
+    db, factory, opened = _registry_db(first)
+
+    def also_dead(url: str) -> _RegistryConnection:
+        conn = factory(url)
+        conn.dead = True
+        return conn
+
+    ran: list[str] = []
+    with (
+        patch("mira.db.postgres.connect", side_effect=also_dead),
+        pytest.raises(psycopg.OperationalError, match="the connection is lost"),
+        db.transaction(),
+    ):
+        ran.append("body")
+
+    assert ran == []
+    assert len(opened) == 1
+    assert first.closed
+
+
+def test_registry_transaction_does_not_reconnect_after_the_body_starts() -> None:
+    first = _RegistryConnection(1)
+    db, factory, opened = _registry_db(first)
+    ran: list[str] = []
+
+    with (
+        patch("mira.db.postgres.connect", side_effect=factory),
+        pytest.raises(psycopg.OperationalError, match="after statements"),
+        db.transaction(),
+    ):
+        ran.append("body")
+        raise psycopg.OperationalError("after statements")
+
+    assert ran == ["body"]
+    assert opened == []
+    assert first.enters == 1
+    assert first.exits == 1
+    assert not first.closed
+
+
+def test_registry_transaction_on_a_live_socket_keeps_the_same_connection() -> None:
+    first = _RegistryConnection(1)
+    db, factory, opened = _registry_db(first)
+
+    with patch("mira.db.postgres.connect", side_effect=factory), db.transaction():
+        assert db.execute("SELECT 1") == []
+
+    assert opened == []
+    assert first.statements == ["SELECT 1"]
+    assert first.enters == 1
+    assert first.exits == 1
+    assert db._conn is first
+    assert not first.closed
