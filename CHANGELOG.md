@@ -8,7 +8,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Automatic reviews stay unpinned.** The review request is `auto`. A pause still skips a delivery. Each job has a role, `opinion` by default. The posted body includes `Role: opinion` or `Role: gate` under the commit. Model calls start with a stripped router skill line. The review API also accepts a local snapshot (`repo`, `base_sha`, `head_sha`, `diff`) that does not read GitHub and does not post.
 - **A running automatic review is not cancelled by a newer push.** The review finishes and posts on the head it started. At most one newer head of that pull request stays queued, and a later push replaces the queued head. A second head of a pull request does not start while one is running.
 - **Automatic reviews survive a process restart and prefer a fresh head.** A running head that has not started posting is queued again when its lease lapses or the process shuts down. A replacement process waits 60 seconds before taking a lease that just lapsed. The service claims the newest queued head first and leaves older heads queued. The default service concurrency is 8 reviews, and the default seat-worker call concurrency is 16, both still inside their existing caps.
 - **An automatic-review head stops after three interruptions.** The third lapsed lease or shutdown marks that head skipped with `interrupted_retry_cap` instead of queueing it again. A newer head, and a head that already started posting, are unchanged.
@@ -18,6 +17,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Review bodies name the model that produced them.** A GitHub review ends with the family and version reported by the seat, such as `Sol 6.1` or `Grok 4.7`. Several models are listed once each. An id that does not state a family and version is shown unchanged, and a review with no reported model has no footer. The requested model is not used.
 - **Secondary reviewer, off by default.** When `KORY_SOURCE_AUTO_REVIEW=1`, every pull request delivered for a repository the GitHub App is installed on is reviewed once as a `COMMENT` on that frozen commit. The review body and each comment are labeled `Kory Source (secondary reviewer)` plus the head sha. The path never requests changes, never adds a required check, and never edits branch protection. While the flag is on, the unlabeled reviewer does not run. A pause skips that delivery. Pause and rollback are an admin setting and a process stop. The seat worker is started only at enablement, on the workstation that holds the logged-in router account pool. Name that host at runtime with `KORY_SOURCE_WORKER_HOST`; leave it unset for generic wording. With the flag unset, webhook reviews stay on today's path. The review request is unpinned (`auto`). The router selects the seat.
 - **Release images omit build attestations.** The Release workflow builds with provenance and SBOM disabled. It still audits every candidate layer before pushing that image.
+
+## [0.12.13] — 2026-11-19
+
+### Changed
+
+- **Automatic reviews stay unpinned.** The review request is `auto`. A pause still skips a delivery. Each job has a role, `opinion` by default. The posted body includes `Role: opinion` or `Role: gate` under the commit. Model calls start with a stripped router skill line. The review API also accepts a local snapshot (`repo`, `base_sha`, `head_sha`, `diff`) that does not read GitHub and does not post.
+- **Every head gets a gate and an opinion.** The first head gets a full opinion and a full gate. A later head reviews the delta since the previous posted head. When a posted head already exists, the extra opinion is Grok-only.
+- **The second role on one head reviews the previous delta.** A posted role of the head under review is not an earlier head. The other role reviews the delta from the previous posted head. That delta stays inside the pull request's changed paths.
 
 ## [0.10.0] — 2026-10-26
 
