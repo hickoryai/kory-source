@@ -354,7 +354,6 @@ async def test_worker_reserves_review_capacity_during_import(monkeypatch):
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
     monkeypatch.setenv("KORY_SOURCE_URL", "https://source.test")
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", "synthetic")
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", "1")
     monkeypatch.setattr("mira.auto_review.worker.POLL_SECONDS", 0.001)
     import_started = asyncio.Event()
     review_started = asyncio.Event()
@@ -363,10 +362,11 @@ async def test_worker_reserves_review_capacity_during_import(monkeypatch):
 
     async def handle(request):
         nonlocal polls
-        if request.method == "GET":
+        if request.url.path == "/api/auto-review/work":
             polls += 1
+            body = json.loads(request.content)
             if polls == 1:
-                assert request.url.params["import_capacity"] == "1"
+                assert body["import_capacity"] == 1
                 return httpx.Response(
                     200,
                     json={
@@ -377,7 +377,8 @@ async def test_worker_reserves_review_capacity_during_import(monkeypatch):
                     },
                 )
             if polls == 2:
-                assert request.url.params["import_capacity"] == "0"
+                assert body["import_capacity"] == 0
+                assert body["exclude"] == ["iw_one:1"]
                 return httpx.Response(
                     200,
                     json={"work_id": "aw_one", "body": {"prompt": "review"}, "timeout_seconds": 10},

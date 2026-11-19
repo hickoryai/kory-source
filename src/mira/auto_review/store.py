@@ -366,9 +366,9 @@ class AutoReviewStore:
         return row, inserted
 
     def claim_next(
-        self, worker: str, *, lease_seconds: float, deadline_seconds: float, max_running: int = 1
+        self, worker: str, *, lease_seconds: float, deadline_seconds: float
     ) -> AutoReviewRequest | None:
-        """Move the newest queued head to running within the executor limit.
+        """Move the newest queued head to running. Reviews have no global cap.
 
         Older heads stay queued. A queued head whose pull request already has
         a running review of the same role stays queued until that review
@@ -376,7 +376,7 @@ class AutoReviewStore:
         ``deadline_seconds`` is the caller's budget. A negative budget claims
         nothing. The executor enforces the real deadline with ``wait_for``.
         """
-        if deadline_seconds < 0 or max_running < 1:
+        if deadline_seconds < 0:
             return None
         candidate = self._one(
             f"SELECT {_REQUEST_COLUMNS} FROM auto_review_requests AS queued "  # noqa: S608
@@ -395,9 +395,8 @@ class AutoReviewStore:
             cur.execute(
                 "UPDATE auto_review_requests SET state = 'running', lease_owner = ?, "
                 "lease_expires_at = ?, started_at = ?, updated_at = ? "
-                "WHERE id = ? AND state = 'queued' AND ("
-                "SELECT COUNT(*) FROM auto_review_requests WHERE state = 'running') < ?",
-                (worker, now + lease_seconds, now, now, candidate.id, max_running),
+                "WHERE id = ? AND state = 'queued'",
+                (worker, now + lease_seconds, now, now, candidate.id),
             )
             claimed = cur.rowcount == 1
         if not claimed:

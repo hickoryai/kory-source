@@ -18,6 +18,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Secondary reviewer, off by default.** When `KORY_SOURCE_AUTO_REVIEW=1`, every pull request delivered for a repository the GitHub App is installed on is reviewed once as a `COMMENT` on that frozen commit. The review body and each comment are labeled `Kory Source (secondary reviewer)` plus the head sha. The path never requests changes, never adds a required check, and never edits branch protection. While the flag is on, the unlabeled reviewer does not run. A pause skips that delivery. Pause and rollback are an admin setting and a process stop. The seat worker is started only at enablement, on the workstation that holds the logged-in router account pool. Name that host at runtime with `KORY_SOURCE_WORKER_HOST`; leave it unset for generic wording. With the flag unset, webhook reviews stay on today's path. The review request is unpinned (`auto`). The router selects the seat.
 - **Release images omit build attestations.** The Release workflow builds with provenance and SBOM disabled. It still audits every candidate layer before pushing that image.
 
+## [0.12.18] — 2026-11-19
+
+### Changed
+
+- **Automatic reviews have no concurrency cap.** The service starts every claimable queued head at once instead of at most 8, and the seat worker forwards every seat call at once instead of at most 16. `KORY_SOURCE_AUTO_REVIEW_CONCURRENCY` and `KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY` are no longer read. One review per pull request and role still runs at a time. Review passes, prompts and models are unchanged.
+- **The seat worker polls with a JSON body.** `POST /api/auto-review/work` takes `{"exclude": [...], "import_capacity": 0|1}`, so the in-flight list has no length limit. The query form, which rejected more than 20 exclusions, now accepts any number and stays for older workers. Deploy the service before the worker.
+
 ## [0.12.17] — 2026-11-19
 
 ### Fixed
