@@ -218,12 +218,14 @@ class _Engine:
         self.snapshot_calls = 0
         self.pr_calls = 0
         self.skill_line = None
+        self.last_diff = ""
         self.llm = SimpleNamespace(close_conversations=AsyncMock())
 
     async def review_snapshot(self, pr_info: PRInfo, diff_text: str, **kwargs) -> ReviewResult:
         from mira.llm.router_acp import review_skill_line
 
         self.skill_line = review_skill_line.get()
+        self.last_diff = diff_text
         self.snapshot_calls += 1
         if self.write and self.provider is not None:
             self.provider.write_attempts.append(self.write)  # type: ignore[attr-defined]
@@ -330,6 +332,8 @@ def test_enablement_steps_need_no_code_reconstruction(
     assert "Role: gate" in review_preamble(HEAD, "gate")
     assert skill_line("opinion") == "[router: skill=review-opinion]"
     assert skill_line("gate") == "[router: skill=review-gate]"
+    assert skill_line("opinion", "review-grok") == "[router: skill=review-grok]"
+    assert skill_line("opinion", "not-a-skill") == "[router: skill=review-opinion]"
 
 
 def test_flag_off_keeps_today_reviewer(db: AppDatabase, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -358,24 +362,177 @@ def test_ownership_gates(db: AppDatabase, monkeypatch: pytest.MonkeyPatch) -> No
     assert ownership(db, "acme", "widgets", 7) == "enqueue"
 
 
-async def test_webhook_enqueues_one_row_and_skips_legacy_handler(
+async def test_webhook_enqueues_both_roles_and_skips_legacy_handler(
     db: AppDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _enable(monkeypatch, db)
     status, scheduled = await _dispatch(db, _payload(draft=True), monkeypatch)
     assert status == "processing"
     assert handle_pull_request not in scheduled
-    row = _store(db).get_by_head("hickoryai", "hickory-ai", 7, HEAD)
-    assert row is not None
-    assert row.state == "queued"
-    assert row.base_sha == BASE
+    rows = _store(db).list_for_head("hickoryai", "hickory-ai", 7, HEAD)
+    assert {(row.role, row.skill, row.state, row.base_sha) for row in rows} == {
+        ("opinion", "review-opinion", "queued", BASE),
+        ("gate", "review-gate", "queued", BASE),
+    }
 
     again, scheduled_again = await _dispatch(
         db, _payload(action="ready_for_review", draft=True), monkeypatch
     )
     assert again == "processing"
     assert handle_pull_request not in scheduled_again
-    assert _store(db).get_by_head("hickoryai", "hickory-ai", 7, HEAD).id == row.id
+    again_rows = _store(db).list_for_head("hickoryai", "hickory-ai", 7, HEAD)
+    assert {row.id for row in again_rows} == {row.id for row in rows}
+
+
+async def test_later_webhook_queues_gate_and_grok_opinion(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable(monkeypatch, db)
+    store = _store(db)
+    posted, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+    )
+    job = store.claim_next("worker", lease_seconds=30, deadline_seconds=30)
+    assert job is not None
+    assert store.begin_post(job.id)
+    assert store.mark_posted(job.id, 4)
+    status, scheduled = await _dispatch(db, _payload(sha=HEAD_NEXT), monkeypatch)
+    assert status == "processing"
+    assert handle_pull_request not in scheduled
+    rows = store.list_for_head("hickoryai", "hickory-ai", 7, HEAD_NEXT)
+    assert {(row.role, row.skill) for row in rows} == {
+        ("gate", "review-gate"),
+        ("opinion", "review-grok"),
+    }
+    assert store.get(posted.id).state == "posted"
+
+
+def test_supersede_and_claim_stay_inside_one_role(db: AppDatabase) -> None:
+    store = _store(db)
+    opinion, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+        role="opinion",
+        skill="review-opinion",
+    )
+    gate, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+        role="gate",
+        skill="review-gate",
+    )
+    moved, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD_NEXT,
+        base_sha=BASE,
+        installation_id=42,
+        role="opinion",
+        skill="review-grok",
+    )
+    assert store.get(opinion.id).state == "superseded"
+    assert store.get(gate.id).state == "queued"
+    assert moved.skill == "review-grok"
+    first = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30, max_running=2)
+    second = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30, max_running=2)
+    assert first is not None and second is not None
+    assert {first.role, second.role} == {"opinion", "gate"}
+    assert store.begin_post(first.id) is True
+
+
+async def test_later_head_reviews_the_delta_and_names_its_skill(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(db)
+    first = _running(store)
+    full = _frozen(HEAD)
+
+    async def _capture(_reader: object, req) -> FrozenSnapshot:
+        return _frozen(req.head_sha)
+
+    monkeypatch.setattr("mira.auto_review.runner.capture", _capture)
+    incremental = AsyncMock(side_effect=AssertionError("first head has no prior review"))
+    reader = SimpleNamespace(
+        get_pull=AsyncMock(return_value=full.meta),
+        freeze=AsyncMock(return_value=full),
+        incremental=incremental,
+    )
+    engine = _Engine()
+    poster = _Poster()
+
+    async def _post(store_arg, request_id, pr_info, result, head_sha) -> int:
+        return await post_if_current(store_arg, request_id, poster, pr_info, result, head_sha)
+
+    await execute_request(
+        store,
+        first,
+        AsyncMock(return_value=reader),
+        engine_factory=lambda *_a, **_k: engine,
+        poster=_post,
+    )
+    assert engine.last_diff == full.diff_text
+    assert engine.skill_line == "[router: skill=review-opinion]"
+    incremental.assert_not_called()
+
+    later, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD_NEXT,
+        base_sha=BASE,
+        installation_id=42,
+        role="gate",
+        skill="review-gate",
+    )
+    claimed = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30, max_running=2)
+    assert claimed is not None and claimed.id == later.id
+    delta = _frozen(HEAD_NEXT)
+    delta_text = "diff --git a/new.py b/new.py\n+new\n"
+    from dataclasses import replace
+
+    delta = replace(delta, diff_text=delta_text)
+    seen: list[str] = []
+
+    async def _incremental(_meta, previous: str) -> FrozenSnapshot:
+        seen.append(previous)
+        return delta
+
+    later_reader = SimpleNamespace(
+        get_pull=AsyncMock(return_value=delta.meta),
+        freeze=AsyncMock(return_value=delta),
+        incremental=_incremental,
+    )
+    later_engine = _Engine()
+    await execute_request(
+        store,
+        claimed,
+        AsyncMock(return_value=later_reader),
+        engine_factory=lambda *_a, **_k: later_engine,
+        poster=_post,
+    )
+    assert seen == [HEAD]
+    assert later_engine.last_diff == delta_text
+    assert later_engine.skill_line == "[router: skill=review-gate]"
+    assert poster.calls == [HEAD, HEAD_NEXT]
 
 
 async def test_flag_on_enqueues_every_installed_repo(
@@ -543,12 +700,25 @@ def test_lapsed_lease_is_requeued_unless_superseded_or_posting(db: AppDatabase) 
     assert store.interrupt_expired(now=time.time() + 3600) == 0
 
 
-def test_existing_table_gains_the_interruption_column(db: AppDatabase) -> None:
+def test_existing_table_gains_role_skill_and_head_role_key(db: AppDatabase) -> None:
     _store(db)
     conn = db._sqlite_conn
     assert conn is not None
-    conn.execute("ALTER TABLE auto_review_requests DROP COLUMN role")
-    conn.execute("ALTER TABLE auto_review_requests DROP COLUMN interrupt_count")
+    conn.execute("DROP TABLE auto_review_requests")
+    conn.execute(
+        "CREATE TABLE auto_review_requests ("
+        "id TEXT PRIMARY KEY, platform TEXT NOT NULL, owner TEXT NOT NULL, "
+        "repo TEXT NOT NULL, pr_number INTEGER NOT NULL, head_sha TEXT NOT NULL, "
+        "base_sha TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', "
+        "installation_id INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL, "
+        "posted_review_id TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '', "
+        "error_message TEXT NOT NULL DEFAULT '', lease_owner TEXT NOT NULL DEFAULT '', "
+        "lease_expires_at DOUBLE PRECISION NOT NULL DEFAULT 0, "
+        "created_at DOUBLE PRECISION NOT NULL, updated_at DOUBLE PRECISION NOT NULL, "
+        "started_at DOUBLE PRECISION NOT NULL DEFAULT 0, "
+        "finished_at DOUBLE PRECISION NOT NULL DEFAULT 0, "
+        "UNIQUE (platform, owner, repo, pr_number, head_sha))"
+    )
     conn.commit()
     store = _store(db)
     store.enqueue(
@@ -564,6 +734,21 @@ def test_existing_table_gains_the_interruption_column(db: AppDatabase) -> None:
     assert job is not None
     assert job.interrupt_count == 0
     assert job.role == "opinion"
+    assert job.skill == ""
+    gate, inserted = store.enqueue(
+        platform="github",
+        owner="example",
+        repo="project",
+        pr_number=3,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+        role="gate",
+        skill="review-gate",
+    )
+    assert inserted
+    assert gate.id != job.id
+    assert gate.role == "gate"
 
 
 def test_third_interruption_skips_the_head(db: AppDatabase) -> None:
