@@ -280,16 +280,30 @@ class AutoReviewStore:
         return [AutoReviewRequest(*row) for row in rows]
 
     def latest_posted_head(
-        self, platform: str, owner: str, repo: str, pr_number: int
+        self,
+        platform: str,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        *,
+        exclude_sha: str | None = None,
     ) -> str | None:
-        """Newest head this pull request has already posted, or none."""
+        """Newest posted head other than ``exclude_sha``, or none.
+
+        A posted role of the head under review is not an earlier head.
+        """
+        sql = (
+            "SELECT head_sha FROM auto_review_requests "  # noqa: S608
+            "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
+            "AND state = 'posted'"
+        )
+        params: list[Any] = [platform, owner, repo, pr_number]
+        if exclude_sha:
+            sql += " AND head_sha != ?"
+            params.append(exclude_sha)
+        sql += " ORDER BY finished_at DESC, id DESC LIMIT 1"
         with self._cursor() as cur:
-            cur.execute(
-                "SELECT head_sha FROM auto_review_requests "  # noqa: S608
-                "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
-                "AND state = 'posted' ORDER BY finished_at DESC, id DESC LIMIT 1",
-                (platform, owner, repo, pr_number),
-            )
+            cur.execute(sql, tuple(params))
             row = cur.fetchone()
         return str(row[0]) if row else None
 

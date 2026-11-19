@@ -439,7 +439,8 @@ def _auto_review_status(payload: dict[str, Any]) -> str | None:
     deliveries that omit ``head.sha`` stay valid while the path is off.
     Drafts are included. ``ready_for_review`` for a sha that is already
     queued inserts nothing. A first head queues an opinion and a gate.
-    A head after a posted review queues a gate and a Grok-only opinion.
+    A head after a posted review of another head queues a gate and a
+    Grok-only opinion. A posted role of this head does not count.
     """
     from mira.auto_review.config import flag_on, jobs_for, ownership
 
@@ -470,7 +471,7 @@ def _auto_review_status(payload: dict[str, Any]) -> str | None:
     from mira.auto_review.store import AutoReviewStore
 
     store = AutoReviewStore(_get_app_db())
-    prior = store.latest_posted_head("github", owner, repo, number)
+    prior = store.latest_posted_head("github", owner, repo, number, exclude_sha=head_sha)
     inserted_any = False
     for role, skill in jobs_for(prior is not None):
         _row, inserted = store.enqueue(
