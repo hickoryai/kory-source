@@ -1,5 +1,6 @@
 """Stdout previews recorded import errors; the run row keeps the full text."""
 
+import json
 import logging
 
 import pytest
@@ -342,6 +343,135 @@ def test_failed_file_does_not_block_the_next_file(tmp_path, monkeypatch):
         ]
         assert revisions.count("example/sample:b.md") == 1
         assert "example/sample:a.md" not in revisions
+
+
+OUTAGE = "Router completion failed: import worker: workstation_outage: HTTP 502"
+
+
+def _md_repo(tmp_path, names):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    for name in names:
+        (repo / f"{name}.md").write_text(f"We use stable {name} names because clients keep them.\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "Fixture")
+    return repo
+
+
+def _fail_for(provider, names):
+    respond = provider.respond
+
+    async def transport(request):
+        if any(f"stable {name} names" in request["body"]["prompt"] for name in names):
+            raise RuntimeError(OUTAGE)
+        return await respond(request)
+
+    provider._transport = transport
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "classification group: traced decision classification failed: NonRetriableLLMError: "
+        "Router completion failed: import worker: workstation_outage",
+        "classification group: import worker: no_worker_before_deadline",
+        "classification group: NonRetriableLLMError: router_acp_failed",
+        "classification group: OperationalError: the connection is lost",
+    ],
+)
+def test_transport_failures_are_retryable(message):
+    from mira.registry.repository_history import _retryable
+
+    assert _retryable(message)
+
+
+def test_content_failures_are_not_retryable():
+    from mira.registry.repository_history import _retryable
+
+    assert not _retryable(
+        "classification group: invalid decision classification response: "
+        "one classification is required for every passage"
+    )
+
+
+def test_outage_group_is_not_marked_failed_and_the_next_batch_stores_it(tmp_path, monkeypatch):
+    repo = _md_repo(tmp_path, ["a", "b"])
+    monkeypatch.setattr("mira.registry.repository_history._GROUP_FILES", 1)
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
+        reg, importer = _importer(tmp_path, repo, rp.operator())
+        provider = importer.classifier._supplied_provider
+        respond = provider.respond
+        _fail_for(provider, ["a"])
+        first = importer.run(apply=True)
+        assert first["status"] == "incomplete"
+        assert first["errors_by_type"] == {"workstation_outage": 1}
+        stored = ImportRuns(reg).get(first["run_id"])
+        assert "failed" not in stored["checkpoint"]
+        assert "md:a.md" not in stored["checkpoint"]["done"]
+        assert "md:b.md" in stored["checkpoint"]["done"]
+        assert any(OUTAGE in item for item in stored["errors"])
+        provider._transport = respond
+        second = importer.run(apply=True)
+        assert second["run_id"] == first["run_id"]
+        assert second["status"] == "complete"
+        assert second["units_read"]["md"] == 1
+        assert "md:a.md" in ImportRuns(reg).get(second["run_id"])["checkpoint"]["done"]
+
+
+def test_resume_retries_outage_entries_recorded_as_failed_by_an_older_batch(tmp_path):
+    repo = _md_repo(tmp_path, ["a"])
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
+        reg, importer = _importer(tmp_path, repo, rp.operator())
+        provider = importer.classifier._supplied_provider
+        respond = provider.respond
+        _fail_for(provider, ["a"])
+        first = importer.run(apply=True)
+        legacy = f"classification group: traced decision classification failed: {OUTAGE}"
+        content = "classification group: one classification is required for every passage"
+        checkpoint = {
+            **ImportRuns(reg).get(first["run_id"])["checkpoint"],
+            "failed": {"md:a.md": legacy, "md:gone.md": content},
+        }
+        reg.db.execute(
+            "UPDATE registry_import_runs SET checkpoint = ? WHERE run_id = ?",
+            (json.dumps(checkpoint, sort_keys=True), first["run_id"]),
+        )
+        provider._transport = respond
+        second = importer.run(apply=True)
+        assert second["run_id"] == first["run_id"]
+        assert second["units_read"]["md"] == 1
+        resumed = ImportRuns(reg).get(second["run_id"])
+        assert resumed["checkpoint"]["failed"] == {"md:gone.md": content}
+        assert "md:a.md" in resumed["checkpoint"]["done"]
+        assert f"md:a.md: {legacy}" in resumed["errors"]
+
+
+def test_batch_stops_after_three_consecutive_retryable_failures(tmp_path, monkeypatch):
+    repo = _md_repo(tmp_path, ["a", "b", "c", "d", "e"])
+    monkeypatch.setattr("mira.registry.repository_history._GROUP_FILES", 1)
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
+        reg, importer = _importer(tmp_path, repo, rp.operator())
+        _fail_for(importer.classifier._supplied_provider, ["a", "b", "c", "d", "e"])
+        result = importer.run(apply=True)
+        assert result["status"] == "incomplete"
+        assert result["per_source"]["md"]["nominated"] == 3
+        assert result["errors_by_type"] == {"workstation_outage": 3, "retryable_stop": 1}
+        stored = ImportRuns(reg).get(result["run_id"])
+        assert "failed" not in stored["checkpoint"]
+        assert stored["checkpoint"]["done"] == []
+
+
+def test_a_stored_group_resets_the_consecutive_failure_count(tmp_path, monkeypatch):
+    repo = _md_repo(tmp_path, ["a", "b", "c", "d", "e"])
+    monkeypatch.setattr("mira.registry.repository_history._GROUP_FILES", 1)
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
+        reg, importer = _importer(tmp_path, repo, rp.operator())
+        _fail_for(importer.classifier._supplied_provider, ["a", "b", "d", "e"])
+        result = importer.run(apply=True)
+        assert result["per_source"]["md"]["nominated"] == 5
+        assert result["errors_by_type"] == {"workstation_outage": 4}
+        assert ImportRuns(reg).get(result["run_id"])["checkpoint"]["done"] == ["log:", "md:c.md"]
 
 
 def test_deleted_historical_path_is_counted_but_git_failures_raise(tmp_path, monkeypatch):

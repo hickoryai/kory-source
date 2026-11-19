@@ -69,6 +69,8 @@ def _record_error(errors: list[str], message: str) -> None:
 
 def _error_preview(errors: list[str]) -> dict[str, Any]:
     def kind(message):
+        if message.startswith("retryable failures:"):
+            return "retryable_stop"
         if "workstation_outage" in message or "Router workstation outage" in message:
             return "workstation_outage"
         if "no_worker_before_deadline" in message:
@@ -89,6 +91,31 @@ def _error_preview(errors: list[str]) -> dict[str, Any]:
         "errors_by_type": dict(Counter(kind(item) for item in errors)),
         "errors": [item[:_ERROR_PREVIEW_CHARS] for item in errors[:_ERROR_PREVIEW_COUNT]],
     }
+
+
+# A group that failed for one of these reasons failed in transport, not on its
+# content. A later batch retries it, so it never enters checkpoint.failed.
+_RETRYABLE_MARKERS = (
+    "workstation_outage",
+    "Router workstation outage",
+    "Router completion failed",
+    "router_acp_",
+    "import worker:",
+    "no_worker_before_deadline",
+    "import_deadline",
+    "waiter_ended",
+    "seat_exhausted",
+    "OperationalError",
+    "connection is lost",
+    "server closed the connection",
+)
+# Consecutive retryable group failures that end a batch early, so an outage
+# cannot spend the whole time budget re-failing groups.
+_MAX_CONSECUTIVE_RETRYABLE = 3
+
+
+def _retryable(message: str) -> bool:
+    return any(marker in message for marker in _RETRYABLE_MARKERS)
 
 
 SOURCE_SYSTEM = "git"
@@ -892,6 +919,12 @@ class RepositoryHistoryImporter:
         failed = dict((run["checkpoint"] or {}).get("failed") or {})
         coverage_before = Counter(run["coverage"])
         errors: list[str] = []
+        # An older batch may have recorded a transport failure as permanent.
+        # Retry those files. The run's errors keep the original text.
+        for key in sorted(failed):
+            if _retryable(failed[key]):
+                errors.append(f"{key}: {failed.pop(key)}")
+        consecutive_retryable = 0
         units_read: Counter[str] = Counter()
         units = selected + [("log", "")]
         stop = False
@@ -905,11 +938,24 @@ class RepositoryHistoryImporter:
                 message = f"classification group: {exc}"
                 _record_error(errors, message)
                 # A budget stop is resumable. Completed batches stay cached, so
-                # the same files are nominated again. Any other group failure is
-                # recorded and skipped, or one file would consume every later batch.
+                # the same files are nominated again. So is a transport failure.
+                # A content failure is recorded and skipped, or one file would
+                # consume every later batch.
                 if "time budget reached" in str(exc):
                     self._flush_stats(run)
                     continue
+                if _retryable(message):
+                    self._flush_stats(run)
+                    consecutive_retryable += 1
+                    if consecutive_retryable >= _MAX_CONSECUTIVE_RETRYABLE:
+                        _record_error(
+                            errors,
+                            "retryable failures: stopping batch after "
+                            f"{consecutive_retryable} consecutive groups",
+                        )
+                        break
+                    continue
+                consecutive_retryable = 0
                 for kind, path, _, _ in group:
                     failed[f"{kind}:{path}"] = message
                 self._commit_cursor(run, done, failed)
@@ -929,6 +975,7 @@ class RepositoryHistoryImporter:
                     self.stages[kind]["classified_ok"] += ok
                     self.stages[kind]["classified_skipped"] += skipped_outcomes
                     self.stages[kind]["classified_failed"] += len(passages) - ok - skipped_outcomes
+            consecutive_retryable = 0
             offset = 0
             for kind, path, revisions, observations in group:
                 key = f"{kind}:{path}"
@@ -990,6 +1037,8 @@ class RepositoryHistoryImporter:
             checkpoint["done"] = sorted(done)
             if failed:
                 checkpoint["failed"] = {key: failed[key] for key in sorted(failed)}
+            else:
+                checkpoint.pop("failed", None)
             checkpoint["last_batch"] = batch
             run["next_checkpoint"] = checkpoint
         self._mark_stats_flushed()
