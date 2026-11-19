@@ -29,6 +29,22 @@ def test_error_preview_keeps_twenty_and_truncates_each_to_300_chars():
     assert preview["errors"][19].startswith("19-")
 
 
+def test_error_preview_names_workstation_outage_and_missed_worker():
+    preview = _error_preview(
+        [
+            "classification group: import worker: workstation_outage: relay connection reset by peer",
+            "Router workstation outage: seat dropped",
+            "classification group: import worker: no_worker_before_deadline",
+            "time budget reached; resume this scope",
+        ]
+    )
+    assert preview["errors_by_type"] == {
+        "workstation_outage": 2,
+        "no_worker_before_deadline": 1,
+        "time_budget": 1,
+    }
+
+
 def _importer(tmp_path, repo, access):
     reg = registry(tmp_path)
     classifier = DecisionClassifier(
@@ -101,6 +117,73 @@ def test_apply_stdout_previews_errors_and_the_row_keeps_the_full_text(
         sum(1 for rec in caplog.records if rec.levelno == logging.WARNING and detail in rec.message)
         == 2
     )
+
+
+def test_max_units_resume_skips_units_committed_before_finish(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "a.md").write_text("We use stable names because clients retain them.\n")
+    (repo / "b.md").write_text("We use stable labels because reports retain them.\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "Fixture")
+    with rp.policy(rp.manifest(repositories=[{"id": "sample", "full_name": REPO}])):
+        reg, importer = _importer(tmp_path, repo, rp.operator())
+        importer.max_units = 1
+        first = importer.run(apply=True)
+        assert first["status"] == "incomplete"
+        assert first["units_read"] == {"md": 1}
+        assert first["llm_calls_delta"] == 1
+        assert first["errors_by_type"] == {}
+        stored = ImportRuns(reg).get(first["run_id"])
+        assert stored["checkpoint"]["done"] == ["md:a.md"]
+        assert stored["checkpoint"]["last_batch"] == {
+            "units_read": {"md": 1},
+            "llm_calls_delta": 1,
+            "errors_by_type": {},
+        }
+        assert stored["coverage"]["units_read_md"] == 1
+        assert reg.db.execute(
+            "SELECT source_id FROM registry_source_revisions WHERE import_run_id = ?",
+            (first["run_id"],),
+        ) == [("example/sample:a.md",)]
+        # Pages already committed. A kill before finish leaves the row running.
+        reg.db.execute(
+            "UPDATE registry_import_runs SET status = 'running' WHERE run_id = ?",
+            (first["run_id"],),
+        )
+        resumed = RepositoryHistoryImporter(
+            reg,
+            GitReader(repo),
+            repo=REPO,
+            access=rp.operator(),
+            max_commits=0,
+            classifier=DecisionClassifier(
+                reg, corpus_id=rp.CORPUS, model="test/pinned", provider=FakeProvider()
+            ),
+        )
+        second = resumed.run(apply=True)
+        assert second["run_id"] == first["run_id"]
+        assert second["status"] == "complete"
+        assert second["units_read"] == {"md": 1, "log": 1}
+        assert second["llm_calls_delta"] == 0
+        assert second["coverage"]["units_read_md"] == 2
+        assert second["slice_coverage"]["units_read_md"] == 1
+        revisions = [
+            row[0]
+            for row in reg.db.execute(
+                "SELECT source_id FROM registry_source_revisions WHERE import_run_id = ? "
+                "ORDER BY source_id",
+                (first["run_id"],),
+            )
+        ]
+        assert revisions.count("example/sample:a.md") == 1
+        assert revisions.count("example/sample:b.md") == 1
+        assert set(ImportRuns(reg).get(second["run_id"])["checkpoint"]["done"]) == {
+            "md:a.md",
+            "md:b.md",
+            "log:",
+        }
 
 
 def test_sql_failed_group_counts_are_visible_and_resume_stores_sql(tmp_path, monkeypatch):
