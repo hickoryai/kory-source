@@ -18,6 +18,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Secondary reviewer, off by default.** When `KORY_SOURCE_AUTO_REVIEW=1`, every pull request delivered for a repository the GitHub App is installed on is reviewed once as a `COMMENT` on that frozen commit. The review body and each comment are labeled `Kory Source (secondary reviewer)` plus the head sha. The path never requests changes, never adds a required check, and never edits branch protection. While the flag is on, the unlabeled reviewer does not run. A pause skips that delivery. Pause and rollback are an admin setting and a process stop. The seat worker is started only at enablement, on the workstation that holds the logged-in router account pool. Name that host at runtime with `KORY_SOURCE_WORKER_HOST`; leave it unset for generic wording. With the flag unset, webhook reviews stay on today's path. The review request is unpinned (`auto`). The router selects the seat.
 - **Release images omit build attestations.** The Release workflow builds with provenance and SBOM disabled. It still audits every candidate layer before pushing that image.
 
+## [0.12.15] — 2026-11-19
+
+### Fixed
+
+- **A dead registry socket reconnects once before a transaction starts.** Entering a Postgres transaction reconnects once when the socket is already closed, then enters again. A failure after the body starts still raises. Nested transactions stay the same. There is no connection pre-ping.
+
 ## [0.12.14] — 2026-11-19
 
 ### Fixed
