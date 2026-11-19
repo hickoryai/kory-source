@@ -210,11 +210,17 @@ async def execute_request(
         result = None
         carried = None
         diff_text = snapshot.diff_text
-        prior = store.latest_posted_head(req.platform, req.owner, req.repo, req.pr_number)
+        prior = store.latest_posted_head(
+            req.platform,
+            req.owner,
+            req.repo,
+            req.pr_number,
+            exclude_sha=snapshot.meta.head_sha,
+        )
         if prior and prior != snapshot.meta.head_sha:
             try:
                 delta = await reader.incremental(snapshot.meta, prior)
-                diff_text = delta.diff_text
+                diff_text = _restrict_diff_to_paths(delta.diff_text, set(snapshot.changed_paths))
             except SnapshotError as exc:
                 logger.info("auto review full fallback request=%s reason=%s", req.id, exc.code)
         while True:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -413,6 +414,36 @@ async def test_later_webhook_queues_gate_and_grok_opinion(
     assert store.get(posted.id).state == "posted"
 
 
+async def test_posted_role_of_this_head_still_enqueues_a_first_head_opinion(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _enable(monkeypatch, db)
+    store = _store(db)
+    gate, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+        role="gate",
+        skill="review-gate",
+    )
+    job = store.claim_next("worker", lease_seconds=30, deadline_seconds=30)
+    assert job is not None and job.id == gate.id
+    assert store.begin_post(job.id)
+    assert store.mark_posted(job.id, 4)
+    status, scheduled = await _dispatch(db, _payload(sha=HEAD), monkeypatch)
+    assert status == "processing"
+    assert handle_pull_request not in scheduled
+    rows = store.list_for_head("hickoryai", "hickory-ai", 7, HEAD)
+    assert {(row.role, row.skill, row.state) for row in rows} == {
+        ("gate", "review-gate", "posted"),
+        ("opinion", "review-opinion", "queued"),
+    }
+
+
 def test_supersede_and_claim_stay_inside_one_role(db: AppDatabase) -> None:
     store = _store(db)
     opinion, _ = store.enqueue(
@@ -506,7 +537,7 @@ async def test_later_head_reviews_the_delta_and_names_its_skill(
     claimed = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30, max_running=2)
     assert claimed is not None and claimed.id == later.id
     delta = _frozen(HEAD_NEXT)
-    delta_text = "diff --git a/new.py b/new.py\n+new\n"
+    delta_text = "diff --git a/a.py b/a.py\n+new\n"
     from dataclasses import replace
 
     delta = replace(delta, diff_text=delta_text)
@@ -533,6 +564,173 @@ async def test_later_head_reviews_the_delta_and_names_its_skill(
     assert later_engine.last_diff == delta_text
     assert later_engine.skill_line == "[router: skill=review-gate]"
     assert poster.calls == [HEAD, HEAD_NEXT]
+
+
+async def test_gate_reviews_prior_delta_after_opinion_posts_same_head(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(db)
+    earlier, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+        role="gate",
+        skill="review-gate",
+    )
+    posted = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
+    assert posted is not None and posted.id == earlier.id
+    assert store.begin_post(posted.id)
+    assert store.mark_posted(posted.id, 4)
+
+    opinion, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD_NEXT,
+        base_sha=BASE,
+        installation_id=42,
+        role="opinion",
+        skill="review-opinion",
+    )
+    full_text = "diff --git a/a.py b/a.py\n+full pull request\n"
+    delta_text = "diff --git a/a.py b/a.py\n+from a to b\n"
+
+    async def _capture(_reader: object, req) -> FrozenSnapshot:
+        return replace(_frozen(req.head_sha), diff_text=full_text)
+
+    monkeypatch.setattr("mira.auto_review.runner.capture", _capture)
+    seen: list[str] = []
+
+    async def _incremental(meta, previous: str) -> FrozenSnapshot:
+        seen.append(previous)
+        return replace(_frozen(meta.head_sha), diff_text=delta_text)
+
+    reader = SimpleNamespace(
+        get_pull=AsyncMock(return_value=_frozen(HEAD_NEXT).meta),
+        freeze=AsyncMock(return_value=_frozen(HEAD_NEXT)),
+        incremental=_incremental,
+    )
+    poster = _Poster()
+
+    async def _post(store_arg, request_id, pr_info, result, head_sha) -> int:
+        return await post_if_current(store_arg, request_id, poster, pr_info, result, head_sha)
+
+    opinion_job = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30)
+    assert opinion_job is not None and opinion_job.id == opinion.id
+    await execute_request(
+        store,
+        opinion_job,
+        AsyncMock(return_value=reader),
+        engine_factory=lambda *_a, **_k: _Engine(),
+        poster=_post,
+    )
+    assert store.get(opinion.id).state == "posted"
+
+    gate, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD_NEXT,
+        base_sha=BASE,
+        installation_id=42,
+        role="gate",
+        skill="review-gate",
+    )
+    seen.clear()
+    gate_engine = _Engine()
+    gate_job = store.claim_next("worker-c", lease_seconds=30, deadline_seconds=30)
+    assert gate_job is not None and gate_job.id == gate.id
+    await execute_request(
+        store,
+        gate_job,
+        AsyncMock(return_value=reader),
+        engine_factory=lambda *_a, **_k: gate_engine,
+        poster=_post,
+    )
+    assert seen == [HEAD]
+    assert gate_engine.last_diff == delta_text
+
+
+async def test_later_head_drops_delta_paths_outside_the_pull_request(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(db)
+    earlier, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD,
+        base_sha=BASE,
+        installation_id=42,
+        role="opinion",
+        skill="review-opinion",
+    )
+    posted = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
+    assert posted is not None and posted.id == earlier.id
+    assert store.begin_post(posted.id)
+    assert store.mark_posted(posted.id, 4)
+
+    gate, _ = store.enqueue(
+        platform="github",
+        owner="hickoryai",
+        repo="hickory-ai",
+        pr_number=7,
+        head_sha=HEAD_NEXT,
+        base_sha=BASE,
+        installation_id=42,
+        role="gate",
+        skill="review-gate",
+    )
+    mixed = (
+        "diff --git a/a.py b/a.py\n"
+        "--- a/a.py\n"
+        "+++ b/a.py\n"
+        "+pr line\n"
+        "diff --git a/main.py b/main.py\n"
+        "--- a/main.py\n"
+        "+++ b/main.py\n"
+        "+main line\n"
+    )
+
+    async def _capture(_reader: object, req) -> FrozenSnapshot:
+        return _frozen(req.head_sha)
+
+    monkeypatch.setattr("mira.auto_review.runner.capture", _capture)
+
+    async def _incremental(meta, _previous: str) -> FrozenSnapshot:
+        return replace(_frozen(meta.head_sha), diff_text=mixed)
+
+    reader = SimpleNamespace(
+        get_pull=AsyncMock(return_value=_frozen(HEAD_NEXT).meta),
+        freeze=AsyncMock(return_value=_frozen(HEAD_NEXT)),
+        incremental=_incremental,
+    )
+    engine = _Engine()
+    poster = _Poster()
+
+    async def _post(store_arg, request_id, pr_info, result, head_sha) -> int:
+        return await post_if_current(store_arg, request_id, poster, pr_info, result, head_sha)
+
+    job = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30)
+    assert job is not None and job.id == gate.id
+    await execute_request(
+        store,
+        job,
+        AsyncMock(return_value=reader),
+        engine_factory=lambda *_a, **_k: engine,
+        poster=_post,
+    )
+    assert "diff --git a/a.py b/a.py" in engine.last_diff
+    assert "+pr line" in engine.last_diff
+    assert "main.py" not in engine.last_diff
+    assert "+main line" not in engine.last_diff
 
 
 async def test_flag_on_enqueues_every_installed_repo(
