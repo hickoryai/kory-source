@@ -262,6 +262,37 @@ async def test_routes_review_first_opt_in_and_no_unadmitted_answers(queue, monke
         assert store.get(work_id)["result_json"] == "{}"
 
 
+async def test_route_keeps_worker_detail_on_an_import_failure(queue, monkeypatch):
+    from types import SimpleNamespace
+
+    store, _run = queue
+    work_id = enqueue(queue)
+    reviews = SimpleNamespace(next_pending=lambda exclude=(): None, get_work=lambda _: None)
+    monkeypatch.setattr(routes, "_store", lambda: reviews)
+    monkeypatch.setattr(routes, "_import_store", lambda: store)
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def worker(request, call_next):
+        request.state.auto_review_worker = True
+        return await call_next(request)
+
+    app.include_router(routes.router)
+    detail = "http 502: model grok-9 is not routeable"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        item = (await client.get("/api/auto-review/work?import_capacity=1")).json()
+        response = await client.post(
+            "/api/auto-review/work/" + item["work_id"],
+            json={"error": "workstation_outage", "actual_model": "unknown", "detail": detail},
+        )
+    assert response.status_code == 200
+    row = store.get(work_id)
+    assert row["error_code"] == "workstation_outage"
+    assert json.loads(row["result_json"])["detail"] == detail
+
+
 async def test_in_flight_review_does_not_block_an_import_claim(queue, monkeypatch):
     from types import SimpleNamespace
 
