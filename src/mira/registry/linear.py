@@ -46,6 +46,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterator
 from datetime import datetime
+from uuid import uuid4
 
 import httpx
 
@@ -73,6 +74,8 @@ PAGE_SIZE = 50
 # A new walk starts this far before the last completed walk began, so an edit
 # saved while that walk was paging is read again (idempotently) next time.
 WATERMARK_OVERLAP = 300.0
+INCREMENTAL_LEASE_STREAM = "incremental_lease"
+INCREMENTAL_LEASE_SECONDS = 900
 MAX_ATTEMPTS = 5
 # Relations Linear stores once, on the issue that holds them. Types not listed
 # here ("similar") are reported by the inventory and not imported.
@@ -514,17 +517,67 @@ class LinearImporter:
         assert self.policy is not None
         return self.policy.corpus_id, self.policy.policy_version
 
-    def run(self, *, apply: bool = False) -> dict:
+    def run(self, *, apply: bool = False, incremental_only: bool = False) -> dict:
         # Scope is checked before any Linear call: a rejected team is never fetched.
         self.policy = require_import(self.access)
         self.teams = manifest_teams(self.policy, self.requested_teams)
         out: dict = {"apply": apply, "corpus_id": self.policy.corpus_id}
-        for stream in STREAMS:
+        if not incremental_only:
+            return self._run_streams(out, apply, incremental_only=False)
+
+        watermarks = {stream: self.state(stream)["watermark"] for stream in STREAMS}
+        if not any(watermarks.values()):
+            status = "waiting_for_backfill"
+        elif not apply:
+            return self._run_streams(out, apply, incremental_only=True)
+        elif owner := self._claim_incremental_lease():
+            try:
+                return self._run_streams(out, apply, incremental_only=True)
+            finally:
+                self.registry.db.execute(
+                    "DELETE FROM registry_sync_state "
+                    "WHERE source_system = ? AND stream = ? AND after_cursor = ?",
+                    (SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, owner),
+                )
+        else:
+            status = "already_running"
+        for stream, watermark in watermarks.items():
+            out[stream] = self._incremental_status(status, watermark, watermark)
+        return out
+
+    def _claim_incremental_lease(self) -> str | None:
+        owner = uuid4().hex
+        now = self.clock()
+        claimed = self.registry.db.execute(
+            "INSERT INTO registry_sync_state (source_system, stream, after_cursor, updated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (source_system, stream) DO UPDATE SET "
+            "after_cursor = excluded.after_cursor, updated_at = excluded.updated_at "
+            "WHERE registry_sync_state.updated_at <= ? RETURNING after_cursor",
+            (SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, owner, now, now - INCREMENTAL_LEASE_SECONDS),
+        )
+        return owner if claimed else None
+
+    def _incremental_status(self, status: str, before: float, after: float) -> dict:
+        return {
+            "status": status,
+            "watermark_before": to_iso(before) if before else None,
+            "watermark_after": to_iso(after) if after else None,
+            "lag_seconds": self.clock() - after if after else None,
+        }
+
+    def _run_streams(self, out: dict, apply: bool, *, incremental_only: bool) -> dict:
+        assert self.policy is not None
+        for index, stream in enumerate(STREAMS):
             self._run = None
+            if incremental_only:
+                before = self.state(stream)["watermark"]
+                if not before:
+                    out[stream] = self._incremental_status("waiting_for_backfill", before, before)
+                    continue
             if apply:
                 # Reset before opening the first upgraded run. A subsequent
                 # resume must keep that run's page cursor, even after a crash.
-                if self._needs_extraction_backfill(stream):
+                if not incremental_only and self._needs_extraction_backfill(stream):
                     self._save(
                         stream,
                         {
@@ -547,16 +600,37 @@ class LinearImporter:
                     },
                 )
             try:
-                out[stream] = self._walk(stream, apply)
+                result = self._walk(stream, apply, incremental_only=incremental_only)
+            except LinearError as exc:
+                if self._run is not None:
+                    self.runs.finish(self._run, complete=False, errors=[str(exc)])
+                if not incremental_only:
+                    raise
+                out[stream] = self._incremental_status("incomplete", before, before) | {
+                    "errors": [str(exc)]
+                }
+                # The client already exhausted its retry budget. Leave the other
+                # streams for the next tick as well.
+                for next_stream in STREAMS[index + 1 :]:
+                    watermark = self.state(next_stream)["watermark"]
+                    status = "incomplete" if watermark else "waiting_for_backfill"
+                    out[next_stream] = self._incremental_status(status, watermark, watermark)
+                break
             except Exception as exc:
                 if self._run is not None:
                     self.runs.finish(self._run, complete=False, errors=[str(exc)])
                 raise
             if self._run is not None:
-                done = self.runs.finish(self._run, complete=True, errors=out[stream]["errors"])
-                out[stream]["run_id"] = done["run_id"]
-                out[stream]["run_status"] = done["status"]
-        out["sync_status"] = self.registry.sync_status(SOURCE_SYSTEM, self.access)
+                done = self.runs.finish(self._run, complete=True, errors=result["errors"])
+                result.update(run_id=done["run_id"], run_status=done["status"])
+            if incremental_only:
+                status = "incomplete" if result["errors"] else "complete"
+                result.update(
+                    self._incremental_status(status, before, self.state(stream)["watermark"])
+                )
+            out[stream] = result
+        if not incremental_only:
+            out["sync_status"] = self.registry.sync_status(SOURCE_SYSTEM, self.access)
         return out
 
     # state rows
@@ -602,9 +676,9 @@ class LinearImporter:
         )
         return bool(versions) and not any(row[0] == IMPORTER_VERSION for row in versions)
 
-    def _walk(self, stream: str, apply: bool) -> dict:
+    def _walk(self, stream: str, apply: bool, *, incremental_only: bool) -> dict:
         st = self.state(stream)
-        if not apply and self._needs_extraction_backfill(stream):
+        if not incremental_only and not apply and self._needs_extraction_backfill(stream):
             st = {"watermark": 0.0, "walk_since": 0.0, "walk_started_at": 0.0, "after_cursor": ""}
         if not st["after_cursor"]:
             st["walk_since"] = max(st["watermark"] - WATERMARK_OVERLAP, 0.0)
@@ -618,20 +692,25 @@ class LinearImporter:
         filt = _and(scope, since)
         totals: Counter[str] = Counter()
         errors: list[dict] = []
+        truncated: set[str] | None = set() if incremental_only else None
         after = st["after_cursor"] or None
         try:
-            self._pages(stream, document, filt, after, st, apply, totals, errors)
+            self._pages(stream, document, filt, after, st, apply, totals, errors, truncated)
         except LinearCursorRejected as exc:
             logger.warning("Linear %s cursor rejected (%s); restarting walk", stream, exc)
             totals["walk_restarted"] += 1
-            self._pages(stream, document, filt, None, st, apply, totals, errors)
+            self._pages(stream, document, filt, None, st, apply, totals, errors, truncated)
         retried: dict = {}
-        if apply and stream == "issues":
+        # The manual importer repairs pending links by ID, outside this window.
+        if apply and stream == "issues" and not incremental_only:
             retried = self._retry_pending(errors)
-        if apply:
+        if apply and (not incremental_only or not errors):
             st.update(watermark=st["walk_started_at"], after_cursor="")
             self._save(stream, st)
-        return {"totals": dict(totals), "errors": errors, "retried": retried}
+        out = {"totals": dict(totals), "errors": errors, "retried": retried}
+        if truncated is not None and stream == "issues":
+            out["truncated_relations"] = sorted(truncated)
+        return out
 
     def _retry_pending(self, errors: list[dict]) -> dict:
         """Re-read the issues still waiting on a link target and import them again.
@@ -668,10 +747,17 @@ class LinearImporter:
         apply: bool,
         totals: Counter[str],
         errors: list[dict],
+        truncated: set[str] | None,
     ) -> None:
         for nodes, end_cursor in self.client.pages(document, stream, filt, after):
             if stream == "issues":
                 kept = [n for n in nodes if _admitted(self._policy(), n.get("team"))]
+                if truncated is not None:
+                    truncated.update(
+                        n["identifier"]
+                        for n in kept
+                        if ((n.get("relations") or {}).get("pageInfo") or {}).get("hasNextPage")
+                    )
                 totals["read"] += len(kept)
                 if len(nodes) > len(kept):
                     totals["excluded_outside_manifest"] += len(nodes) - len(kept)
@@ -713,7 +799,12 @@ class LinearImporter:
                     errors.append(res)
                 if res.get("sync_status") == "pending_links":
                     totals["pending_links"] += 1
-            if end_cursor:
+            if truncated is not None and errors:
+                # A later crash must not resume past an item that failed.
+                if st["after_cursor"]:
+                    st["after_cursor"] = ""
+                    self._save(stream, st)
+            elif end_cursor:
                 st["after_cursor"] = end_cursor
                 self._save(stream, st)
 
@@ -854,7 +945,14 @@ def main(argv: list[str] | None = None) -> int:
         "--team", action="append", help="limit to this Linear team key (default: every team)"
     )
     parser.add_argument("--apply", action="store_true", help="write to the registry")
+    parser.add_argument(
+        "--incremental-only",
+        action="store_true",
+        help="import only streams with a completed backfill",
+    )
     args = parser.parse_args(argv)
+    if args.incremental_only and args.command != "import":
+        parser.error("--incremental-only requires import")
     logging.basicConfig(level=logging.INFO)
     from mira.registry.access import operator_context
 
@@ -868,8 +966,10 @@ def main(argv: list[str] | None = None) -> int:
 
         registry = get_registry()
         assert registry is not None
-        out = LinearImporter(registry, client, args.team, access=access).run(apply=args.apply)
-    json.dump(out, sys.stdout, indent=2, default=str)
+        out = LinearImporter(registry, client, args.team, access=access).run(
+            apply=args.apply, incremental_only=args.incremental_only
+        )
+    json.dump(out, sys.stdout, indent=None if args.incremental_only else 2, default=str)
     sys.stdout.write("\n")
     return 0
 
