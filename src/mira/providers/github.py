@@ -33,6 +33,7 @@ from mira.providers.base import BaseProvider
 # tests import these names from this module).
 from mira.providers.formatting import (  # noqa: F401
     _CATEGORY_DISPLAY,
+    REVIEW_SUMMARY_HEADING,
     parse_bot_comment_metadata,
 )
 from mira.providers.formatting import (
@@ -549,7 +550,7 @@ class GitHubProvider(BaseProvider):
         if review_body is None:
             review_body = ""
             if result.summary:
-                review_body = f"**Mira Review Summary**\n\n{result.summary}"
+                review_body = f"{REVIEW_SUMMARY_HEADING}\n\n{result.summary}"
             if result.key_issues:
                 review_body += _format_key_issues(result.key_issues)
         review_body = append_model_footer(review_body, result.actual_models)
@@ -833,7 +834,7 @@ class GitHubProvider(BaseProvider):
                     author = comments[0].get("author")
                     if author is None:
                         continue
-                    if _normalize_login(author["login"]) == _normalize_login(bot_login):
+                    if is_own_review(author["login"], bot_login):
                         total_unresolved += 1
                         if node["isOutdated"]:
                             thread_ids.append(node["id"])
@@ -910,7 +911,7 @@ class GitHubProvider(BaseProvider):
                     continue
                 first = comments[0]
                 author = (first.get("author") or {}).get("login", "")
-                if _normalize_login(author) != _normalize_login(effective_login):
+                if not is_own_review(author, effective_login):
                     skipped_author += 1
                     logger.info(
                         "Skipping thread %s: author %r != %r",
@@ -1196,7 +1197,7 @@ class GitHubProvider(BaseProvider):
                     continue
                 first = comments[0]
                 author = (first.get("author") or {}).get("login", "")
-                if _normalize_login(author) != _normalize_login(effective_login):
+                if not is_own_review(author, effective_login):
                     continue
                 threads.append(
                     BotThreadRecord(

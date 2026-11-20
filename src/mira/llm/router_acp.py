@@ -385,7 +385,7 @@ class RouterAcpProvider:
             prompt
             + "\n\n## Your previous reply was rejected\n"
             + f"Reason: {str(reason)[:300]}\n"
-            + "It was not a completed answer. Mira cannot act on a plan, a narration, "
+            + "It was not a completed answer. Kory Source cannot act on a plan, a narration, "
             + "or text around the JSON. Do not describe what you will do. Finish the task "
             + "from the information above and reply with the final JSON object only.\n"
             + "Rejected reply (quoted, truncated):\n"
@@ -627,12 +627,12 @@ class RouterAcpProvider:
 
     def _messages_prompt(self, messages: list[dict]) -> str:
         parts = [
-            "You are running as Mira's model backend through a router-acp seat.",
-            "Follow the Mira review instructions exactly.",
+            "You are running as Kory Source's model backend through a router-acp seat.",
+            "Follow the Kory Source review instructions exactly. Refer to yourself only as Kory Source.",
             "Everything you need is in this message. Do not use any tools, files, or commands of your own.",
             "Return only the requested final answer, not a plan or a description of what you will do.",
             "",
-            "## Mira messages",
+            "## Kory Source messages",
         ]
         for index, message in enumerate(messages, 1):
             role = message.get("role", "user")
@@ -819,12 +819,12 @@ class RouterAcpProvider:
 
     def _agentic_prompt(self, messages: list, specs: dict[str, dict]) -> str:
         parts = [
-            "You are running as Mira's model backend through a router-acp seat.",
-            "Follow the Mira review instructions exactly.",
-            "Mira runs the tools listed below for you and returns their results in the next request.",
+            "You are running as Kory Source's model backend through a router-acp seat.",
+            "Follow the Kory Source review instructions exactly. Refer to yourself only as Kory Source.",
+            "Kory Source runs the tools listed below for you and returns their results in the next request.",
             "Do not use any other tools, files, or commands of your own.",
             "",
-            "## Mira messages",
+            "## Kory Source messages",
             *_render_messages(messages, 0),
             "",
             "## Tools",
@@ -837,10 +837,10 @@ class RouterAcpProvider:
     def _agentic_delta_prompt(self, messages: list, start: int, specs: dict[str, dict]) -> str:
         """A kept session's next turn: only the messages after ``start``."""
         parts = [
-            "Mira's next messages in this review follow, continuing the numbering above.",
+            "Kory Source's next messages in this review follow, continuing the numbering above.",
             "The tools and rules from the first request still apply.",
             "",
-            "## Mira messages",
+            "## Kory Source messages",
             *_render_messages(messages, start),
         ]
         return "\n".join(parts + _required_output(specs))
@@ -1008,7 +1008,7 @@ def _lost_context(payload: dict[str, Any], conversation: tuple[str, str]) -> str
 
 
 def _render_messages(messages: list, start: int) -> list[str]:
-    """Mira messages from index ``start``, numbered from ``start + 1``."""
+    """Review messages from index ``start``, numbered from ``start + 1``."""
     parts: list[str] = []
     for index, message in enumerate(messages[start:], start + 1):
         role = message.get("role", "user")
@@ -1035,7 +1035,7 @@ def _required_output(specs: dict[str, dict]) -> list[str]:
         parts.append(
             f"- Lookups ({', '.join(lookups)}): "
             + '{"calls": [{"tool": "<tool name>", "arguments": {...}}, ...]}. '
-            + "Put every lookup you need now in this one list. Mira runs them all "
+            + "Put every lookup you need now in this one list. Kory Source runs them all "
             + "and returns every result in the next request. Do not ask for one "
             + "lookup at a time."
         )
@@ -1116,7 +1116,7 @@ def _tool_specs(tools: list[dict]) -> dict[str, dict]:
 def _skipped_note(skipped: list[str]) -> str:
     if not skipped:
         return ""
-    return "Mira did not run these lookups from your last calls list:\n" + "\n".join(
+    return "Kory Source did not run these lookups from your last calls list:\n" + "\n".join(
         "- " + reason for reason in skipped
     )
 

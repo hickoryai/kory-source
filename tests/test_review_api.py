@@ -787,7 +787,7 @@ def test_pending_work_shape_and_relay_never_dialed(env):
         assert item["work_id"].startswith("wrk_") and len(item["work_id"]) == 36
         assert item["model"] == "auto"
         assert item["timeout_seconds"] == 900
-        assert "Mira" in item["prompt"]
+        assert "Kory Source" in item["prompt"]
         report = client.get(f"/api/reviews/{created['id']}/report", headers=_auth())
         assert item["prompt"] not in report.text
         done = _wait(client, created["id"])

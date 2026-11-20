@@ -50,6 +50,7 @@ def test_bot_evidence_is_not_human(author, body, account_type):
 def test_normalization_and_own_identity():
     assert normalize_login(" Posting-App[bot] ") == "posting-app"
     assert is_own_review("KORY-SOURCE[bot]", "another-bot")
+    assert is_own_review("miracodeai[bot]", "kory-source")
     assert is_own_review("posting-app", "Posting-App[bot]")
     assert classify_review_comment("alice", "Please revise", account_type="User") == "human_review"
 

@@ -32,7 +32,11 @@ from mira.models import (
 )
 from mira.platforms import profiles
 from mira.providers.base import BaseProvider
-from mira.providers.formatting import format_comment_body, format_key_issues
+from mira.providers.formatting import (
+    REVIEW_SUMMARY_HEADING,
+    format_comment_body,
+    format_key_issues,
+)
 from mira.providers.review_classification import (
     classify_review_comment,
     is_own_review,
@@ -331,7 +335,7 @@ class ForgejoProvider(BaseProvider):
 
         summary_text = ""
         if result.summary:
-            summary_text = f"**Mira Review Summary**\n\n{result.summary}"
+            summary_text = f"{REVIEW_SUMMARY_HEADING}\n\n{result.summary}"
         if result.key_issues:
             summary_text += format_key_issues(result.key_issues)
 
@@ -452,11 +456,11 @@ class ForgejoProvider(BaseProvider):
         try:
             async for review, comment in self._iter_review_comments(pr_info):
                 review_user = (review.get("user") or {}).get("username", "")
-                if bot_identities and review_user not in bot_identities:
+                if bot_identities and not is_own_review(review_user, *tuple(bot_identities)):
                     continue
 
                 comment_user = (comment.get("user") or {}).get("username", "")
-                if bot_identities and comment_user not in bot_identities:
+                if bot_identities and not is_own_review(comment_user, *tuple(bot_identities)):
                     continue
 
                 line = comment.get("new_position") or comment.get("line") or 0

@@ -27,7 +27,11 @@ from mira.models import (
 )
 from mira.platforms import profiles
 from mira.providers.base import BaseProvider
-from mira.providers.formatting import format_comment_body, format_key_issues
+from mira.providers.formatting import (
+    REVIEW_SUMMARY_HEADING,
+    format_comment_body,
+    format_key_issues,
+)
 from mira.providers.review_classification import (
     classify_review_comment,
     is_own_review,
@@ -375,7 +379,7 @@ class GitLabProvider(BaseProvider):
 
         review_body = ""
         if result.summary:
-            review_body = f"**Mira Review Summary**\n\n{result.summary}"
+            review_body = f"{REVIEW_SUMMARY_HEADING}\n\n{result.summary}"
         if result.key_issues:
             review_body += format_key_issues(result.key_issues)
         if review_body:
@@ -462,7 +466,7 @@ class GitLabProvider(BaseProvider):
             if note is None:
                 continue
             author = (note.get("author") or {}).get("username", "")
-            if bot_identities and author not in bot_identities:
+            if bot_identities and not is_own_review(author, *tuple(bot_identities)):
                 continue
             pos = note.get("position") or {}
             records.append(

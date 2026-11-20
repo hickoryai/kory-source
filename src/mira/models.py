@@ -6,8 +6,13 @@ import enum
 from dataclasses import dataclass, field
 
 WALKTHROUGH_MARKER = "<!-- mira-walkthrough -->"
+WALKTHROUGH_HEADING = "## Kory Source PR Walkthrough"
+# Reviews already posted under this heading are still the same comment.
+LEGACY_WALKTHROUGH_HEADINGS = ("## Mira PR Walkthrough",)
 PR_SUMMARY_START = "<!-- mira-pr-summary-start -->"
 PR_SUMMARY_END = "<!-- mira-pr-summary-end -->"
+PR_SUMMARY_HEADING = "## Summary by Kory Source"
+LEGACY_PR_SUMMARY_HEADINGS = ("## Summary by Mira",)
 
 
 class FileChangeType(enum.Enum):
@@ -216,7 +221,7 @@ class WalkthroughResult:
         failure_notice: str | None = None,
     ) -> str:
         """Render as a markdown PR comment."""
-        parts = [WALKTHROUGH_MARKER, "## Mira PR Walkthrough", ""]
+        parts = [WALKTHROUGH_MARKER, WALKTHROUGH_HEADING, ""]
         parts.append(self.summary)
 
         if self.sequence_diagram:
@@ -343,12 +348,16 @@ class WalkthroughResult:
             parts.append("")
             parts.append("---")
             parts.append("")
-            link = f"[Mira dashboard]({dashboard_url})" if dashboard_url else "the Mira dashboard"
+            link = (
+                f"[Kory Source dashboard]({dashboard_url})"
+                if dashboard_url
+                else "the Kory Source dashboard"
+            )
             parts.append(
-                f"> 💡 **This review will be more accurate after indexing.** "
+                f"> 💡 **Index this repo before relying on the review.** "
                 f"This repo hasn't been indexed yet, so the review is based on "
                 f"the diff plus on-demand file lookups. Visit {link} to index "
-                f"this repo — Mira will then know about callers, dependents, "
+                f"this repo. After indexing, Kory Source can use callers, dependents, "
                 f"and cross-repo impact."
             )
 

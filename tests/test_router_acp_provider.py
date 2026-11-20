@@ -831,7 +831,7 @@ async def test_mixed_valid_and_invalid_lookups_run_only_the_valid_ones():
     # A usable batch is not a bad response; the next step names what was skipped.
     assert [e["state"] for e in provider.call_log] == ["ok", "ok"]
     note = prompts[1]
-    assert "Mira did not run these lookups" in note
+    assert "Kory Source did not run these lookups" in note
     for reason in (
         "entry 2: unknown tool 'run_shell'",
         "entry 3: read_file: missing path",

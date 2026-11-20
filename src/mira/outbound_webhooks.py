@@ -154,7 +154,7 @@ def _message(event: str, data: dict[str, Any]) -> tuple[str, str, str]:
     if event == REVIEW_COMPLETED:
         comments = data.get("comments", 0)
         issues = data.get("key_issues", 0)
-        title = f"✅ Mira reviewed {pr_ref}"
+        title = f"✅ Kory Source reviewed {pr_ref}"
         body = f"*<{pr_url}|{pr_ref}>* — {comments} comment(s), {issues} key issue(s)"
         return title, body, "2EB67D"
 
@@ -162,24 +162,24 @@ def _message(event: str, data: dict[str, Any]) -> tuple[str, str, str]:
         issues = data.get("key_issues", 0)
         sev = data.get("severities") or {}
         breakdown = ", ".join(f"{n} {name}" for name, n in sev.items()) or f"{issues} issue(s)"
-        title = f"🛑 Mira found high-severity issues in {pr_ref}"
+        title = f"🛑 Kory Source found high-severity issues in {pr_ref}"
         body = f"*<{pr_url}|{pr_ref}>* — {breakdown}"
         return title, body, "E01E5A"
 
     if event == REVIEW_FAILED:
         err = data.get("error", "unknown error")
-        title = f"❌ Mira review failed for {pr_ref}"
+        title = f"❌ Kory Source review failed for {pr_ref}"
         body = f"*<{pr_url}|{pr_ref}>* — review failed: {err}"
         return title, body, "E01E5A"
 
     if event == INDEXING_COMPLETED:
         files = data.get("files_indexed", 0)
-        title = f"📚 Mira finished indexing {repo}"
+        title = f"📚 Kory Source finished indexing {repo}"
         body = f"*{repo}* is indexed — {files} file(s) ready for cross-repo context."
         return title, body, "2EB67D"
 
     # Fallback for unknown events — still deliver something useful.
-    return f"Mira: {event}", f"Event `{event}` for {repo or 'Mira'}.", "5B6770"
+    return f"Kory Source: {event}", f"Event `{event}` for {repo or 'Kory Source'}.", "5B6770"
 
 
 def render(event: str, data: dict[str, Any], fmt: str) -> dict[str, Any]:

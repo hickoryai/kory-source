@@ -307,7 +307,7 @@ async def test_handle_comment_help_posts_command_list(
 
     mock_provider.post_comment.assert_awaited_once()
     posted = mock_provider.post_comment.call_args[0][1]
-    assert posted.startswith("### Mira commands")
+    assert posted.startswith("### Kory Source commands")
     assert "@mira-bot review" in posted
     assert "@mira-bot reject" in posted
     # Help must not invoke the LLM (no diff fetch, no question reply).

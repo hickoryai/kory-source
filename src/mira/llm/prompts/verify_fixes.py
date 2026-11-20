@@ -15,22 +15,24 @@ _MAX_DESCRIPTION_LENGTH = 300
 def _extract_issue_description(body: str) -> str:
     """Extract the core issue description from a formatted review comment body.
 
-    Mira's posted comments follow this structure::
+    Current comments, and comments posted before the wording change, look like::
 
-        {emoji} **{category_label}**
+        HUMAN ATTENTION: ...          (optional; kept)
+        **{category_label}**          (older comments led with an emoji)
         {severity_badge}
 
         **{title}**
 
-        {description}
+        Fix `path:line`.
+        {instructions}
 
-        **Suggested fix:**
+        **Suggested fix:**            (older comments)
         ```suggestion ...```
 
-        <details>🤖 Prompt for AI Agents ...</details>
+        <details>Fix instructions ...</details>
 
-    This function strips the badge header, suggestion blocks, and agent prompts,
-    returning just the title and explanation text.
+    This function strips the badge header, suggestion blocks, and the fenced
+    fix-instruction details, and keeps a leading ``HUMAN ATTENTION:`` line.
     """
     text = body
 
@@ -46,11 +48,13 @@ def _extract_issue_description(body: str) -> str:
     # Split into paragraphs (double-newline separated)
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
 
-    # The formatted comment starts with a compact badge paragraph
-    # (emoji + category label + optional severity line).  Skip it when
-    # there is more content after it.
-    if len(paragraphs) > 1 and len(paragraphs[0]) < 80:
-        paragraphs = paragraphs[1:]
+    # Skip the compact badge paragraph when more content follows. A leading
+    # HUMAN ATTENTION line is the instruction, so skip the badge after it.
+    idx = 0
+    if paragraphs and paragraphs[0].startswith("HUMAN ATTENTION:"):
+        idx = 1
+    if len(paragraphs) > idx + 1 and len(paragraphs[idx]) < 80:
+        paragraphs = paragraphs[:idx] + paragraphs[idx + 1 :]
 
     result = " ".join(paragraphs).strip()
     if not result:
