@@ -231,12 +231,30 @@ def slack_factory(registry: Any, config: Mapping[str, Any]) -> SourceImporter:
     return SlackImporter(registry, client, access=access, classifier=classifier)
 
 
+def session_history_factory(registry: Any, config: Mapping[str, Any]) -> SourceImporter:
+    """Lazy adapter for the one-time session history cutover."""
+    from mira.registry.session_history import SessionHistoryImporter
+
+    values = dict(config)
+    values.pop("repo", None)
+    required = ("access", "user", "bundle")
+    for key in required:
+        if key not in values:
+            raise SourceImporterError(f"session_history source importer requires {key!r}")
+    options = {
+        key: values.pop(key) for key in (*required, "mark_cutover", "classifier") if key in values
+    }
+    _reject_options("session_history", values)
+    return SessionHistoryImporter(registry, **options)
+
+
 def default_source_importers() -> SourceImporterRegistry:
     """Return a new registry with the built-in adapters registered lazily."""
     sources = SourceImporterRegistry()
     sources.register("linear", linear_factory)
     sources.register("slack", slack_factory)
     sources.register("repository-history", repository_history_factory)
+    sources.register("session_history", session_history_factory)
     return sources
 
 

@@ -51,6 +51,7 @@ NAMESPACES = ("registry-jwt", "dashboard-account", "operator")
 # Imported rows from these sources are not part of the decision corpus: they
 # mirror Mira's own approved learned rules and keep their prior visibility.
 LEGACY_VISIBLE_SOURCES = ("", "mira_learned_rule")
+_SESSION_SUBJECT = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _WILDCARDS = ("*", "all", "any", "%")
 
 
@@ -95,6 +96,7 @@ class CorpusPolicy:
     import_operators: tuple[Member, ...]
     legacy_reviewer_sources: tuple[str, ...]
     manifest_sha256: str
+    session_subjects: tuple[str, ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
     slack_channels: tuple[str, ...] = ()
 
@@ -212,6 +214,12 @@ def canonical_sha256(manifest: Mapping[str, Any]) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def session_subject(value: Any) -> str:
+    """Canonical email used for session subject admission and stream names."""
+    value = value.strip().lower() if isinstance(value, str) else ""
+    return value if _SESSION_SUBJECT.fullmatch(value) else ""
+
+
 def parse_policy(raw: str | Mapping[str, Any]) -> CorpusPolicy:
     """Validate a policy manifest. Raises ``PolicyError`` on anything doubtful."""
     if isinstance(raw, str):
@@ -250,6 +258,9 @@ def parse_policy(raw: str | Mapping[str, Any]) -> CorpusPolicy:
     legacy = data.get("legacy_reviewer_sources") or []
     if not isinstance(legacy, list) or not all(isinstance(s, str) and s for s in legacy):
         raise PolicyError("legacy_reviewer_sources must be a list of source system names")
+    subjects = data.get("session_subjects", [])
+    if not isinstance(subjects, list) or not all(session_subject(s) for s in subjects):
+        raise PolicyError("session_subjects must be a list of email addresses")
     enabled = data.get("enabled")
     if not isinstance(enabled, bool):
         raise PolicyError("enabled must be true or false")
@@ -267,6 +278,7 @@ def parse_policy(raw: str | Mapping[str, Any]) -> CorpusPolicy:
         import_operators=_members(data.get("import_operators"), "import_operators", ("operator",)),
         legacy_reviewer_sources=tuple(legacy),
         manifest_sha256=canonical_sha256(data),
+        session_subjects=tuple(dict.fromkeys(map(session_subject, subjects))),
         raw=data,
         slack_channels=tuple(channels),
     )

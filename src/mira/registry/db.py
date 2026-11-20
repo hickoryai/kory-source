@@ -192,6 +192,7 @@ class RegistryDB:
         self.postgres = bool(url)
         self._url = url
         self._path = path
+        self._read_only = read_only
         if url:
             from mira.db.postgres import connect
 
@@ -201,16 +202,19 @@ class RegistryDB:
         else:
             assert path is not None
             if read_only:
-                self._conn = sqlite3.connect(
-                    Path(path).resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None
-                )
-                return
-            Path(path).parent.mkdir(parents=True, exist_ok=True)
+                path = Path(path).resolve().as_uri() + "?mode=ro"
+            else:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(
-                path, check_same_thread=False, isolation_level=None, timeout=30.0
+                path,
+                uri=read_only,
+                check_same_thread=False,
+                isolation_level=None,
+                timeout=30.0,
             )
             self._conn.execute("PRAGMA busy_timeout=30000")
-            self._enable_wal()
+            if not read_only:
+                self._enable_wal()
         if read_only:
             return
         from mira.registry.migrations import ADVISORY_LOCK_KEY, migrate
@@ -253,6 +257,8 @@ class RegistryDB:
 
                 def _reopen() -> Any:
                     self._conn = reconnect(self._url or "", self._conn)
+                    if self._read_only:
+                        self._conn.execute("SET default_transaction_read_only = on")
                     return self._conn
 
                 with ReconnectingCursor(self._conn.cursor(), on_reconnect=_reopen) as cur:

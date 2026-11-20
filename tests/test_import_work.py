@@ -85,6 +85,25 @@ def test_admission_rechecked_for_poll_and_answer(queue):
     assert store.get(work_id)["result_json"] == "{}"
 
 
+def test_session_worker_claim_requires_listed_subject(queue):
+    from mira.registry.access import AccessDenied
+
+    store, run = queue
+    subject = "owner@example.com"
+    store.db.execute(
+        "UPDATE registry_import_runs SET source_system = 'session_history', stream = ? WHERE run_id = ?",
+        (f"session:{subject}", run["run_id"]),
+    )
+    with pytest.raises(AccessDenied):
+        enqueue(queue)
+    rp.install(rp.manifest(session_subjects=[subject]))
+    work_id = enqueue(queue)
+    assert store.claim()["work_id"] == f"{work_id}:1"
+    rp.install(rp.manifest(session_subjects=["other@example.com"]))
+    assert store.claim() is None
+    assert not store.answer(f"{work_id}:1", {"text": "discarded after revocation"})
+
+
 def test_other_corpus_and_non_import_parent_refused(queue):
     store, run = queue
     from mira.registry.access import AccessDenied
