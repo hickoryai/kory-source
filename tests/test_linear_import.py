@@ -621,6 +621,7 @@ def test_incremental_skips_a_live_lease_and_reclaims_it_after_expiry(reg, client
 def test_apply_renews_lease_between_pages(reg, client, fake, clock, monkeypatch):
     imp = importer(reg, client, clock)
     imp.run(apply=True)
+    fake.requests.clear()
     for i in range(5):
         fake.issue(f"HAI-{i}", t=T0)
     original_pages = client.pages
@@ -635,6 +636,35 @@ def test_apply_renews_lease_between_pages(reg, client, fake, clock, monkeypatch)
     out = imp.run(apply=True, incremental_only=True)
     assert out["issues"]["status"] == "complete"
     assert clock.now > T0 + lin.INCREMENTAL_LEASE_SECONDS
+    assert [r["variables"]["after"] for r in fake.requests if "RegistryIssues" in r["query"]] == [
+        None,
+        "c2",
+        "c4",
+    ]
+
+
+def test_expired_lease_stops_a_run_before_it_writes_the_page(reg, client, fake, clock, monkeypatch):
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    fake.issue("HAI-1", t=T0)
+    original_pages = client.pages
+    replacement = None
+
+    def claim_during_fetch(*args, **kwargs):
+        nonlocal replacement
+        for page in original_pages(*args, **kwargs):
+            clock.now += lin.INCREMENTAL_LEASE_SECONDS
+            replacement = importer(reg, client, clock)._claim_incremental_lease()
+            assert replacement
+            yield page
+
+    monkeypatch.setattr(client, "pages", claim_during_fetch)
+    with pytest.raises(RuntimeError, match="another run acquired it"):
+        imp.run(apply=True, incremental_only=True)
+
+    assert imp.state(lin.INCREMENTAL_LEASE_STREAM)["after_cursor"] == replacement
+    assert imp.state("issues")["watermark"] == T0
+    assert reg.by_source("linear", "uuid-HAI-1") is None
 
 
 def test_restart_after_a_crash_resumes_and_matches_a_clean_run(tmp_path, client, fake, clock):

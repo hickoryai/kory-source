@@ -574,7 +574,7 @@ class LinearImporter:
             (self.clock(), SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, self._lease_owner),
         )
         if not renewed:
-            raise LinearError("the Linear import lease expired and another run acquired it")
+            raise RuntimeError("the Linear import lease expired and another run acquired it")
 
     def _incremental_status(self, status: str, before: float, after: float) -> dict:
         return {
