@@ -605,6 +605,8 @@ def test_incremental_skips_a_live_lease_and_reclaims_it_after_expiry(reg, client
 
     out = imp.run(apply=True, incremental_only=True)
     assert all(out[stream]["status"] == "already_running" for stream in lin.STREAMS)
+    with pytest.raises(LinearError, match="already running"):
+        imp.run(apply=True)
     assert not fake.requests
 
     clock.now += lin.INCREMENTAL_LEASE_SECONDS
@@ -614,6 +616,25 @@ def test_incremental_skips_a_live_lease_and_reclaims_it_after_expiry(reg, client
     assert not reg.db.execute(
         "SELECT stream FROM registry_sync_state WHERE stream = 'incremental_lease'"
     )
+
+
+def test_apply_renews_lease_between_pages(reg, client, fake, clock, monkeypatch):
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    for i in range(5):
+        fake.issue(f"HAI-{i}", t=T0)
+    original_pages = client.pages
+
+    def slow_pages(*args, **kwargs):
+        for page in original_pages(*args, **kwargs):
+            clock.now += 600
+            assert not importer(reg, client, clock)._claim_incremental_lease()
+            yield page
+
+    monkeypatch.setattr(client, "pages", slow_pages)
+    out = imp.run(apply=True, incremental_only=True)
+    assert out["issues"]["status"] == "complete"
+    assert clock.now > T0 + lin.INCREMENTAL_LEASE_SECONDS
 
 
 def test_restart_after_a_crash_resumes_and_matches_a_clean_run(tmp_path, client, fake, clock):

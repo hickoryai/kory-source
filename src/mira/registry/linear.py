@@ -503,6 +503,7 @@ class LinearImporter:
         self.policy: CorpusPolicy | None = None
         self.teams: list[str] = []
         self._run: dict | None = None
+        self._lease_owner: str | None = None
 
     def _policy(self) -> CorpusPolicy:
         assert self.policy is not None, "run() checks the policy first"
@@ -522,28 +523,36 @@ class LinearImporter:
         self.policy = require_import(self.access)
         self.teams = manifest_teams(self.policy, self.requested_teams)
         out: dict = {"apply": apply, "corpus_id": self.policy.corpus_id}
-        if not incremental_only:
-            return self._run_streams(out, apply, incremental_only=False)
+        if incremental_only:
+            watermarks = {stream: self.state(stream)["watermark"] for stream in STREAMS}
+            if not any(watermarks.values()):
+                return out | {
+                    stream: self._incremental_status("waiting_for_backfill", 0.0, 0.0)
+                    for stream in STREAMS
+                }
+        if not apply:
+            return self._run_streams(out, apply, incremental_only=incremental_only)
 
-        watermarks = {stream: self.state(stream)["watermark"] for stream in STREAMS}
-        if not any(watermarks.values()):
-            status = "waiting_for_backfill"
-        elif not apply:
-            return self._run_streams(out, apply, incremental_only=True)
-        elif owner := self._claim_incremental_lease():
-            try:
-                return self._run_streams(out, apply, incremental_only=True)
-            finally:
-                self.registry.db.execute(
-                    "DELETE FROM registry_sync_state "
-                    "WHERE source_system = ? AND stream = ? AND after_cursor = ?",
-                    (SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, owner),
+        owner = self._claim_incremental_lease()
+        if owner is None:
+            if not incremental_only:
+                raise LinearError("a Linear import is already running")
+            return out | {
+                stream: self._incremental_status(
+                    "already_running" if watermark else "waiting_for_backfill", watermark, watermark
                 )
-        else:
-            status = "already_running"
-        for stream, watermark in watermarks.items():
-            out[stream] = self._incremental_status(status, watermark, watermark)
-        return out
+                for stream, watermark in watermarks.items()
+            }
+        self._lease_owner = owner
+        try:
+            return self._run_streams(out, apply, incremental_only=incremental_only)
+        finally:
+            self._lease_owner = None
+            self.registry.db.execute(
+                "DELETE FROM registry_sync_state "
+                "WHERE source_system = ? AND stream = ? AND after_cursor = ?",
+                (SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, owner),
+            )
 
     def _claim_incremental_lease(self) -> str | None:
         owner = uuid4().hex
@@ -556,6 +565,16 @@ class LinearImporter:
             (SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, owner, now, now - INCREMENTAL_LEASE_SECONDS),
         )
         return owner if claimed else None
+
+    def _renew_lease(self) -> None:
+        assert self._lease_owner is not None
+        renewed = self.registry.db.execute(
+            "UPDATE registry_sync_state SET updated_at = ? "
+            "WHERE source_system = ? AND stream = ? AND after_cursor = ? RETURNING after_cursor",
+            (self.clock(), SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, self._lease_owner),
+        )
+        if not renewed:
+            raise LinearError("the Linear import lease expired and another run acquired it")
 
     def _incremental_status(self, status: str, before: float, after: float) -> dict:
         return {
@@ -575,6 +594,7 @@ class LinearImporter:
                     out[stream] = self._incremental_status("waiting_for_backfill", before, before)
                     continue
             if apply:
+                self._renew_lease()
                 # Reset before opening the first upgraded run. A subsequent
                 # resume must keep that run's page cursor, even after a crash.
                 if not incremental_only and self._needs_extraction_backfill(stream):
@@ -705,6 +725,7 @@ class LinearImporter:
         if apply and stream == "issues" and not incremental_only:
             retried = self._retry_pending(errors)
         if apply and (not incremental_only or not errors):
+            self._renew_lease()
             st.update(watermark=st["walk_started_at"], after_cursor="")
             self._save(stream, st)
         out = {"totals": dict(totals), "errors": errors, "retried": retried}
@@ -724,6 +745,7 @@ class LinearImporter:
             ids = pending[start : start + PENDING_BATCH]
             filt = _and(_team_filter(self.teams), {"id": {"in": ids}})
             for nodes, _ in self.client.pages(ISSUES_QUERY, "issues", filt):
+                self._renew_lease()
                 kept = [n for n in nodes if _admitted(self._policy(), n.get("team"))]
                 items = [issue_item(n) for n in kept]
                 results = self.registry.import_items(
@@ -750,6 +772,8 @@ class LinearImporter:
         truncated: set[str] | None,
     ) -> None:
         for nodes, end_cursor in self.client.pages(document, stream, filt, after):
+            if apply:
+                self._renew_lease()
             if stream == "issues":
                 kept = [n for n in nodes if _admitted(self._policy(), n.get("team"))]
                 if truncated is not None:
