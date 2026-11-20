@@ -108,8 +108,7 @@ def _help_message(bot_name: str) -> str:
         f"On an inline review comment Kory Source posted, reply with `@{bot_name} reject` "
         f"(aliases: `dismiss`, `resolve`, `ignore`) to mark the thread resolved and "
         f"teach Kory Source not to make similar suggestions in the future.\n\n"
-        f"To skip a PR entirely, include `@{bot_name} ignore` in the PR body.\n\n"
-        f"Full docs: https://docs.miracode.ai/commands"
+        f"To skip a PR entirely, include `@{bot_name} ignore` in the PR body.\n"
     )
 
 

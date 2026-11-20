@@ -482,6 +482,25 @@ class TestGetRepoPermission:
         assert permission == "none"
 
 
+class TestRemoveLabel:
+    @pytest.mark.asyncio
+    async def test_missing_label_is_success(self):
+        seen: dict[str, object] = {}
+
+        def handler(method, url, **kw):
+            seen["method"] = method
+            seen["url"] = url
+            seen["data"] = kw.get("data")
+            return _FakeResp(status=404, text="label not found")
+
+        with _patch(handler):
+            await GitLabProvider("tok").remove_label(_PR, "kory-source-paused")
+
+        assert seen["method"] == "PUT"
+        assert seen["url"].endswith("/merge_requests/7")
+        assert seen["data"] == {"remove_labels": "kory-source-paused"}
+
+
 class TestRegistry:
     def test_create_provider_gitlab(self):
         assert isinstance(create_provider("gitlab", "tok"), GitLabProvider)

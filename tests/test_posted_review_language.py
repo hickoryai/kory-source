@@ -79,6 +79,4 @@ def test_help_message_does_not_say_mira() -> None:
     text = _help_message("kory-source")
     assert "Adds a `kory-source-paused` label." in text
     assert "mira-paused" not in text
-    # The command docs host stays. The posted product name must not.
-    visible = re.sub(r"https://docs\.miracode\.ai\S*", "", text, flags=re.IGNORECASE)
-    assert "mira" not in visible.lower()
+    assert "mira" not in text.lower()
