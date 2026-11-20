@@ -462,6 +462,8 @@ def materialize(
     anchor: dict | None = None,
     occurred_at: float = 0.0,
     identity: str = "",
+    ticket: str = "",
+    session_history: bool = False,
 ) -> list[str]:
     """Turn extracted candidates into proposed decisions with cited evidence.
 
@@ -471,7 +473,8 @@ def materialize(
 
     ``identity`` keys a passage across revisions of one document (a Markdown
     file): the same quote in a later revision adds supporting evidence to the
-    existing decision instead of a duplicate.
+    existing decision instead of a duplicate. Session history takes time from
+    event metadata and keeps the first occurrence on the decision row.
     """
     from mira.registry.attribution import tool_attribution
     from mira.registry.authority import classify
@@ -501,7 +504,7 @@ def materialize(
         for key, value in (
             ("author", source_author),
             ("author_kind", "human" if values.get("actor_kind") == "human" else "agent"),
-            ("model", values.get("original_model") or ""),
+            ("model", "" if session_history else values.get("original_model") or ""),
             ("authority_tier", tier),
             ("decision_revision", 1),
         ):
@@ -527,7 +530,7 @@ def materialize(
             obj["decided_by"] = source_author
             changed = True
         if (
-            decision_time
+            (decision_time or session_history)
             and obj.get("status") == "proposed"
             and (needs_time or legacy)
             and obj.get("decided_at") != decision_time
@@ -543,7 +546,7 @@ def materialize(
         stated_date = re.search(
             r"\b(?:decided|ratified|approved)(?:\s+on)?\s+(\d{4}-\d{2}-\d{2})\b", cand.quote, re.I
         )
-        if stated_date:
+        if stated_date and not session_history:
             with suppress(ValueError):
                 decision_time = (
                     datetime.strptime(stated_date[1], "%Y-%m-%d").replace(tzinfo=UTC).timestamp()
@@ -561,6 +564,8 @@ def materialize(
             "scope": "repo" if repo else "org",
             "source_url": source_url,
         }
+        if ticket:
+            item["ticket"] = ticket
         extractor = cand.extractor_name or EXTRACTOR
         extractor_version = cand.extractor_version or EXTRACTOR_VERSION
         support_confidence = (
@@ -576,7 +581,7 @@ def materialize(
             counts["extraction_errors"] += 1
             continue
         oid = res["object_id"]
-        if cand.extractor_model:
+        if cand.extractor_model and not session_history:
             obj = registry.get(oid)
             if obj.get("model") != cand.extractor_model:
                 obj["model"] = cand.extractor_model
@@ -597,10 +602,11 @@ def materialize(
         )
         if res["outcome"] != "created":
             existing = registry.get(oid)
-            retain_source_provenance(existing, decision_time)
-            if cand.extractor_model and existing.get("model") != cand.extractor_model:
-                existing["model"] = cand.extractor_model
-                registry._write(existing)
+            if not session_history:
+                retain_source_provenance(existing, decision_time)
+                if cand.extractor_model and existing.get("model") != cand.extractor_model:
+                    existing["model"] = cand.extractor_model
+                    registry._write(existing)
             already_supported = registry.db.execute(
                 "SELECT 1 FROM registry_decision_evidence WHERE object_id = ? AND evidence_id = ? "
                 "AND quote_start = ? AND quote_end = ? AND section = ? LIMIT 1",

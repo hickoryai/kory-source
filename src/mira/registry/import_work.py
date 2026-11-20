@@ -1,4 +1,4 @@
-"""Database-only transport for traced classification of admitted repository imports.
+"""Database-only transport for traced classification of admitted history imports.
 
 The worker gets no corpus read API. Every poll and answer rechecks the live
 policy and parent run. Attempts are fenced so late answers cannot win a retry.
@@ -81,6 +81,11 @@ class ImportWorkStore:
                 len(channel_scope) == 3
                 and channel_scope[0] == corpus
                 and channel_scope[2] in policy.slack_channels
+            )
+        elif source == "session_history":
+            in_scope = (
+                stream.startswith("session:")
+                and stream.removeprefix("session:") in policy.session_subjects
             )
         else:
             in_scope = stream.startswith("repository:") and policy.admits_repository(
@@ -187,6 +192,7 @@ class ImportWorkStore:
                 m.key for m in policy.import_operators if not m.expires_at or m.expires_at > now
             )
             streams = tuple("repository:" + repo for pair in policy.repositories for repo in pair)
+            streams += tuple("session:" + subject for subject in policy.session_subjects)
             if not operators or not streams:
                 return None
 
