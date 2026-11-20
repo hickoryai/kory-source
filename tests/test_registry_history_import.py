@@ -548,34 +548,79 @@ def test_incremental_cannot_overwrite_a_cursor_advanced_by_another_run(reg, chec
     assert read_cursors(reg, "git")[stream]["cursor"] == shas[2]
 
 
-@pytest.mark.parametrize("retryable", [False, True])
-def test_incremental_advances_only_after_settled_units(reg, checkout, monkeypatch, retryable):
+@pytest.mark.parametrize("failure", ["parse", "transport", "unknown"])
+def test_incremental_advances_only_after_settled_units(reg, checkout, monkeypatch, failure):
     _, shas = checkout
     stream = f"repository:{REPO}"
     record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
     importer = incremental(reg, checkout, commit=shas[1])
     collect = importer._collect_unit
-    message = "Router workstation outage" if retryable else "invalid content"
+    exceptions = {
+        "parse": json.JSONDecodeError("invalid content", "", 0),
+        "transport": RuntimeError("Router workstation outage"),
+        "unknown": ValueError("unexpected unit error"),
+    }
+    error = exceptions[failure]
 
     def collect_unit(frozen, kind, path):
         if kind == "md":
-            raise ValueError(message)
+            raise error
         return collect(frozen, kind, path)
 
     monkeypatch.setattr(importer, "_collect_unit", collect_unit)
     out = importer.run(apply=True)
     run = ImportRuns(reg).get(out["run_id"])
     assert out["error_count"] == 1
-    if retryable:
+    if failure != "parse":
         assert out["status"] == "incomplete"
-        assert message in run["errors"][0]
+        assert str(error) in run["errors"][0]
         assert not run["checkpoint"].get("failed")
         assert read_cursors(reg, "git")[stream]["cursor"] == shas[0]
     else:
         assert out["status"] == "complete"
-        assert run["checkpoint"]["failed"] == {"md:docs/design.md": message}
+        assert run["checkpoint"]["failed"] == {"md:docs/design.md": str(error)}
         assert not run["errors"]
         assert read_cursors(reg, "git")[stream]["cursor"] == shas[1]
+
+
+def test_incremental_classification_group_failure_keeps_the_range_open(reg, checkout, monkeypatch):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    importer = incremental(reg, checkout)
+
+    def fail_group(prepared, *, apply):
+        assert apply
+        assert {path for _, path, *_ in prepared} >= {"docs/design.md", "src/app/session.py"}
+        raise ValueError("malformed classifier response")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(importer, "_classify_prepared", fail_group)
+        out = importer.run(apply=True)
+    assert out["status"] == "incomplete"
+    assert not ImportRuns(reg).get(out["run_id"])["checkpoint"].get("failed")
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[0]
+
+    resumed = importer.run(apply=True)
+    assert resumed["run_id"] == out["run_id"]
+    assert resumed["status"] == "complete"
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[2]
+
+
+def test_incremental_evidence_write_error_does_not_settle_a_unit(reg, checkout, monkeypatch):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    importer = incremental(reg, checkout, commit=shas[1])
+
+    def fail_write(*args, **kwargs):
+        raise ValueError("unexpected write error")
+
+    monkeypatch.setattr(importer.store, "record_revision", fail_write)
+    out = importer.run(apply=True)
+    assert out["status"] == "incomplete"
+    assert not ImportRuns(reg).get(out["run_id"])["checkpoint"].get("failed")
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[0]
 
 
 def test_incremental_refuses_cursor_outside_requested_history(reg, checkout):

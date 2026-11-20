@@ -214,10 +214,10 @@ decision, immutable evidence stores the exact excerpt, its original offset and
 the URL to its lines. Files without decisions create no source revisions.
 
 An unfinished apply resumes its saved range before processing a later commit.
-Use the same extractor configuration to resume. A time budget or transient
-failure leaves the range open. A content failure is recorded in
-`checkpoint.failed` and in the error summary. The cursor advances once every
-unit is stored or has a recorded content failure.
+Use the same extractor configuration to resume. A time budget, classification
+group failure, or evidence write failure leaves the range open. The importer
+records file parse failures in `checkpoint.failed` and in the error summary.
+The cursor advances once every unit is stored or has a recorded parse failure.
 
 | Status | Meaning |
 | --- | --- |

@@ -31,6 +31,7 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 from bisect import bisect_right
 from collections import Counter, OrderedDict
 from dataclasses import replace
@@ -182,6 +183,20 @@ _DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
 _BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _DOCSTRING = re.compile(r"(?P<q>\"\"\"|''')(?P<body>.*?)(?P=q)", re.S)
 _SEP = "\x1e"
+
+
+class _ContentParseError(ValueError):
+    """A data file's lexical offsets could not be recovered."""
+
+
+_CONTENT_PARSE_ERRORS = (
+    _ContentParseError,
+    UnicodeError,
+    yaml.YAMLError,
+    csv.Error,
+    json.JSONDecodeError,
+    tomllib.TOMLDecodeError,
+)
 
 
 def language_of(path: str) -> str:
@@ -415,7 +430,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                 continue
             for col, value in enumerate(row):
                 if cursor >= len(fields):
-                    raise ValueError("CSV field offsets unavailable")
+                    raise _ContentParseError("CSV field offsets unavailable")
                 m = fields[cursor]
                 cursor += 1
                 end = m.end()
@@ -431,8 +446,6 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                         parts.extend(["columns", str(col)])
                     add(key, value, m.start(), end, parts)
     elif suffix == ".toml":
-        import tomllib
-
         tomllib.loads(text)  # Validate before the lexical walk; never execute values.
         position = 0
         section: list[str] = []
@@ -467,7 +480,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                 if delimiter[0] == '"' and text[position] == "\\":
                     position += 1
                 position += 1
-            raise ValueError("unterminated TOML string")
+            raise _ContentParseError("unterminated TOML string")
 
         def keys():
             nonlocal position
@@ -479,7 +492,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                 else:
                     match = _TOML_KEY.match(text, position)
                     if not match:
-                        raise ValueError("invalid TOML key")
+                        raise _ContentParseError("invalid TOML key")
                     part = match[0]
                     position += len(part)
                 parts.append(part)
@@ -501,7 +514,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                 while text[position : position + 1] != "}":
                     nested = keys()
                     if text[position : position + 1] != "=":
-                        raise ValueError("invalid TOML inline assignment")
+                        raise _ContentParseError("invalid TOML inline assignment")
                     position += 1
                     scan_value([*parts, *nested], nested[-1])
                     whitespace()
@@ -546,7 +559,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
             else:
                 named = keys()
                 if text[position : position + 1] != "=":
-                    raise ValueError("invalid TOML assignment")
+                    raise _ContentParseError("invalid TOML assignment")
                 position += 1
                 scan_value([*section, *named], named[-1])
     return out
@@ -1043,9 +1056,10 @@ class RepositoryHistoryImporter:
             try:
                 classified, estimates = self._classify_prepared(prepared, apply=True)
             except (RuntimeError, ValueError) as exc:
+                if self.incremental and isinstance(exc, AccessDenied):
+                    raise
                 message = f"classification group: {exc}"
-                if not self.incremental or _retryable(message) or "time budget reached" in message:
-                    _record_error(errors, message)
+                _record_error(errors, message)
                 # A budget stop is resumable. Completed batches stay cached, so
                 # the same files are nominated again. So is a transport failure.
                 # A content failure is recorded and skipped, or one file would
@@ -1065,10 +1079,13 @@ class RepositoryHistoryImporter:
                         break
                     continue
                 consecutive_retryable = 0
+                # A group failure cannot identify which files failed. Keep the
+                # incremental range open so no sibling file is skipped.
+                if self.incremental:
+                    self._flush_stats(run)
+                    continue
                 for kind, path, _, _ in group:
                     failed[f"{kind}:{path}"] = message
-                    if self.incremental:
-                        logger.warning("%s:%s: %s", kind, path, message)
                 self._commit_cursor(run, done, failed)
                 continue
             finally:
@@ -1122,9 +1139,11 @@ class RepositoryHistoryImporter:
                         stop = True
                         break
                 except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
+                    if self.incremental and isinstance(exc, AccessDenied):
+                        raise
                     done.discard(key)
                     run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
-                    self._unit_error(key, str(exc), errors, failed)
+                    _record_error(errors, f"{key}: {exc}")
             if stop:
                 break
         llm_calls_delta = (
@@ -1406,6 +1425,7 @@ class RepositoryHistoryImporter:
 
     def _prepared_groups(self, frozen, units, done, errors, failed=None):
         """Pack a short wave, then let the caller checkpoint it."""
+        settle_parse_errors = self.incremental and failed is not None
         failed = {} if failed is None else failed
         group, count, chars = [], 0, 0
         for number, (kind, path) in enumerate(units, 1):
@@ -1422,7 +1442,13 @@ class RepositoryHistoryImporter:
             try:
                 prepared, observations = self._collect_unit(frozen, kind, path)
             except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
-                self._unit_error(key, str(exc), errors, failed if self.incremental else None)
+                if self.incremental and isinstance(exc, AccessDenied):
+                    raise
+                if settle_parse_errors and isinstance(exc, _CONTENT_PARSE_ERRORS):
+                    failed[key] = str(exc)
+                    logger.warning("%s: %s", key, exc)
+                else:
+                    _record_error(errors, f"{key}: {exc}")
                 continue
             group.append((kind, path, prepared, observations))
             count += sum(len(passages) for _, _, _, _, passages in prepared)
@@ -1432,19 +1458,6 @@ class RepositoryHistoryImporter:
                 group, count, chars = [], 0, 0
         if group:
             yield group
-
-    def _unit_error(self, key, message, errors, failed):
-        if (
-            self.incremental
-            and failed is not None
-            and not _retryable(message)
-            and "time budget reached" not in message
-            and not message.startswith("git ")
-        ):
-            failed[key] = message
-            logger.warning("%s: %s", key, message)
-        else:
-            _record_error(errors, f"{key}: {message}")
 
     def _record_timeout_skips(self, run, sha, path, text, counts):
         skipped = getattr(self.classifier, "skipped", {})
