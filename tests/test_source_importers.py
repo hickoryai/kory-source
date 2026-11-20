@@ -76,7 +76,7 @@ def test_builtin_adapters_are_registered_without_importing_connectors():
     # construct a client or invoke a source importer.
     sources = default_source_importers()
 
-    assert sources.sources() == ("linear", "repository-history")
+    assert sources.sources() == ("linear", "repository-history", "slack")
     assert not hasattr(sources, "client")
 
 

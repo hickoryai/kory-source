@@ -353,3 +353,43 @@ does not update that process. Update the worker checkout and restart only its
 worker service through the deployment's supported operator mechanism before the
 first apply. A relay restart is unnecessary. Keep the apply held when no supported
 worker update mechanism is available.
+
+## Slack decision import
+
+An import operator can run `python -m mira.registry.slack import` to sample one
+history page per approved channel. A dry run writes no registry data and calls no
+model. Add `--apply` to store messages and propose decisions. An empty or missing
+`slack_channels` list disables Slack access. The corpus policy lists Slack channel
+IDs, for example `"slack_channels": ["CEXAMPLE"]`.
+
+Use a workspace Slack app and set its bot token as `SLACK_HISTORY_TOKEN`. Grant
+`channels:history`, `groups:history`, `channels:read`, `groups:read`, and
+`users:read`. Add the bot to each approved channel through Slack. The importer
+records a channel access error if the bot lacks access.
+
+Set `SLACK_SIGNING_SECRET` on the service. Use `/api/registry/slack/events` on
+that service as the Slack event request URL. Subscribe to `message.channels` and
+`message.groups`. The service verifies each request and queues only events for
+approved channels. Apply drains those events for the token's workspace.
+
+```text
+Slack channel history → Import job → Registry evidence → Proposed decisions
+Slack message events → Signed inbox ↗
+```
+
+The first apply pages through channel history, then checks for messages that
+arrived during the backfill. A later apply reads history after the exact Slack
+message timestamp saved for that channel. A history failure leaves the last
+completed cursor in place. The next apply resumes from the saved page
+checkpoint. A job that finds the importer lock held makes no Slack calls.
+
+Slack events supply replies on older threads, edits, and explicit deletions.
+Keep events enabled during backfill to capture replies that arrive while it
+runs. Historic thread replies require a separate backfill. File contents
+stay in Slack. An edit adds an immutable revision and an explicit deletion
+adds a tombstone. A failed history request records an error. A failed author
+lookup stores the message with an unknown author in the attribution.
+
+The same classifier used for repository history proposes decisions with an
+exact quote, a permalink, the message timestamp, and the Slack author fields.
+Apply keeps decisions proposed and sets their basis to migration.

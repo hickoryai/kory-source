@@ -67,20 +67,31 @@ class ImportWorkStore:
         ):
             return False
         runs = self.db.execute(
-            "SELECT corpus_id, policy_version, status, stream, operator_principal, extractor, extractor_model "
+            "SELECT corpus_id, policy_version, status, stream, operator_principal, extractor, "
+            "extractor_model, source_system "
             "FROM registry_import_runs WHERE run_id = ?",
             (row["run_id"],),
         )
         if not runs:
             return False
-        corpus, version, status, stream, principal, extractor, model = runs[0]
+        corpus, version, status, stream, principal, extractor, model, source = runs[0]
+        if source == "slack":
+            channel_scope = stream.rsplit(":", 2)
+            in_scope = (
+                len(channel_scope) == 3
+                and channel_scope[0] == corpus
+                and channel_scope[2] in policy.slack_channels
+            )
+        else:
+            in_scope = stream.startswith("repository:") and policy.admits_repository(
+                stream.removeprefix("repository:")
+            )
         body = json.loads(row["body_json"])
         return (
             corpus == policy.corpus_id
             and version == policy.policy_version
             and status == "running"
-            and stream.startswith("repository:")
-            and policy.admits_repository(stream.removeprefix("repository:"))
+            and in_scope
             and any(
                 m.key == principal and (not m.expires_at or m.expires_at > time.time())
                 for m in policy.import_operators

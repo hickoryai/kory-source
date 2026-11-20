@@ -159,6 +159,8 @@ def install(app: Any) -> None:
     """Mount ``/api/registry`` (dashboard session) and ``/mcp`` (registry JWT)."""
     from mira.registry.api import router
     from mira.registry.mcp import router as mcp_router
+    from mira.registry.slack_events import router as slack_events_router
 
     app.include_router(router)
     app.include_router(mcp_router)
+    app.include_router(slack_events_router)

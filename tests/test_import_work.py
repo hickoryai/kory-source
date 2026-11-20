@@ -465,3 +465,19 @@ async def test_classifier_worker_transport_keeps_required_tracing(queue, monkeyp
     assert len(result) == 1
     assert traces
     assert classifier.stats["llm_calls"] == 1
+
+
+def test_slack_work_admission_checks_current_channel(queue):
+    store, run = queue
+    channel = "CEXAMPLE"
+    rp.install(rp.manifest(slack_channels=[channel]))
+    store.db.execute(
+        "UPDATE registry_import_runs SET source_system = 'slack', stream = ? WHERE run_id = ?",
+        (f"{rp.CORPUS}:TEXAMPLE:{channel}", run["run_id"]),
+    )
+    assert enqueue(queue).startswith("iw_")
+    rp.install(rp.manifest(slack_channels=[]))
+    from mira.registry.access import AccessDenied
+
+    with pytest.raises(AccessDenied):
+        enqueue(queue)
