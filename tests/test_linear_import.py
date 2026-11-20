@@ -498,12 +498,173 @@ def test_incremental_walk_reads_from_the_watermark(reg, client, fake, clock):
     clock.now = T0 + 3600
     fake.issue("HAI-4", t=T0 + 1800, title="Renamed", state="completed")
     fake.requests.clear()
-    out = importer(reg, client, clock).run(apply=True)
+    out = importer(reg, client, clock).run(apply=True, incremental_only=True)
     # Issues inside the overlap are read again and are no-ops.
     assert out["issues"]["totals"] == {"read": 4, "updated": 1, "unchanged": 3}
     issues_filter = fake.requests[0]["variables"]["filter"]["and"][1]
     assert lin.to_epoch(issues_filter["updatedAt"]["gte"]) == T0 - lin.WATERMARK_OVERLAP
     assert reg.work_by_ticket("HAI-4", rp.reader())["title"] == "Renamed"
+    assert out["issues"]["status"] == "complete"
+    assert out["issues"]["watermark_before"] == lin.to_iso(T0)
+    assert out["issues"]["watermark_after"] == lin.to_iso(clock.now)
+    assert out["issues"]["lag_seconds"] == 0
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_incremental_waits_without_touching_backfill_cursor(reg, client, fake, clock, apply):
+    imp = importer(reg, client, clock)
+    backfill = imp.state("issues") | {"after_cursor": "c2", "walk_started_at": T0}
+    imp._save("issues", backfill)
+    before = snapshot(reg)
+
+    out = imp.run(apply=apply, incremental_only=True)
+
+    assert all(out[stream]["status"] == "waiting_for_backfill" for stream in lin.STREAMS)
+    assert all(out[stream]["lag_seconds"] is None for stream in lin.STREAMS)
+    assert not fake.requests
+    assert imp.state("issues") == backfill
+    assert snapshot(reg) == before
+    assert not reg.db.execute("SELECT run_id FROM registry_import_runs")
+    assert not reg.db.execute(
+        "SELECT stream FROM registry_sync_state WHERE stream = 'incremental_lease'"
+    )
+
+
+def test_incremental_only_walks_ready_streams(reg, client, fake, clock):
+    imp = importer(reg, client, clock)
+    imp._save("issues", imp.state("issues") | {"watermark": T0})
+    fake.issue("HAI-1", t=T0, relations={"pageInfo": {"hasNextPage": True}, "nodes": []})
+
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["issues"]["truncated_relations"] == ["HAI-1"]
+    assert out["comments"]["status"] == out["documents"]["status"] == "waiting_for_backfill"
+    assert len(fake.requests) == 1
+    assert "RegistryIssues" in fake.requests[0]["query"]
+
+
+def test_incremental_item_error_replays_the_window(reg, client, fake, clock, monkeypatch):
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    clock.now += 3600
+    for i in range(5):
+        fake.issue(f"HAI-{i}", t=clock.now)
+    original_import = reg.import_items
+    on_page = 0
+
+    def fail_on_second_page(*args, **kwargs):
+        nonlocal on_page
+        on_page += 1
+        if on_page == 2:
+            return [{"outcome": "error"}]
+        return original_import(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(reg, "import_items", fail_on_second_page)
+        out = imp.run(apply=True, incremental_only=True)
+
+    assert out["issues"]["status"] == "incomplete"
+    assert out["issues"]["lag_seconds"] == 3600
+    assert imp.state("issues")["watermark"] == T0
+    assert not imp.state("issues")["after_cursor"]
+    fake.requests.clear()
+    out = imp.run(apply=True, incremental_only=True)
+    assert out["issues"]["status"] == "complete"
+    assert fake.requests[0]["variables"]["after"] is None
+    assert fake.requests[0]["variables"]["filter"]["and"][1]["updatedAt"]["gte"] == lin.to_iso(
+        T0 - lin.WATERMARK_OVERLAP
+    )
+    assert reg.work_by_ticket("HAI-2", rp.reader())
+
+
+def test_incremental_transport_failure_keeps_cursor(reg, client, fake, clock):
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    clock.now += 3600
+    for i in range(5):
+        fake.issue(f"HAI-{i}", t=clock.now)
+    fake.crash_after_pages = fake.pages_served + 1
+
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["issues"]["status"] == "incomplete"
+    assert imp.state("issues")["watermark"] == T0
+    assert imp.state("issues")["after_cursor"] == "c2"
+    fake.crash_after_pages = None
+    fake.requests.clear()
+    out = imp.run(apply=True, incremental_only=True)
+    assert out["issues"]["status"] == "complete"
+    assert fake.requests[0]["variables"]["after"] == "c2"
+
+
+def test_incremental_skips_a_live_lease_and_reclaims_it_after_expiry(reg, client, fake, clock):
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    fake.requests.clear()
+    assert imp._claim_incremental_lease()
+
+    out = imp.run(apply=True, incremental_only=True)
+    assert all(out[stream]["status"] == "already_running" for stream in lin.STREAMS)
+    with pytest.raises(LinearError, match="already running"):
+        imp.run(apply=True)
+    assert not fake.requests
+
+    clock.now += lin.INCREMENTAL_LEASE_SECONDS
+    out = imp.run(apply=True, incremental_only=True)
+    assert out["issues"]["status"] == "complete"
+    assert fake.requests
+    assert not reg.db.execute(
+        "SELECT stream FROM registry_sync_state WHERE stream = 'incremental_lease'"
+    )
+
+
+def test_apply_renews_lease_between_pages(reg, client, fake, clock, monkeypatch):
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    fake.requests.clear()
+    for i in range(5):
+        fake.issue(f"HAI-{i}", t=T0)
+    original_pages = client.pages
+
+    def slow_pages(*args, **kwargs):
+        for page in original_pages(*args, **kwargs):
+            clock.now += 600
+            assert not importer(reg, client, clock)._claim_incremental_lease()
+            yield page
+
+    monkeypatch.setattr(client, "pages", slow_pages)
+    out = imp.run(apply=True, incremental_only=True)
+    assert out["issues"]["status"] == "complete"
+    assert clock.now > T0 + lin.INCREMENTAL_LEASE_SECONDS
+    assert [r["variables"]["after"] for r in fake.requests if "RegistryIssues" in r["query"]] == [
+        None,
+        "c2",
+        "c4",
+    ]
+
+
+def test_expired_lease_stops_a_run_before_it_writes_the_page(reg, client, fake, clock, monkeypatch):
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    fake.issue("HAI-1", t=T0)
+    original_pages = client.pages
+    replacement = None
+
+    def claim_during_fetch(*args, **kwargs):
+        nonlocal replacement
+        for page in original_pages(*args, **kwargs):
+            clock.now += lin.INCREMENTAL_LEASE_SECONDS
+            replacement = importer(reg, client, clock)._claim_incremental_lease()
+            assert replacement
+            yield page
+
+    monkeypatch.setattr(client, "pages", claim_during_fetch)
+    with pytest.raises(RuntimeError, match="another run acquired it"):
+        imp.run(apply=True, incremental_only=True)
+
+    assert imp.state(lin.INCREMENTAL_LEASE_STREAM)["after_cursor"] == replacement
+    assert imp.state("issues")["watermark"] == T0
+    assert reg.by_source("linear", "uuid-HAI-1") is None
 
 
 def test_restart_after_a_crash_resumes_and_matches_a_clean_run(tmp_path, client, fake, clock):
@@ -650,12 +811,12 @@ def test_archive_and_trash_round_trip(reg, client, fake, clock):
 
     clock.now = T0 + 100
     fake.issue("HAI-4", t=T0 + 90, state="completed", archivedAt=iso(T0 + 90))
-    imp.run(apply=True)
+    imp.run(apply=True, incremental_only=True)
     assert reg.work_by_ticket("HAI-4", rp.reader())["delivery_state"] == "archived"
 
     clock.now = T0 + 200
     fake.issue("HAI-4", t=T0 + 190, state="completed")
-    imp.run(apply=True)
+    imp.run(apply=True, incremental_only=True)
     assert reg.work_by_ticket("HAI-4", rp.reader())["delivery_state"] == "shipped"
 
     clock.now = T0 + 300
@@ -1167,6 +1328,27 @@ def test_upgrade_revisits_old_unchanged_evidence_to_extract_decisions(
     clock.now += 7200
     importer(reg, client, clock).run(apply=True)
     assert _decisions(reg) == [("Decision: retain history.", "proposed")]
+
+
+@pytest.mark.parametrize("apply", [False, True])
+def test_incremental_never_resets_an_old_importer_watermark(
+    reg, client, fake, clock, monkeypatch, apply
+):
+    fake.issue("HAI-1", t=T0 - 3600)
+    imp = importer(reg, client, clock)
+    with monkeypatch.context() as old:
+        old.setattr(lin, "IMPORTER_VERSION", "2")
+        imp.run(apply=True)
+    clock.now += 7200
+    fake.requests.clear()
+
+    out = imp.run(apply=apply, incremental_only=True)
+
+    assert out["issues"]["totals"].get("read", 0) == 0
+    assert out["issues"]["watermark_after"] == lin.to_iso(clock.now if apply else T0)
+    assert fake.requests[0]["variables"]["filter"]["and"][1]["updatedAt"]["gte"] == lin.to_iso(
+        T0 - lin.WATERMARK_OVERLAP
+    )
 
 
 def test_upgraded_backfill_resumes_its_saved_page_cursor(reg, client, fake, clock, monkeypatch):
