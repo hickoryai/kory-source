@@ -200,6 +200,33 @@ The inventory selects files present at the frozen commit; files deleted before
 that snapshot are outside this walk. Historical revisions of selected files
 can retain decisions overwritten or removed in later versions.
 
+### Incremental repository imports
+
+After an unbounded, unfiltered backfill completes, use `--incremental` to
+read changes after its saved Git commit. The cursor commit itself is excluded.
+Omit `--max-commits` and `--path`. Add `--apply` to store decisions and advance
+the cursor. The factory accepts `incremental=True`.
+
+The importer reads commit messages within the range. It reads changed Markdown,
+SQL, data and template revisions inside that range. It reads code comments and
+docstrings at the range's final commit for paths the range changed. For a file
+decision, immutable evidence stores the exact excerpt, its original offset and
+the URL to its lines. Files without decisions create no source revisions.
+
+An unfinished apply resumes its saved range before processing a later commit.
+Use the same extractor configuration to resume. A time budget or transient
+failure leaves the range open. A content failure is recorded in
+`checkpoint.failed` and in the error summary. The cursor advances once every
+unit is stored or has a recorded content failure.
+
+| Status | Meaning |
+| --- | --- |
+| `waiting_for_backfill` | No cursor exists. The importer performs no Git reads or writes. |
+| `up_to_date` | The requested commit equals the cursor. |
+| `cursor_not_ancestor` | The requested history does not contain the cursor. Check the checkout and commit before retrying. |
+| `pending_range_ahead` | An unfinished range ends outside the requested history. Retry with its final commit or a descendant. |
+| `cursor_changed` | Another run advanced the cursor. Retry from the new cursor. |
+
 `source_importers.SourceImporter` defines `run(*, apply=False)`. A
 `SourceImporterRegistry` registers factories, and `default_source_importers()`
 registers lazy `linear` and `repository-history` adapters. A deployment can
