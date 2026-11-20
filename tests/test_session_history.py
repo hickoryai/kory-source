@@ -4,6 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import psycopg
 import pytest
 
 from mira.registry.access import AccessDenied
@@ -12,13 +13,17 @@ from mira.registry.imports import Candidate
 from mira.registry.model import RegistryError
 from mira.registry.provenance import ProvenanceStore, QuoteMismatch
 from mira.registry.service import Registry
-from mira.registry.session_history import export_bundle
+from mira.registry.session_history import export_bundle, main
 from mira.registry.source_importers import default_source_importers
 from tests import registry_policy as rp
 
 USER = "owner@example.com"
 QUOTE = "We decided to keep the existing API."
-UNAVAILABLE = ["Claude Desktop", "Claude iOS", "Codex memories database"]
+UNAVAILABLE = [
+    {"system": "offbox_session", "name": "Desktop transcripts", "reason": "No exported file"},
+    {"system": "offbox_session", "name": "Mobile transcripts", "reason": "No device export"},
+    {"system": "agent_memory", "name": "Memory database", "reason": "No text export"},
+]
 
 
 class Classifier:
@@ -120,6 +125,7 @@ def test_dry_run_does_not_write_or_classify(setup):
         "files_read": 1,
         "excluded_events": 2,
         "stored_evidence": 0,
+        "unavailable_stored": 0,
         "proposed": 0,
     }
     assert report["unavailable"] == UNAVAILABLE
@@ -226,7 +232,7 @@ def test_distinct_memory_roots_and_markdown_only(setup):
     for project in ("project-a", "project-b"):
         memory = tmp_path / project / "memory"
         memory.mkdir(parents=True)
-        (memory / "MEMORY.md").write_text(QUOTE)
+        (memory / "MEMORY.md").write_text(f"{QUOTE} Project: {project}")
         (memory / "state.sqlite").write_text("excluded by file type")
         sources.append(("agent_memory", memory))
     bundle = tmp_path / "memory-bundle"
@@ -236,3 +242,92 @@ def test_distinct_memory_roots_and_markdown_only(setup):
     assert {row["source_system"] for row in registry._select("kind = 'decision'")} == {
         "agent_memory"
     }
+
+
+def test_unavailable_source_revisions_are_empty_and_replay_is_a_noop(setup):
+    tmp_path, _, registry, sources, _, classifier = setup
+    bundle = _bundle(tmp_path / "bundle", sources)
+    report = _importer(registry, bundle, classifier).run(apply=True)
+    assert report["counts"]["unavailable_stored"] == len(UNAVAILABLE)
+    assert report["counts"]["stored_evidence"] == 0
+    assert classifier.calls == 0
+    rows = registry.db.execute(
+        "SELECT source_system, source_labels, availability, original_text, payload, corpus_id "
+        "FROM registry_source_revisions"
+    )
+    assert {
+        (system, json.loads(labels)["name"], json.loads(labels)["reason"])
+        for system, labels, *_ in rows
+    } == {(entry["system"], entry["name"], entry["reason"]) for entry in UNAVAILABLE}
+    assert all(row[2:] == ("unavailable", "", "{}", rp.CORPUS) for row in rows)
+    assert (
+        _importer(registry, bundle, classifier).run(apply=True)["counts"]["unavailable_stored"] == 0
+    )
+    assert registry.db.execute("SELECT COUNT(*) FROM registry_import_runs") == [(1,)]
+
+
+def test_text_identity_ignores_renames_and_tool_changes_after_cutover(setup):
+    tmp_path, _, registry, sources, transcript, classifier = setup
+    _write(transcript)
+    copy = sources / "copy.jsonl"
+    copy.write_bytes(transcript.read_bytes())
+    first = _bundle(tmp_path / "first", sources)
+    preview = _importer(registry, first, classifier).run()
+    assert preview["new_revisions"] == 1
+    assert preview["counts"]["files_read"] == 2
+    report = _importer(registry, first, classifier, mark_cutover=True).run(apply=True)
+    assert report["cutover"]
+    assert report["counts"]["stored_evidence"] == 1
+
+    # One renamed copy and another copy whose tool result changed.
+    copy.unlink()
+    transcript.rename(sources / "renamed.jsonl")
+    (sources / "other.jsonl").write_text(
+        (sources / "renamed.jsonl")
+        .read_text()
+        .replace("private tool payload", "changed tool result")
+    )
+    second = _bundle(tmp_path / "second", sources)
+    importer = _importer(registry, second, classifier)
+    assert importer.run()["new_revisions"] == 0
+    report = importer.run(apply=True)
+    assert report["cutover"]
+    assert report["counts"]["files_read"] == report["counts"]["stored_evidence"] == 0
+    assert classifier.calls == 1
+    assert registry.db.execute(
+        "SELECT COUNT(*) FROM registry_source_revisions WHERE availability = 'available'"
+    ) == [(1,)]
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (sqlite3.OperationalError, "session history database operation failed"),
+        (psycopg.DatabaseError, "session history database operation failed"),
+        (AccessDenied, "session history import denied by corpus policy"),
+    ],
+)
+def test_cli_database_and_access_errors_hide_details(setup, monkeypatch, capsys, failure, message):
+    monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
+
+    def fail():
+        raise failure("SELECT secret FROM /private/transcript")
+
+    monkeypatch.setattr("mira.registry.get_registry", fail)
+    with pytest.raises(SystemExit) as exit_info:
+        main(["import", "--user", USER, "--bundle", str(setup[0]), "--apply"])
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == message + "\n"
+
+
+def test_empty_bundle_cannot_mark_cutover(setup, monkeypatch, capsys):
+    tmp_path, _, registry, sources, _, _ = setup
+    bundle = _bundle(tmp_path / "bundle", sources)
+    monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
+    monkeypatch.setattr("mira.registry.get_registry", lambda: registry)
+    with pytest.raises(SystemExit) as exit_info:
+        main(["import", "--user", USER, "--bundle", str(bundle), "--apply", "--mark-cutover"])
+    assert exit_info.value.code == 1
+    assert capsys.readouterr().err == "marking cutover requires at least one file\n"
+    assert registry.db.execute("SELECT 1 FROM registry_sync_state") == []
+    assert registry.db.execute("SELECT 1 FROM registry_import_runs") == []

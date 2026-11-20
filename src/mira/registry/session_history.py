@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+import sqlite3
 import sys
 from collections import Counter
 from collections.abc import Iterator
@@ -31,7 +32,21 @@ from mira.registry.imports import (
     record_cursor,
 )
 from mira.registry.model import RegistryError
-from mira.registry.provenance import ProvenanceStore, QuoteMismatch, SourceRevision, evidence_id_for
+from mira.registry.provenance import (
+    ProvenanceStore,
+    QuoteMismatch,
+    SourceRevision,
+    evidence_id_for,
+    sha256_text,
+)
+
+DATABASE_ERRORS: tuple[type[Exception], ...]
+try:
+    from psycopg import Error as PostgresError
+except ImportError:  # SQLite deployments do not need the Postgres driver.
+    DATABASE_ERRORS = (sqlite3.Error,)
+else:
+    DATABASE_ERRORS = (sqlite3.Error, PostgresError)
 
 IMPORTER = "session_history"
 VERSION = "1"
@@ -118,17 +133,41 @@ def _sidecar(path: Path) -> dict[str, str]:
     return {key: value for key, value in fields.items() if value}
 
 
+class EmptyCutover(RegistryError):
+    """An empty bundle cannot seal a session subject."""
+
+
+def _unavailable_revision(entry: dict, namespace: str) -> SourceRevision:
+    system, name, reason = entry["system"], entry["name"], entry["reason"]
+    if (
+        set(entry) != {"system", "name", "reason"}
+        or system not in SYSTEMS
+        or not all(_label(value) for value in (name, reason))
+    ):
+        raise ValueError("invalid unavailable source")
+    return SourceRevision(
+        system,
+        "unavailable_source",
+        f"{namespace}/{name}",
+        "",
+        source_labels={"name": name, "reason": reason},
+        availability="unavailable",
+    )
+
+
 def export_bundle(
     bundle: Path,
     *,
     user: str,
     sources: list[tuple[str, Path]],
-    unavailable: list[str],
+    unavailable: list[dict[str, str]],
 ) -> dict:
     """Copy only selected file types from explicit roots; never copy native state."""
     user = session_subject(user)
     if not user:
         raise RegistryError("a valid session subject is required")
+    for entry in unavailable:
+        _unavailable_revision(entry, "")
     bundle.mkdir(mode=0o700)
     files = []
     for system, root in sources:
@@ -150,12 +189,14 @@ def export_bundle(
             excluded = 0
             meta = {}
             if system == "agent_memory":
-                if "\x00" in raw.decode("utf-8"):
+                text = raw.decode("utf-8")
+                if "\x00" in text:
                     raise RegistryError("memory file contains a NUL character")
                 data = raw
             else:
                 events, excluded = _events(raw)
                 data = b"".join(_json_bytes(event) for event in events)
+                text = "\n\n".join(event["content"] for event in events)
                 meta = _sidecar(path)
             source_id = f"{root_id}/{path.relative_to(root).as_posix()}"
             checksum = digest(data)
@@ -166,7 +207,7 @@ def export_bundle(
                     "system": system,
                     "source_id": source_id,
                     "sha256": checksum,
-                    "source_sha256": digest(raw),
+                    "text_sha256": sha256_text(text),
                     "excluded": excluded,
                     "meta": meta,
                 }
@@ -175,7 +216,7 @@ def export_bundle(
         "schema": VERSION,
         "user": user,
         "files": files,
-        "unavailable": sorted(set(unavailable)),
+        "unavailable": unavailable,
     }
     (bundle / "manifest.json").write_bytes(_json_bytes(manifest))
     return {
@@ -194,10 +235,18 @@ class EventSpan:
     origin: str
 
 
+def _text_evidence_id(namespace: str, text_sha256: str) -> str:
+    return evidence_id_for(IMPORTER, "stored_text", namespace, text_sha256)
+
+
 class SessionRevision(SourceRevision):
     @property
     def observation_sha256(self) -> str:
-        return self.source_version
+        return self.content_sha256
+
+    @property
+    def evidence_id(self) -> str:
+        return _text_evidence_id(self.source_id.split("/", 1)[0], self.content_sha256)
 
 
 @dataclass(frozen=True)
@@ -205,7 +254,7 @@ class BundleEntry:
     system: str
     source_id: str
     sha256: str
-    source_sha256: str
+    text_sha256: str
     excluded: int
     meta: dict
 
@@ -217,7 +266,7 @@ class BundleEntry:
             or ".." in name.parts
             or len(name.parts) < 2
             or not FILE_DIGEST.fullmatch(self.sha256)
-            or not FILE_DIGEST.fullmatch(self.source_sha256)
+            or not FILE_DIGEST.fullmatch(self.text_sha256)
             or type(self.excluded) is not int
             or self.excluded < 0
             or not isinstance(self.meta, dict)
@@ -231,9 +280,7 @@ class BundleEntry:
         return "memory_file" if self.system == "agent_memory" else "transcript"
 
     def evidence_id(self, namespace: str) -> str:
-        return evidence_id_for(
-            self.system, self.source_type, f"{namespace}/{self.source_id}", self.source_sha256
-        )
+        return _text_evidence_id(namespace, self.text_sha256)
 
 
 @dataclass(frozen=True)
@@ -276,14 +323,15 @@ class BundleFile:
                 pieces.append(content)
                 offset += len(content) + 2
             text = "\n\n".join(pieces)
-        # The registry namespaces immutable revisions by source, file and corpus.
-        # Source bytes determine the revision within that file.
+        if sha256_text(text) != entry.text_sha256:
+            raise ValueError("stored text digest mismatch")
+        # The first observation of this text supplies its source provenance.
         revision = SessionRevision(
             entry.system,
             entry.source_type,
             f"{namespace}/{entry.source_id}",
             text,
-            source_version=entry.source_sha256,
+            source_version=entry.text_sha256,
             source_labels={
                 "branch": meta.get("branch"),
                 "branch_state": "stated" if meta.get("branch") else "unknown",
@@ -356,8 +404,7 @@ class SessionHistoryImporter:
             )
         )
 
-    def _new_files(self, files: list[BundleEntry], namespace: str) -> list[BundleEntry]:
-        ids = [file.evidence_id(namespace) for file in files]
+    def _existing_evidence(self, ids: list[str]) -> set[str]:
         existing = set()
         for start in range(0, len(ids), 500):
             batch = ids[start : start + 500]
@@ -369,6 +416,11 @@ class SessionHistoryImporter:
                     batch,
                 )
             )
+        return existing
+
+    def _new_files(self, files: list[BundleEntry], namespace: str) -> list[BundleEntry]:
+        ids = [file.evidence_id(namespace) for file in files]
+        existing = self._existing_evidence(ids)
         pending = [
             file
             for file, evidence_id in zip(files, ids, strict=True)
@@ -378,7 +430,9 @@ class SessionHistoryImporter:
             raise RegistryError("session cutover is complete; the bundle contains a new revision")
         return pending
 
-    def _load(self) -> tuple[list[BundleEntry], list[str], str]:
+    def _load(
+        self, namespace: str
+    ) -> tuple[list[BundleEntry], list[dict], list[SourceRevision], str]:
         try:
             path = self.bundle / "manifest.json"
             if path.is_symlink():
@@ -388,8 +442,9 @@ class SessionHistoryImporter:
             if manifest["schema"] != VERSION or manifest["user"] != self.user:
                 raise ValueError("manifest does not match this import")
             unavailable = manifest["unavailable"]
-            if not isinstance(unavailable, list) or not all(_label(x) for x in unavailable):
+            if not isinstance(unavailable, list):
                 raise ValueError("invalid unavailable sources")
+            exceptions = [_unavailable_revision(entry, namespace) for entry in unavailable]
             if not isinstance(manifest["files"], list):
                 raise ValueError("invalid file list")
             files = [BundleEntry(**entry) for entry in manifest["files"]]
@@ -397,38 +452,52 @@ class SessionHistoryImporter:
                 raise ValueError("duplicate source file")
         except (OSError, ValueError, KeyError, TypeError):
             raise RegistryError("invalid session-history bundle") from None
-        return files, unavailable, digest(raw)
+        return files, unavailable, exceptions, digest(raw)
 
     def run(self, *, apply: bool = False) -> dict:
         policy = self._policy()
         if self.mark_cutover and not apply:
             raise RegistryError("marking cutover requires apply")
         namespace = digest(_json_bytes([policy.corpus_id, self.user]))
-        files, unavailable, checksum = self._load()
+        files, unavailable, exceptions, checksum = self._load(namespace)
+        if self.mark_cutover and not files:
+            raise EmptyCutover("marking cutover requires at least one file")
         counts: Counter[str] = Counter(
             files_in_bundle=len(files),
             files_read=0,
             excluded_events=0,
             stored_evidence=0,
+            unavailable_stored=0,
             proposed=0,
         )
         out = {"apply": apply, "unavailable": unavailable, "counts": counts}
         if not apply:
             pending = self._new_files(files, namespace)
             candidate_passages = 0
+            seen = set()
             for entry in pending:
                 file = BundleFile.load(self.bundle, entry, namespace=namespace)
                 counts["files_read"] += 1
                 counts["excluded_events"] += file.excluded
+                evidence_id = file.revision.evidence_id
+                if evidence_id in seen:
+                    continue
+                seen.add(evidence_id)
                 candidate_passages += len(file.passages)
-            return {**out, "new_revisions": len(pending), "candidate_passages": candidate_passages}
+            return {**out, "new_revisions": len(seen), "candidate_passages": candidate_passages}
 
         run = None
         try:
             with self._lock(namespace):
                 pending = self._new_files(files, namespace)
-                if not pending:
-                    if self.mark_cutover and files and not self._cutover(namespace):
+                existing = self._existing_evidence(
+                    [revision.evidence_id for revision in exceptions]
+                )
+                missing = {
+                    rev.evidence_id: rev for rev in exceptions if rev.evidence_id not in existing
+                }
+                if not pending and not missing:
+                    if self.mark_cutover and not self._cutover(namespace):
                         record_cursor(
                             self.registry,
                             IMPORTER,
@@ -437,12 +506,15 @@ class SessionHistoryImporter:
                             cursor=checksum,
                         )
                     return {**out, "cutover": self._cutover(namespace)}
-                classifier = self.classifier or decision_llm.default_classifier(
-                    self.registry, corpus_id=policy.corpus_id
-                )
-                if classifier.corpus_id != policy.corpus_id:
-                    raise AccessDenied("classifier cache belongs to another corpus")
-                classifier.validate_configuration()
+                classifier = None
+                if pending:
+                    classifier = self.classifier or decision_llm.default_classifier(
+                        self.registry, corpus_id=policy.corpus_id
+                    )
+                    if classifier.corpus_id != policy.corpus_id:
+                        raise AccessDenied("classifier cache belongs to another corpus")
+                    classifier.validate_configuration()
+                model = classifier.model if classifier else ""
                 run = self.runs.start(
                     self.access,
                     source_system=IMPORTER,
@@ -452,16 +524,18 @@ class SessionHistoryImporter:
                     scope={
                         "bundle_sha256": checksum,
                         "unavailable": unavailable,
-                        "model": classifier.model,
+                        "model": model,
                         "policy_sha256": policy.manifest_sha256,
                         "operator": self.access.principal,
                     },
-                    extractor=decision_llm.EXTRACTOR,
-                    extractor_version=decision_llm.EXTRACTOR_VERSION,
-                    extractor_model=classifier.model,
+                    extractor=decision_llm.EXTRACTOR if classifier else "",
+                    extractor_version=decision_llm.EXTRACTOR_VERSION if classifier else "",
+                    extractor_model=model,
                 )
-            classifier.import_run_id = run["run_id"]
+            if classifier is not None:
+                classifier.import_run_id = run["run_id"]
             for entry in pending:
+                assert classifier is not None
                 with self._lock(namespace):
                     if not self._new_files([entry], namespace):
                         continue
@@ -481,6 +555,17 @@ class SessionHistoryImporter:
                     counts.update(page_counts)
             with self._lock(namespace):
                 run = self.runs.get(run["run_id"])
+                for revision in missing.values():
+                    with self.runs.page(run, self.access) as page_counts:
+                        _, created = self.store.record_revision(
+                            revision,
+                            corpus=(run["corpus_id"], run["policy_version"]),
+                            run_id=run["run_id"],
+                        )
+                        if created:
+                            page_counts["unavailable_stored"] += 1
+                            run["next_checkpoint"] = {"evidence_id": revision.evidence_id}
+                    counts.update(page_counts)
                 self.runs.finish(run, complete=True)
                 if self.mark_cutover and not self._cutover(namespace):
                     record_cursor(
@@ -564,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--user", required=True)
         command.add_argument("--bundle", required=True, type=Path)
     exporter.add_argument("--source", action="append", required=True, metavar="TYPE=DIR")
-    exporter.add_argument("--unavailable", action="append", default=[])
+    exporter.add_argument("--unavailable", action="append", default=[], metavar="TYPE:NAME=REASON")
     importer.add_argument("--apply", action="store_true")
     importer.add_argument("--mark-cutover", action="store_true")
     args = parser.parse_args(argv)
@@ -576,11 +661,18 @@ def main(argv: list[str] | None = None) -> int:
                 if not separator or not path:
                     parser.error("--source requires TYPE=DIR")
                 sources.append((kind, Path(path)))
+            unavailable = []
+            for value in args.unavailable:
+                source, equals, reason = value.partition("=")
+                system, colon, name = source.partition(":")
+                if not equals or not colon:
+                    parser.error("--unavailable requires TYPE:NAME=REASON")
+                unavailable.append({"system": system, "name": name, "reason": reason})
             out = export_bundle(
                 args.bundle,
                 user=args.user,
                 sources=sources,
-                unavailable=args.unavailable,
+                unavailable=unavailable,
             )
         else:
             from mira.registry import get_registry
@@ -606,6 +698,12 @@ def main(argv: list[str] | None = None) -> int:
                 url, path = default_location()
                 with closing(RegistryDB(url=url, path=path, read_only=True)) as db:
                     out = SessionHistoryImporter(Registry(db), **settings).run()
+    except EmptyCutover:
+        parser.exit(1, "marking cutover requires at least one file\n")
+    except AccessDenied:
+        parser.exit(1, "session history import denied by corpus policy\n")
+    except DATABASE_ERRORS:
+        parser.exit(1, "session history database operation failed\n")
     except (RegistryError, ValueError, OSError):
         # A raw exception can contain private paths, quotes or source content.
         parser.exit(1, "session history operation failed; check bundle, policy and run state\n")
