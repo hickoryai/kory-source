@@ -4,7 +4,6 @@ import json
 import sqlite3
 from pathlib import Path
 
-import psycopg
 import pytest
 
 from mira.registry.access import AccessDenied
@@ -303,12 +302,16 @@ def test_text_identity_ignores_renames_and_tool_changes_after_cutover(setup):
     ("failure", "message"),
     [
         (sqlite3.OperationalError, "session history database operation failed"),
-        (psycopg.DatabaseError, "session history database operation failed"),
+        ("postgres", "session history database operation failed"),
+        (RuntimeError, "session history operation failed; check bundle, policy and run state"),
         (AccessDenied, "session history import denied by corpus policy"),
     ],
 )
 def test_cli_database_and_access_errors_hide_details(setup, monkeypatch, capsys, failure, message):
     monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
+
+    if failure == "postgres":
+        failure = pytest.importorskip("psycopg").DatabaseError
 
     def fail():
         raise failure("SELECT secret FROM /private/transcript")
@@ -331,3 +334,27 @@ def test_empty_bundle_cannot_mark_cutover(setup, monkeypatch, capsys):
     assert capsys.readouterr().err == "marking cutover requires at least one file\n"
     assert registry.db.execute("SELECT 1 FROM registry_sync_state") == []
     assert registry.db.execute("SELECT 1 FROM registry_import_runs") == []
+
+
+def test_cutover_refuses_new_unavailable_source_revisions(setup):
+    tmp_path, _, registry, sources, transcript, classifier = setup
+    _write(transcript)
+    first = _bundle(tmp_path / "first", sources)
+    assert _importer(registry, first, classifier, mark_cutover=True).run(apply=True)["cutover"]
+
+    second = tmp_path / "second"
+    export_bundle(
+        second,
+        user=USER,
+        sources=[("kory_code_session", sources)],
+        unavailable=[
+            *UNAVAILABLE,
+            {"system": "offbox_session", "name": "Another source", "reason": "No export"},
+        ],
+    )
+    importer = _importer(registry, second, classifier)
+    for apply in (False, True):
+        with pytest.raises(RegistryError, match="cutover is complete"):
+            importer.run(apply=apply)
+    assert registry.db.execute("SELECT COUNT(*) FROM registry_source_revisions") == [(4,)]
+    assert registry.db.execute("SELECT COUNT(*) FROM registry_import_runs") == [(1,)]

@@ -430,6 +430,15 @@ class SessionHistoryImporter:
             raise RegistryError("session cutover is complete; the bundle contains a new revision")
         return pending
 
+    def _new_unavailable(
+        self, exceptions: list[SourceRevision], namespace: str
+    ) -> dict[str, SourceRevision]:
+        existing = self._existing_evidence([revision.evidence_id for revision in exceptions])
+        missing = {rev.evidence_id: rev for rev in exceptions if rev.evidence_id not in existing}
+        if missing and self._cutover(namespace):
+            raise RegistryError("session cutover is complete; the bundle contains a new revision")
+        return missing
+
     def _load(
         self, namespace: str
     ) -> tuple[list[BundleEntry], list[dict], list[SourceRevision], str]:
@@ -473,6 +482,7 @@ class SessionHistoryImporter:
         out = {"apply": apply, "unavailable": unavailable, "counts": counts}
         if not apply:
             pending = self._new_files(files, namespace)
+            self._new_unavailable(exceptions, namespace)
             candidate_passages = 0
             seen = set()
             for entry in pending:
@@ -490,12 +500,7 @@ class SessionHistoryImporter:
         try:
             with self._lock(namespace):
                 pending = self._new_files(files, namespace)
-                existing = self._existing_evidence(
-                    [revision.evidence_id for revision in exceptions]
-                )
-                missing = {
-                    rev.evidence_id: rev for rev in exceptions if rev.evidence_id not in existing
-                }
+                missing = self._new_unavailable(exceptions, namespace)
                 if not pending and not missing:
                     if self.mark_cutover and not self._cutover(namespace):
                         record_cursor(
@@ -555,7 +560,7 @@ class SessionHistoryImporter:
                     counts.update(page_counts)
             with self._lock(namespace):
                 run = self.runs.get(run["run_id"])
-                for revision in missing.values():
+                for revision in self._new_unavailable(exceptions, namespace).values():
                     with self.runs.page(run, self.access) as page_counts:
                         _, created = self.store.record_revision(
                             revision,
@@ -689,7 +694,8 @@ def main(argv: list[str] | None = None) -> int:
             }
             if args.apply:
                 registry = get_registry()
-                assert registry is not None
+                if registry is None:
+                    raise RegistryError("session history registry is unavailable")
                 out = SessionHistoryImporter(registry, **settings).run(apply=True)
             else:
                 from mira.registry.db import RegistryDB, default_location
@@ -704,7 +710,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.exit(1, "session history import denied by corpus policy\n")
     except DATABASE_ERRORS:
         parser.exit(1, "session history database operation failed\n")
-    except (RegistryError, ValueError, OSError):
+    except Exception:
         # A raw exception can contain private paths, quotes or source content.
         parser.exit(1, "session history operation failed; check bundle, policy and run state\n")
     json.dump(out, sys.stdout, indent=2)
