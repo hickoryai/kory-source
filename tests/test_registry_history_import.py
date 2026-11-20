@@ -14,7 +14,14 @@ from mira.registry import anchor_resolution
 from mira.registry.access import AccessContext
 from mira.registry.db import RegistryDB
 from mira.registry.github_history import GitHubHistoryImporter, GitHubReadClient
-from mira.registry.imports import ReadOnlyViolation, assert_read_only_graphql, extract_decisions
+from mira.registry.imports import (
+    ImportRuns,
+    ReadOnlyViolation,
+    assert_read_only_graphql,
+    extract_decisions,
+    read_cursors,
+    record_cursor,
+)
 from mira.registry.provenance import ProvenanceStore
 from mira.registry.repository_history import GitReader, RepositoryHistoryImporter
 from mira.registry.service import Registry
@@ -439,3 +446,194 @@ def test_failed_unbounded_walk_never_advances_cursor(reg, checkout, monkeypatch)
     ).run(apply=True)
     assert result["status"] == "incomplete"
     assert read_cursors(reg, "git") == {}
+
+
+def incremental(reg, checkout, **kwargs):
+    return RepositoryHistoryImporter(
+        reg, GitReader(checkout[0]), repo=REPO, access=rp.operator(), incremental=True, **kwargs
+    )
+
+
+def test_incremental_waits_for_backfill_before_reading_git(reg, checkout, monkeypatch):
+    importer = incremental(reg, checkout)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("read git without the backfill cursor")
+
+    monkeypatch.setattr(importer.reader, "git", unexpected)
+    assert importer.run()["status"] == "waiting_for_backfill"
+    assert importer.run(apply=True)["status"] == "waiting_for_backfill"
+    assert not ImportRuns(reg).coverage(rp.operator())
+    assert read_cursors(reg, "git") == {}
+
+
+def test_incremental_reads_only_new_revisions_and_replay_writes_nothing(reg, checkout, monkeypatch):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    importer = incremental(reg, checkout, commit=shas[1])
+    show = importer.reader.show
+
+    def show_new_markdown(commit, path):
+        assert (commit, path) == (shas[1], "docs/design.md")
+        return show(commit, path)
+
+    monkeypatch.setattr(importer.reader, "show", show_new_markdown)
+    dry = importer.run()
+    assert dry["markdown_files"] == 1 and dry["code_files"] == 0
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[0]
+    out = importer.run(apply=True)
+    assert out["status"] == "complete"
+    assert out["since"] == shas[0]
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[1]
+    rows = reg.db.execute(
+        "SELECT commit_sha, original_text FROM registry_source_revisions WHERE source_type = 'git_markdown'"
+    )
+    assert set(rows) == {
+        (shas[1], "Registry rows carry a corpus id."),
+        (shas[1], "Merges are realization only."),
+    }
+    assert importer.run(apply=True)["status"] == "up_to_date"
+    assert ImportRuns(reg).coverage(rp.operator())[0]["run_id"] == out["run_id"]
+    assert len(ImportRuns(reg).coverage(rp.operator())) == 1
+
+
+def test_incremental_resumes_saved_range_before_new_head(reg, checkout):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    partial = incremental(reg, checkout, commit=shas[1], max_units=1).run(apply=True)
+    assert partial["status"] == "incomplete"
+    resumed = incremental(reg, checkout).run(apply=True)
+    assert resumed["status"] == "complete"
+    assert resumed["run_id"] == partial["run_id"]
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[1]
+    assert incremental(reg, checkout).run(apply=True)["commit"] == shas[2]
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[2]
+
+
+def test_incremental_keeps_revisions_of_a_file_removed_inside_the_range(reg, checkout):
+    repo, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    _git(repo, "commit", "--allow-empty", "-m", "We decided: keep the deployment queue serial.")
+    empty = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "rm", "docs/design.md")
+    _git(repo, "commit", "-m", "Remove design notes")
+    head = _git(repo, "rev-parse", "HEAD")
+    out = incremental(reg, checkout).run(apply=True)
+    assert out["status"] == "complete"
+    rows = reg.db.execute("SELECT source_type, commit_sha FROM registry_source_revisions")
+    assert set(rows) == {
+        ("git_markdown", shas[1]),
+        ("git_source_file", head),
+        ("git_commit_message", empty),
+    }
+
+
+def test_incremental_cannot_overwrite_a_cursor_advanced_by_another_run(reg, checkout, monkeypatch):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    importer = incremental(reg, checkout, commit=shas[1])
+    collect = importer._collect_unit
+
+    def collect_unit(frozen, kind, path):
+        if kind == "log":
+            record_cursor(reg, "git", stream, watermark=0, cursor=shas[2])
+        return collect(frozen, kind, path)
+
+    monkeypatch.setattr(importer, "_collect_unit", collect_unit)
+    assert importer.run(apply=True)["status"] == "cursor_changed"
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[2]
+
+
+@pytest.mark.parametrize("failure", ["parse", "transport", "unknown"])
+def test_incremental_advances_only_after_settled_units(reg, checkout, monkeypatch, failure):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    importer = incremental(reg, checkout, commit=shas[1])
+    collect = importer._collect_unit
+    exceptions = {
+        "parse": json.JSONDecodeError("invalid content", "", 0),
+        "transport": RuntimeError("Router workstation outage"),
+        "unknown": ValueError("unexpected unit error"),
+    }
+    error = exceptions[failure]
+
+    def collect_unit(frozen, kind, path):
+        if kind == "md":
+            raise error
+        return collect(frozen, kind, path)
+
+    monkeypatch.setattr(importer, "_collect_unit", collect_unit)
+    out = importer.run(apply=True)
+    run = ImportRuns(reg).get(out["run_id"])
+    assert out["error_count"] == 1
+    if failure != "parse":
+        assert out["status"] == "incomplete"
+        assert str(error) in run["errors"][0]
+        assert not run["checkpoint"].get("failed")
+        assert read_cursors(reg, "git")[stream]["cursor"] == shas[0]
+    else:
+        assert out["status"] == "complete"
+        assert run["checkpoint"]["failed"] == {"md:docs/design.md": str(error)}
+        assert not run["errors"]
+        assert read_cursors(reg, "git")[stream]["cursor"] == shas[1]
+
+
+def test_incremental_classification_group_failure_keeps_the_range_open(reg, checkout, monkeypatch):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    importer = incremental(reg, checkout)
+
+    def fail_group(prepared, *, apply):
+        assert apply
+        assert {path for _, path, *_ in prepared} >= {"docs/design.md", "src/app/session.py"}
+        raise ValueError("malformed classifier response")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(importer, "_classify_prepared", fail_group)
+        out = importer.run(apply=True)
+    assert out["status"] == "incomplete"
+    assert not ImportRuns(reg).get(out["run_id"])["checkpoint"].get("failed")
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[0]
+
+    resumed = importer.run(apply=True)
+    assert resumed["run_id"] == out["run_id"]
+    assert resumed["status"] == "complete"
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[2]
+
+
+def test_incremental_evidence_write_error_does_not_settle_a_unit(reg, checkout, monkeypatch):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[0])
+    importer = incremental(reg, checkout, commit=shas[1])
+
+    def fail_write(*args, **kwargs):
+        raise ValueError("unexpected write error")
+
+    monkeypatch.setattr(importer.store, "record_revision", fail_write)
+    out = importer.run(apply=True)
+    assert out["status"] == "incomplete"
+    assert not ImportRuns(reg).get(out["run_id"])["checkpoint"].get("failed")
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[0]
+
+
+def test_incremental_refuses_cursor_outside_requested_history(reg, checkout):
+    _, shas = checkout
+    stream = f"repository:{REPO}"
+    record_cursor(reg, "git", stream, watermark=0, cursor=shas[2])
+    out = incremental(reg, checkout, commit=shas[1]).run(apply=True)
+    assert out["status"] == "cursor_not_ancestor"
+    assert read_cursors(reg, "git")[stream]["cursor"] == shas[2]
+    assert not ImportRuns(reg).coverage(rp.operator())
+
+
+@pytest.mark.parametrize("option", [{"max_commits": 0}, {"paths": ["docs"]}])
+def test_incremental_refuses_limits(reg, checkout, option):
+    with pytest.raises(ValueError, match="incremental history does not accept"):
+        incremental(reg, checkout, **option)

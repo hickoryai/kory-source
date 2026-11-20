@@ -31,8 +31,10 @@ import re
 import subprocess
 import sys
 import time
+import tomllib
 from bisect import bisect_right
 from collections import Counter, OrderedDict
+from dataclasses import replace
 from itertools import chain
 from pathlib import Path
 from typing import Any
@@ -50,6 +52,7 @@ from mira.registry.imports import (
     ReadOnlyViolation,
     extract_decisions,
     materialize,
+    read_cursors,
     record_cursor,
 )
 from mira.registry.provenance import ProvenanceStore, SourceRevision
@@ -125,7 +128,8 @@ IMPORTER_VERSION = "5"
 # commit the cursor, so earlier groups stay finished.
 _GROUP_PASSAGES = 32
 _GROUP_FILES = 8
-_READ_ONLY = {"log", "show", "ls-tree", "rev-parse", "cat-file", "diff", "blame"}
+_READ_ONLY = {"log", "show", "ls-tree", "rev-parse", "cat-file", "diff", "blame", "merge-base"}
+_DEFAULT_MAX_COMMITS = 200
 _MARKDOWN = (".md", ".mdx", ".markdown")
 # Comment syntax per language. Anything else is reported as unsupported.
 _LINE_COMMENT = {
@@ -179,6 +183,20 @@ _DOLLAR_QUOTE = re.compile(r"\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$")
 _BLOCK = re.compile(r"/\*.*?\*/", re.S)
 _DOCSTRING = re.compile(r"(?P<q>\"\"\"|''')(?P<body>.*?)(?P=q)", re.S)
 _SEP = "\x1e"
+
+
+class _ContentParseError(ValueError):
+    """A data file's lexical offsets could not be recovered."""
+
+
+_CONTENT_PARSE_ERRORS = (
+    _ContentParseError,
+    UnicodeError,
+    yaml.YAMLError,
+    csv.Error,
+    json.JSONDecodeError,
+    tomllib.TOMLDecodeError,
+)
 
 
 def language_of(path: str) -> str:
@@ -412,7 +430,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                 continue
             for col, value in enumerate(row):
                 if cursor >= len(fields):
-                    raise ValueError("CSV field offsets unavailable")
+                    raise _ContentParseError("CSV field offsets unavailable")
                 m = fields[cursor]
                 cursor += 1
                 end = m.end()
@@ -428,8 +446,6 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                         parts.extend(["columns", str(col)])
                     add(key, value, m.start(), end, parts)
     elif suffix == ".toml":
-        import tomllib
-
         tomllib.loads(text)  # Validate before the lexical walk; never execute values.
         position = 0
         section: list[str] = []
@@ -464,7 +480,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                 if delimiter[0] == '"' and text[position] == "\\":
                     position += 1
                 position += 1
-            raise ValueError("unterminated TOML string")
+            raise _ContentParseError("unterminated TOML string")
 
         def keys():
             nonlocal position
@@ -476,7 +492,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                 else:
                     match = _TOML_KEY.match(text, position)
                     if not match:
-                        raise ValueError("invalid TOML key")
+                        raise _ContentParseError("invalid TOML key")
                     part = match[0]
                     position += len(part)
                 parts.append(part)
@@ -498,7 +514,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
                 while text[position : position + 1] != "}":
                     nested = keys()
                     if text[position : position + 1] != "=":
-                        raise ValueError("invalid TOML inline assignment")
+                        raise _ContentParseError("invalid TOML inline assignment")
                     position += 1
                     scan_value([*parts, *nested], nested[-1])
                     whitespace()
@@ -543,7 +559,7 @@ def data_candidates(text: str, suffix: str, *, nominate_values: bool = False) ->
             else:
                 named = keys()
                 if text[position : position + 1] != "=":
-                    raise ValueError("invalid TOML assignment")
+                    raise _ContentParseError("invalid TOML assignment")
                 position += 1
                 scan_value([*section, *named], named[-1])
     return out
@@ -581,7 +597,7 @@ class GitReader:
         self._commit_cache: dict[str, dict] = {}
         self._blame_cache: OrderedDict[tuple[str, str], dict[int, dict]] = OrderedDict()
 
-    def git(self, *args: str) -> str:
+    def git(self, *args: str, allow_no_match: bool = False) -> str:
         if not args or args[0] not in _READ_ONLY:
             raise ReadOnlyViolation(f"git {args[0] if args else ''} is not a read-only command")
         proc = subprocess.run(
@@ -591,12 +607,35 @@ class GitReader:
             timeout=300,
             check=False,
         )
-        if proc.returncode != 0:
+        if proc.returncode != 0 and not (allow_no_match and proc.returncode == 1):
             raise RuntimeError(f"git {args[0]} failed: {proc.stderr.strip()[:300]}")
         return proc.stdout
 
     def rev_parse(self, rev: str) -> str:
-        return self.git("rev-parse", "--verify", f"{rev}^{{commit}}").strip()
+        return self.git("rev-parse", "--verify", "--end-of-options", f"{rev}^{{commit}}").strip()
+
+    def is_ancestor(self, ancestor: str, commit: str) -> bool:
+        return self.git("merge-base", ancestor, commit, allow_no_match=True).strip() == ancestor
+
+    def changed_history(self, revisions: str) -> dict[str, list[str]]:
+        """Map changed paths to commits inside the range, newest first."""
+        out = self.git(
+            "log",
+            "--format=%x00%H",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            "--diff-merges=first-parent",
+            revisions,
+            "--",
+        )
+        history: dict[str, list[str]] = {}
+        for record in out.removeprefix("\0").split("\0\0"):
+            sha, _, paths = record.partition("\0\n")
+            for path in paths.rstrip("\0").split("\0"):
+                if path:
+                    history.setdefault(path, []).append(sha)
+        return history
 
     def files(self, commit: str) -> list[str]:
         return [p for p in self.git("ls-tree", "-r", "--name-only", commit).splitlines() if p]
@@ -785,11 +824,12 @@ class RepositoryHistoryImporter:
         repo: str,
         access: AccessContext,
         commit: str = "HEAD",
-        max_commits: int = 200,
+        max_commits: int = _DEFAULT_MAX_COMMITS,
         classifier: Any = None,
         paths: list[str] | None = None,
         max_seconds: float = 0,
         max_units: int = 0,
+        incremental: bool = False,
     ) -> None:
         if max_seconds < 0:
             raise ValueError("max_seconds must be nonnegative")
@@ -806,9 +846,28 @@ class RepositoryHistoryImporter:
         self.commit = commit
         if max_commits < 0:
             raise ValueError("max_commits must be nonnegative (0 means unbounded)")
+        if incremental and (max_commits != _DEFAULT_MAX_COMMITS or self.paths):
+            raise ValueError("incremental history does not accept a commit limit or path filter")
         self.max_commits = max_commits
+        self.incremental = incremental
+        self._range = ""
+        self._history: dict[str, list[str]] = {}
+        self._range_commits: dict[str, dict] = {}
         self.store = ProvenanceStore(registry)
         self.runs = ImportRuns(registry)
+
+    def _pending_range(self, policy, stream, since):
+        for run in reversed(self.runs.coverage(self.access, unfinished_stream=stream)):
+            if (
+                run["source_system"] == SOURCE_SYSTEM
+                and run["corpus_id"] == policy.corpus_id
+                and run["policy_version"] == policy.policy_version
+                and run["importer_version"] == IMPORTER_VERSION
+            ):
+                scope = json.loads(run["scope_manifest"])
+                if scope.get("since") == since:
+                    return scope
+        return None
 
     def run(self, *, apply: bool = False) -> dict:
         started_run = time.monotonic()
@@ -817,19 +876,83 @@ class RepositoryHistoryImporter:
         policy = require_import(self.access)
         if not policy.admits_repository(self.repo):
             raise AccessDenied("the repository is not in the approved corpus manifest")
+        stream = f"repository:{self.repo}"
+        since = ""
+        pending = None
+        self._range = ""
+        self._history = {}
+        self._range_commits = {}
+        if self.incremental:
+            since = read_cursors(self.registry, SOURCE_SYSTEM).get(stream, {}).get("cursor", "")
+            if not since:
+                return {"apply": apply, "status": "waiting_for_backfill"}
+            frozen = self.reader.rev_parse(self.commit)
+            try:
+                cursor_found = self.reader.rev_parse(since) == since
+            except RuntimeError:
+                cursor_found = False
+            if not cursor_found or not self.reader.is_ancestor(since, frozen):
+                return {
+                    "apply": apply,
+                    "status": "cursor_not_ancestor",
+                    "since": since,
+                    "commit": frozen,
+                }
+            if since == frozen:
+                return {"apply": apply, "status": "up_to_date", "since": since, "commit": frozen}
+            pending = self._pending_range(policy, stream, since)
+            if pending:
+                until = self.reader.rev_parse(pending["commit"])
+                if not self.reader.is_ancestor(until, frozen):
+                    return {
+                        "apply": apply,
+                        "status": "pending_range_ahead",
+                        "since": since,
+                        "commit": until,
+                    }
+                frozen = until
+            self._range = f"{since}..{frozen}"
         if self.classifier is None:
             self.classifier = decision_llm.default_classifier(
                 self.registry, corpus_id=policy.corpus_id
             )
         if apply:
             self.classifier.validate_configuration()
-        frozen = self.reader.rev_parse(self.commit)
-        selected, skipped = inventory(self.reader, frozen, paths=self.paths)
+        if not self.incremental:
+            frozen = self.reader.rev_parse(self.commit)
         self.classifier.deadline = started_run + self.max_seconds if self.max_seconds else None
         stats_before = Counter(getattr(self.classifier, "stats", {}))
         self._stats_flushed = Counter(stats_before)
         if self.classifier.corpus_id != policy.corpus_id:
             raise AccessDenied("classifier cache belongs to another corpus")
+        scope = {
+            "repo": self.repo,
+            "paths": self.paths,
+            "commit": frozen,
+            "max_commits": 0 if self.incremental else self.max_commits,
+            "importer_version": IMPORTER_VERSION,
+            "extractor_version": decision_llm.EXTRACTOR_VERSION,
+            "extractor_model": self.classifier.model,
+        }
+        if self.incremental:
+            scope["since"] = since
+        if pending and pending != scope:
+            raise ValueError(
+                "resume the saved incremental range with its original extractor configuration"
+            )
+        if self.incremental:
+            self._history = self.reader.changed_history(self._range)
+            selected = []
+            skipped: Counter[str] = Counter()
+            for path in sorted(self._history):
+                reason, kind = skip_reason(path), file_kind(path)
+                if reason or not kind:
+                    skipped[reason or "unsupported"] += 1
+                else:
+                    selected.append((kind, path))
+        else:
+            selected, skipped = inventory(self.reader, frozen, paths=self.paths)
+        range_details = {"since": since} if self.incremental else {}
         if not apply:
             totals = Counter(kind for kind, _ in selected)
             estimates: Counter[str] = Counter()
@@ -846,6 +969,7 @@ class RepositoryHistoryImporter:
             return {
                 "apply": False,
                 "commit": frozen,
+                **range_details,
                 **{
                     f"{label}_files": totals[kind]
                     for kind, label in (
@@ -864,33 +988,28 @@ class RepositoryHistoryImporter:
                 "batch_chars": getattr(self.classifier, "batch_chars", decision_llm.BATCH_CHARS),
                 "max_concurrency": getattr(self.classifier, "max_concurrency", 2),
                 "paths": self.paths,
-                "max_commits_per_file": self.max_commits,
+                "max_commits_per_file": scope["max_commits"],
                 **_error_preview(planning_errors),
                 "estimate_complete": not planning_errors,
                 "history_skipped": {k: v for k, v in estimates.items() if k.startswith("skipped_")},
                 "unsupported_files": skipped["unsupported"],
                 "skipped": dict(skipped),
             }
-        scope = {
-            "repo": self.repo,
-            "paths": self.paths,
-            "commit": frozen,
-            "max_commits": self.max_commits,
-            "importer_version": IMPORTER_VERSION,
-            "extractor_version": decision_llm.EXTRACTOR_VERSION,
-            "extractor_model": self.classifier.model,
-        }
-        previous = self.registry.db.execute(
-            "SELECT run_id FROM registry_import_runs WHERE corpus_id = ? AND policy_version = ? "
-            "AND source_system = ? AND stream = ? AND importer_version = ? AND status = 'complete' "
-            "ORDER BY finished_at DESC",
-            (
-                policy.corpus_id,
-                policy.policy_version,
-                SOURCE_SYSTEM,
-                f"repository:{self.repo}",
-                IMPORTER_VERSION,
-            ),
+        previous = (
+            ()
+            if self.incremental
+            else self.registry.db.execute(
+                "SELECT run_id FROM registry_import_runs WHERE corpus_id = ? AND policy_version = ? "
+                "AND source_system = ? AND stream = ? AND importer_version = ? AND status = 'complete' "
+                "ORDER BY finished_at DESC",
+                (
+                    policy.corpus_id,
+                    policy.policy_version,
+                    SOURCE_SYSTEM,
+                    stream,
+                    IMPORTER_VERSION,
+                ),
+            )
         )
         for (run_id,) in previous:
             prior = self.runs.get(run_id)
@@ -906,7 +1025,7 @@ class RepositoryHistoryImporter:
         run = self.runs.start(
             self.access,
             source_system=SOURCE_SYSTEM,
-            stream=f"repository:{self.repo}",
+            stream=stream,
             importer=IMPORTER,
             importer_version=IMPORTER_VERSION,
             scope=scope,
@@ -923,7 +1042,9 @@ class RepositoryHistoryImporter:
         # Retry those files. The run's errors keep the original text.
         for key in sorted(failed):
             if _retryable(failed[key]):
-                errors.append(f"{key}: {failed.pop(key)}")
+                message = failed.pop(key)
+                if not self.incremental:
+                    errors.append(f"{key}: {message}")
         consecutive_retryable = 0
         units_read: Counter[str] = Counter()
         units = selected + [("log", "")]
@@ -935,6 +1056,8 @@ class RepositoryHistoryImporter:
             try:
                 classified, estimates = self._classify_prepared(prepared, apply=True)
             except (RuntimeError, ValueError) as exc:
+                if self.incremental and isinstance(exc, AccessDenied):
+                    raise
                 message = f"classification group: {exc}"
                 _record_error(errors, message)
                 # A budget stop is resumable. Completed batches stay cached, so
@@ -956,6 +1079,11 @@ class RepositoryHistoryImporter:
                         break
                     continue
                 consecutive_retryable = 0
+                # A group failure cannot identify which files failed. Keep the
+                # incremental range open so no sibling file is skipped.
+                if self.incremental:
+                    self._flush_stats(run)
+                    continue
                 for kind, path, _, _ in group:
                     failed[f"{kind}:{path}"] = message
                 self._commit_cursor(run, done, failed)
@@ -1011,6 +1139,8 @@ class RepositoryHistoryImporter:
                         stop = True
                         break
                 except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
+                    if self.incremental and isinstance(exc, AccessDenied):
+                        raise
                     done.discard(key)
                     run["next_checkpoint"] = {**(run.get("checkpoint") or {}), "done": sorted(done)}
                     _record_error(errors, f"{key}: {exc}")
@@ -1042,30 +1172,53 @@ class RepositoryHistoryImporter:
             checkpoint["last_batch"] = batch
             run["next_checkpoint"] = checkpoint
         self._mark_stats_flushed()
-        # A later batch must keep the recorded failure text. finish() replaces
-        # the errors column, and an empty list would look like a clean run.
+        reported_errors = list(errors)
         for key, message in sorted(failed.items()):
             line = f"{key}: {message}"
-            if line not in errors and message not in errors:
-                errors.append(line)
+            if line not in reported_errors and message not in reported_errors:
+                reported_errors.append(line)
         finished = set(done) | set(failed)
         remaining = any(f"{kind}:{path}" not in finished for kind, path in units)
-        final = self.runs.finish(
-            run,
-            complete=(not remaining) and not failed and self.max_commits == 0 and not self.paths,
-            errors=errors,
-            unknown_totals=(["history_before_max_commits"] if self.max_commits else [])
-            + (["unselected_paths"] if self.paths else []),
-        )
-        if final["status"] == "complete":
-            watermark = float(self.reader.git("show", "-s", "--format=%ct", frozen).strip())
-            record_cursor(
-                self.registry,
-                SOURCE_SYSTEM,
-                f"repository:{self.repo}",
-                watermark=watermark,
-                cursor=frozen,
+        if self.incremental:
+            complete = not remaining and not errors
+            watermark = (
+                float(self.reader.git("show", "-s", "--format=%ct", frozen).strip())
+                if complete
+                else 0
             )
+            with self.registry.db.transaction():
+                if complete and not record_cursor(
+                    self.registry,
+                    SOURCE_SYSTEM,
+                    stream,
+                    watermark=watermark,
+                    cursor=frozen,
+                    expected_cursor=since,
+                ):
+                    self.runs.finish(run, complete=False, errors=["cursor changed during import"])
+                    return {
+                        "apply": True,
+                        "status": "cursor_changed",
+                        "commit": frozen,
+                        **range_details,
+                    }
+                final = self.runs.finish(run, complete=complete, errors=errors)
+        else:
+            final = self.runs.finish(
+                run,
+                complete=(not remaining)
+                and not failed
+                and self.max_commits == 0
+                and not self.paths,
+                errors=reported_errors,
+                unknown_totals=(["history_before_max_commits"] if self.max_commits else [])
+                + (["unselected_paths"] if self.paths else []),
+            )
+            if final["status"] == "complete":
+                watermark = float(self.reader.git("show", "-s", "--format=%ct", frozen).strip())
+                record_cursor(
+                    self.registry, SOURCE_SYSTEM, stream, watermark=watermark, cursor=frozen
+                )
         logger.info(
             "repository history batch run_id=%s status=%s units_read=%s "
             "llm_calls_delta=%s errors_by_type=%s",
@@ -1079,6 +1232,7 @@ class RepositoryHistoryImporter:
             "run_id": final["run_id"],
             "status": final["status"],
             "commit": frozen,
+            **range_details,
             "coverage": final["coverage"],
             "slice_coverage": {
                 key: value - (coverage_before[key] or 0)
@@ -1106,7 +1260,7 @@ class RepositoryHistoryImporter:
             },
             "units_read": dict(units_read),
             "llm_calls_delta": llm_calls_delta,
-            **_error_preview(errors),
+            **_error_preview(reported_errors),
         }
 
     def _stat_delta(self) -> Counter[str]:
@@ -1164,7 +1318,14 @@ class RepositoryHistoryImporter:
         """Classify/cache outside the atomic evidence page transaction."""
         observations: Counter[str] = Counter()
         prepared = []
-        if kind == "log":
+        if self._range and kind != "code":
+            if not self._range_commits:
+                self._range_commits = {
+                    c["sha"]: c for c in self.reader.commits(self._range, max_count=0)
+                }
+            shas = self._range_commits if kind == "log" else self._history[path]
+            versions = [(sha, path, self._range_commits[sha]) for sha in shas]
+        elif kind == "log":
             versions = [
                 (c["sha"], "", c) for c in self.reader.commits(frozen, None, self.max_commits)
             ]
@@ -1210,8 +1371,6 @@ class RepositoryHistoryImporter:
         # Translate offsets into one disjoint virtual file for classification,
         # so all historical revisions share bounded batches and identical text
         # is classified only once. Then restore each revision's real offsets.
-        from dataclasses import replace
-
         flat = []
         bases = []
         base = 0
@@ -1266,7 +1425,8 @@ class RepositoryHistoryImporter:
 
     def _prepared_groups(self, frozen, units, done, errors, failed=None):
         """Pack a short wave, then let the caller checkpoint it."""
-        failed = failed or {}
+        settle_parse_errors = self.incremental and failed is not None
+        failed = {} if failed is None else failed
         group, count, chars = [], 0, 0
         for number, (kind, path) in enumerate(units, 1):
             key = f"{kind}:{path}"
@@ -1282,7 +1442,13 @@ class RepositoryHistoryImporter:
             try:
                 prepared, observations = self._collect_unit(frozen, kind, path)
             except (RuntimeError, ValueError, UnicodeError, yaml.YAMLError, csv.Error) as exc:
-                _record_error(errors, f"{key}: {exc}")
+                if self.incremental and isinstance(exc, AccessDenied):
+                    raise
+                if settle_parse_errors and isinstance(exc, _CONTENT_PARSE_ERRORS):
+                    failed[key] = str(exc)
+                    logger.warning("%s: %s", key, exc)
+                else:
+                    _record_error(errors, f"{key}: {exc}")
                 continue
             group.append((kind, path, prepared, observations))
             count += sum(len(passages) for _, _, _, _, passages in prepared)
@@ -1337,6 +1503,8 @@ class RepositoryHistoryImporter:
         kind = file_kind(path)
         language = language_of(path)
         self._record_timeout_skips(run, sha, path, text, counts)
+        if self.incremental and not candidates:
+            return
         rev = SourceRevision(
             SOURCE_SYSTEM,
             "git_markdown" if kind == "md" else "git_source_file",
@@ -1349,13 +1517,14 @@ class RepositoryHistoryImporter:
             repository=self.repo,
             commit_sha=sha,
         )
-        eid, created = self.store.record_revision(
-            rev, corpus=(run["corpus_id"], run["policy_version"]), run_id=run["run_id"]
-        )
+        if not self.incremental:
+            eid, created = self.store.record_revision(
+                rev, corpus=(run["corpus_id"], run["policy_version"]), run_id=run["run_id"]
+            )
+            counts["stored_evidence" if created else "duplicate_evidence"] += 1
+            counts[f"{kind}_stored_evidence" if created else f"{kind}_duplicate_evidence"] += 1
         counts["discovered"] += 1
         counts["fetched_versions"] += 1
-        counts["stored_evidence" if created else "duplicate_evidence"] += 1
-        counts[f"{kind}_stored_evidence" if created else f"{kind}_duplicate_evidence"] += 1
         counts[f"{kind}_stored_passages"] += len(candidates)
         counts[f"{kind}_versions"] += 1
         symbols = extract_symbols(text, language) if kind == "code" else []
@@ -1373,6 +1542,21 @@ class RepositoryHistoryImporter:
             line = line_of(cand.start)
             line_end = line_of(max(cand.start, cand.end - 1))
             origin = origins[line]
+            if self.incremental:
+                excerpt = replace(
+                    rev,
+                    original_text=text[cand.start : cand.end],
+                    source_labels={
+                        **rev.source_labels,
+                        "excerpt_start": cand.start,
+                    },
+                )
+                eid, created = self.store.record_revision(
+                    excerpt, corpus=(run["corpus_id"], run["policy_version"]), run_id=run["run_id"]
+                )
+                counts["stored_evidence" if created else "duplicate_evidence"] += 1
+                counts[f"{kind}_stored_evidence" if created else f"{kind}_duplicate_evidence"] += 1
+                cand = replace(cand, start=0, end=len(excerpt.original_text))
             attrs = self._git_attrs(eid, origin)
             self.store.record_attributions(attrs, corpus_id=run["corpus_id"])
             enclosing = [s for s in symbols if s.start_line <= line <= s.end_line]
@@ -1408,6 +1592,8 @@ class RepositoryHistoryImporter:
 
     def _log_record(self, run, commit, candidates, counts):
         self._record_timeout_skips(run, commit["sha"], "", commit["message"], counts)
+        if self.incremental and not candidates:
+            return
         rev = SourceRevision(
             SOURCE_SYSTEM,
             "git_commit_message",
@@ -1485,7 +1671,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--checkout", required=True)
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument(
-        "--max-commits", type=int, default=200, help="Commit limit; 0 walks all history"
+        "--max-commits",
+        type=int,
+        default=_DEFAULT_MAX_COMMITS,
+        help="Commit limit; 0 walks all history",
     )
     parser.add_argument(
         "--max-seconds",
@@ -1500,8 +1689,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Stop after this many stored units; 0 means no unit cap. An unfinished apply resumes.",
     )
     parser.add_argument("--path", action="append", help="Limit to a file or directory; repeatable")
+    parser.add_argument(
+        "--incremental", action="store_true", help="Read changes after the backfill cursor"
+    )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
+    if args.incremental and (args.max_commits != _DEFAULT_MAX_COMMITS or args.path):
+        parser.error("--incremental does not accept a commit limit or --path")
     logging.basicConfig(level=logging.INFO)
     from mira.registry import get_registry
     from mira.registry.access import operator_context
@@ -1519,6 +1713,7 @@ def main(argv: list[str] | None = None) -> int:
         paths=args.path,
         max_seconds=args.max_seconds,
         max_units=args.max_units,
+        incremental=args.incremental,
     ).run(apply=args.apply)
     json.dump(out, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")

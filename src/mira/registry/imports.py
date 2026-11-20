@@ -257,15 +257,20 @@ class ImportRuns:
         )
         return self.get(run["run_id"])
 
-    def coverage(self, ctx: AccessContext | None) -> list[dict]:
+    def coverage(self, ctx: AccessContext | None, *, unfinished_stream: str = "") -> list[dict]:
         """Runs in corpora the caller may read; nothing (not even a count) otherwise."""
         if ctx is None or not ctx.has_corpus:
             return []
         marks = ", ".join("?" for _ in ctx.corpus_ids)
+        params = tuple(sorted(ctx.corpus_ids))
+        unfinished = ""
+        if unfinished_stream:
+            unfinished = "AND stream = ? AND status IN ('running', 'incomplete') "
+            params += (unfinished_stream,)
         rows = self.db.execute(
             f"SELECT {', '.join(self._COLS)} FROM registry_import_runs WHERE corpus_id IN "
-            f"({marks}) ORDER BY started_at DESC",
-            tuple(sorted(ctx.corpus_ids)),
+            f"({marks}) {unfinished}ORDER BY started_at DESC",
+            params,
         )
         out = []
         for row in rows:
@@ -285,15 +290,29 @@ class ImportRuns:
 
 
 def record_cursor(
-    registry: Any, source_system: str, stream: str, *, watermark: float, cursor: str = ""
-) -> None:
-    registry.db.execute(
+    registry: Any,
+    source_system: str,
+    stream: str,
+    *,
+    watermark: float,
+    cursor: str = "",
+    expected_cursor: str | None = None,
+) -> bool:
+    """Record a cursor. When supplied, compare the existing cursor before advancing."""
+    params = (source_system, stream, float(watermark), 0.0, 0.0, cursor, registry.clock())
+    condition = " WHERE registry_sync_state.after_cursor = ?" if expected_cursor is not None else ""
+    if expected_cursor is not None:
+        params += (expected_cursor,)
+    rows = registry.db.execute(
         "INSERT INTO registry_sync_state (source_system, stream, watermark, walk_since, "  # noqa: S608
         "walk_started_at, after_cursor, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT (source_system, stream) DO UPDATE SET watermark = excluded.watermark, "
-        "after_cursor = excluded.after_cursor, updated_at = excluded.updated_at",
-        (source_system, stream, float(watermark), 0.0, 0.0, cursor, registry.clock()),
+        "after_cursor = excluded.after_cursor, updated_at = excluded.updated_at"
+        + condition
+        + " RETURNING after_cursor",
+        params,
     )
+    return bool(rows)
 
 
 def read_cursors(registry: Any, source_system: str) -> dict[str, dict]:
