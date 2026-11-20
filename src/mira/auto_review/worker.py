@@ -22,7 +22,6 @@ from mira.auto_review.config import (
     ENV_FLAG,
     ENV_SOURCE_URL,
     ENV_TOKEN,
-    concurrency_limit,
     flag_on,
     worker_host,
 )
@@ -91,7 +90,6 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
         return 2
     relay = _relay_url()
     logger.info("seat worker polling %s via %s on %s", source, relay, worker_host())
-    limit = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", 16, 20)
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=httpx.Timeout(CALL_TIMEOUT, connect=10.0))
     active: dict[str, asyncio.Task[None]] = {}
@@ -107,33 +105,34 @@ async def run_worker(*, client: httpx.AsyncClient | None = None) -> int:
                             task.result()
                         except Exception:
                             logger.exception("seat work %s failed", work_id)
-                if len(active) - len(import_ids) < limit:
-                    response = await http.get(
-                        f"{source}/api/auto-review/work",
-                        headers=_source_headers(),
-                        params=[("exclude", work_id) for work_id in active]
-                        + [("import_capacity", "0" if import_ids else "1")],
-                    )
-                    if response.status_code != 204:
-                        response.raise_for_status()
-                        item = response.json()
-                        work_id = item["work_id"]
-                        # Also safe during a rolling upgrade with an old service
-                        # that ignores the exclusion query parameter.
-                        if work_id not in active:
-                            if item.get("kind") == "corpus_import":
-                                import_ids.add(work_id)
-                            logger.info(
-                                "auto review work received request=%s work=%s queue_wait_seconds=%.3f active=%d",
-                                item.get("request_id"),
-                                work_id,
-                                item.get("queue_wait_seconds", 0),
-                                len(active) + 1,
-                            )
-                            active[work_id] = asyncio.create_task(
-                                _process_item(http, source, relay, item)
-                            )
-                            continue
+                # Review calls have no concurrency cap. The exclusion list rides
+                # in the body, so its length is not bounded by a URL.
+                response = await http.post(
+                    f"{source}/api/auto-review/work",
+                    headers=_source_headers(),
+                    json={
+                        "exclude": list(active),
+                        "import_capacity": 0 if import_ids else 1,
+                    },
+                )
+                if response.status_code != 204:
+                    response.raise_for_status()
+                    item = response.json()
+                    work_id = item["work_id"]
+                    if work_id not in active:
+                        if item.get("kind") == "corpus_import":
+                            import_ids.add(work_id)
+                        logger.info(
+                            "auto review work received request=%s work=%s queue_wait_seconds=%.3f active=%d",
+                            item.get("request_id"),
+                            work_id,
+                            item.get("queue_wait_seconds", 0),
+                            len(active) + 1,
+                        )
+                        active[work_id] = asyncio.create_task(
+                            _process_item(http, source, relay, item)
+                        )
+                        continue
                 if active:
                     await asyncio.wait(
                         active.values(),

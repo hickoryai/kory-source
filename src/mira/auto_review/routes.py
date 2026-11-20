@@ -15,7 +15,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from mira.auto_review.config import ENV_TOKEN, set_paused, switch_view
 from mira.auto_review.store import AutoReviewStore
@@ -91,19 +91,46 @@ async def post_switch(request: Request) -> JSONResponse:
     return JSONResponse(switch_view(_db()))
 
 
-@router.get("/work")
-def poll_work(
-    request: Request,
-    exclude: Annotated[list[str] | None, Query(max_length=20)] = None,
-    import_capacity: Annotated[int, Query(ge=0, le=1)] = 0,
-) -> Response:
-    """The seat worker's next relay body, or 204 when there is nothing to run."""
+class PollBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exclude: list[str] = []
+    import_capacity: int = Field(default=0, ge=0, le=1)
+
+
+@router.post("/work")
+async def poll_work(request: Request) -> Response:
+    """The seat worker's next relay body, or 204 when there is nothing to run.
+
+    The worker sends its in-flight work ids in the body. The list has no
+    length cap, because review calls have no concurrency cap.
+    """
     if not getattr(request.state, "auto_review_worker", False):
         return _error(401, "worker_token_required", "The seat worker token is required.")
+    try:
+        body = PollBody.model_validate(await request.json())
+    except (ValidationError, ValueError):
+        return _error(422, "invalid_request", "Body must be {exclude: [...], import_capacity}.")
+    return _next_work(tuple(body.exclude), body.import_capacity)
+
+
+@router.get("/work")
+def poll_work_query(
+    request: Request,
+    exclude: Annotated[list[str] | None, Query()] = None,
+    import_capacity: Annotated[int, Query(ge=0, le=1)] = 0,
+) -> Response:
+    """Query form for a worker that predates the body form."""
+    if not getattr(request.state, "auto_review_worker", False):
+        return _error(401, "worker_token_required", "The seat worker token is required.")
+    return _next_work(tuple(exclude or ()), import_capacity)
+
+
+def _next_work(exclude: tuple[str, ...], import_capacity: int) -> Response:
     # Review work this worker is not already running still comes first.
     # In-flight review rows stay pending until answered. An unfiltered
     # next_pending() would treat those rows as a queue and never claim import.
-    work = _store().next_pending(tuple(exclude or ()))
+    work = _store().next_pending(exclude)
     if work is None and import_capacity:
         # Workers that omit import_capacity never receive an import envelope.
         imports = _import_store()

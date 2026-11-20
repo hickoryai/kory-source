@@ -482,8 +482,8 @@ def test_supersede_and_claim_stay_inside_one_role(db: AppDatabase) -> None:
     assert store.get(opinion.id).state == "superseded"
     assert store.get(gate.id).state == "queued"
     assert moved.skill == "review-grok"
-    first = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30, max_running=2)
-    second = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30, max_running=2)
+    first = store.claim_next("worker-a", lease_seconds=30, deadline_seconds=30)
+    second = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30)
     assert first is not None and second is not None
     assert {first.role, second.role} == {"opinion", "gate"}
     assert store.begin_post(first.id) is True
@@ -534,7 +534,7 @@ async def test_later_head_reviews_the_delta_and_names_its_skill(
         role="gate",
         skill="review-gate",
     )
-    claimed = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30, max_running=2)
+    claimed = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30)
     assert claimed is not None and claimed.id == later.id
     delta = _frozen(HEAD_NEXT)
     delta_text = "diff --git a/a.py b/a.py\n+new\n"
@@ -1119,14 +1119,14 @@ def test_running_head_is_not_cancelled_and_one_newer_head_waits(db: AppDatabase)
     assert second_wait.state == "queued"
 
     # The running review holds this pull request. Another pull request can start.
-    claimed = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30, max_running=4)
+    claimed = store.claim_next("worker-b", lease_seconds=30, deadline_seconds=30)
     assert claimed is not None
     assert claimed.id == other.id
     assert store.get(second_wait.id).state == "queued"
 
     store.mark_skipped(running.id, "test_done", "the running head posted")
     store.mark_skipped(other.id, "test_done", "the other pull request posted")
-    nxt = store.claim_next("worker-c", lease_seconds=30, deadline_seconds=30, max_running=4)
+    nxt = store.claim_next("worker-c", lease_seconds=30, deadline_seconds=30)
     assert nxt is not None
     assert nxt.id == second_wait.id
     assert store.get(first_wait.id).state == "superseded"
@@ -1597,12 +1597,12 @@ async def test_auto_review_routes_are_mounted() -> None:
     assert response.status_code == 401
 
 
-async def test_executor_runs_bounded_reviews_and_cancels_all_on_stop(
+async def test_executor_starts_every_queued_review_and_cancels_all_on_stop(
     db: AppDatabase,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _store(db)
-    for number in range(6):
+    for number in range(30):
         store.enqueue(
             platform="github",
             owner="example",
@@ -1618,97 +1618,51 @@ async def test_executor_runs_bounded_reviews_and_cancels_all_on_stop(
 
     async def execute(store, job, reader_factory, **_kwargs):
         started.append(job.id)
-        if len(started) == 3:
+        if len(started) == 30:
             full.set()
         try:
             await asyncio.Event().wait()
         finally:
             cancelled.append(job.id)
 
+    # An old cap setting is ignored. Reviews have no concurrency cap.
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", "3")
     monkeypatch.setattr("mira.auto_review.runner.execute_request", execute)
     executor = AutoReviewExecutor(store, AsyncMock())
     await executor.start()
     try:
         await asyncio.wait_for(full.wait(), 2)
-        assert len(executor._tasks) == 3
-        assert (
-            store.claim_next("other", lease_seconds=30, deadline_seconds=30, max_running=3) is None
-        )
+        assert len(executor._tasks) == 30
+        assert store.claim_next("other", lease_seconds=30, deadline_seconds=30) is None
     finally:
         await executor.stop()
-    assert len(started) == 3
+    assert len(started) == 30
     assert set(cancelled) == set(started)
     assert all(store.get(job).state == "queued" for job in started)
     assert all(store.get(job).error_code == "" for job in started)
     assert all(store.get(job).posted_review_id == "" for job in started)
 
 
-async def test_executor_refills_after_one_review_finishes(
-    db: AppDatabase,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = _store(db)
-    for number in range(3):
-        store.enqueue(
-            platform="github",
-            owner="example",
-            repo="project",
-            pr_number=number,
-            head_sha=HEAD,
-            base_sha=BASE,
-            installation_id=1,
-        )
-    started = []
-    first_done = asyncio.Event()
-    full = asyncio.Event()
-    refilled = asyncio.Event()
-
-    async def execute(store, job, reader_factory, **_kwargs):
-        started.append(job.id)
-        if len(started) == 2:
-            full.set()
-        if len(started) == 3:
-            refilled.set()
-        if len(started) == 1:
-            await first_done.wait()
-            store.mark_skipped(job.id, "test_complete", "completed")
-        else:
-            await asyncio.Event().wait()
-
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", "2")
-    monkeypatch.setattr("mira.auto_review.runner.execute_request", execute)
-    executor = AutoReviewExecutor(store, AsyncMock())
-    await executor.start()
-    try:
-        await asyncio.wait_for(full.wait(), 2)
-        first_done.set()
-        await asyncio.wait_for(refilled.wait(), 2)
-        assert len(started) == 3
-        assert len(executor._tasks) == 2
-    finally:
-        await executor.stop()
-
-
-async def test_worker_overlaps_calls_without_duplicate_dispatch(
+async def test_worker_runs_every_call_at_once_without_duplicate_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
     monkeypatch.setenv("KORY_SOURCE_URL", "https://source.test")
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", "test-secret")
+    # An old cap setting is ignored. Review calls have no concurrency cap.
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", "2")
     monkeypatch.setattr("mira.auto_review.worker.POLL_SECONDS", 0.01)
-    pending = ["first", "second", "third"]
+    pending = [f"call-{number}" for number in range(30)]
     calls = []
     running = set()
     answers = []
-    overlap = asyncio.Event()
-    third = asyncio.Event()
+    all_running = asyncio.Event()
     release = asyncio.Event()
 
     async def handle(request: Request) -> Response:
         if request.url.path == "/api/auto-review/work":
-            exclude = request.url.params.get_list("exclude")
+            assert request.method == "POST"
+            exclude = json.loads(request.content)["exclude"]
             assert running <= set(exclude)
             item = next((key for key in pending if key not in exclude), None)
             if item is None:
@@ -1720,31 +1674,22 @@ async def test_worker_overlaps_calls_without_duplicate_dispatch(
             key = json.loads(request.content)["prompt"]
             calls.append(key)
             running.add(key)
-            assert len(running) <= 2
+            if len(running) == len(pending):
+                all_running.set()
             try:
-                if key == "first":
-                    await release.wait()
-                elif key == "second":
-                    assert "first" in running
-                    overlap.set()
-                else:
-                    third.set()
-                    await release.wait()
+                await release.wait()
                 return Response(200, json={"text": "review", "actual_model": ROUTEABLE_MODEL})
             finally:
                 running.remove(key)
-        key = request.url.path.rsplit("/", 1)[-1]
-        pending.remove(key)
-        answers.append(key)
+        answers.append(request.url.path.rsplit("/", 1)[-1])
         return Response(200, json={})
 
     async with AsyncClient(transport=MockTransport(handle)) as client:
         worker = asyncio.create_task(run_worker(client=client))
         try:
-            await asyncio.wait_for(overlap.wait(), 2)
-            await asyncio.wait_for(third.wait(), 2)
-            assert calls == ["first", "second", "third"]
-            assert answers == ["second"]
+            await asyncio.wait_for(all_running.wait(), 2)
+            assert sorted(calls) == sorted(pending)
+            assert answers == []
         finally:
             worker.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -1761,50 +1706,33 @@ async def test_poll_excludes_in_flight_work_without_mutating_it(
     monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", "seat-secret")
     store = _store(db)
     job = _running(store)
-    first = store.create_work(job.id, prompt="one", model=ROUTEABLE_MODEL, timeout_seconds=30)
-    second = store.create_work(job.id, prompt="two", model=ROUTEABLE_MODEL, timeout_seconds=30)
+    in_flight = [
+        store.create_work(job.id, prompt=f"busy {n}", model=ROUTEABLE_MODEL, timeout_seconds=30)
+        for n in range(25)
+    ]
+    last = store.create_work(job.id, prompt="next", model=ROUTEABLE_MODEL, timeout_seconds=30)
     async with AsyncClient(transport=ASGITransport(app=_api(db)), base_url="http://test") as client:
         headers = {"Authorization": "Bearer seat-secret"}
-        response = await client.get(
-            "/api/auto-review/work", headers=headers, params={"exclude": first}
+        response = await client.post(
+            "/api/auto-review/work", headers=headers, json={"exclude": in_flight}
         )
         assert response.status_code == 200
-        assert response.json()["work_id"] == second
+        assert response.json()["work_id"] == last
         assert response.json()["queue_wait_seconds"] >= 0
+        response = await client.post(
+            "/api/auto-review/work", headers=headers, json={"exclude": [*in_flight, last]}
+        )
+        assert response.status_code == 204
+        # The query form still serves a worker that predates the body form.
         response = await client.get(
             "/api/auto-review/work",
             headers=headers,
-            params=[("exclude", first), ("exclude", second)],
+            params=[("exclude", work_id) for work_id in in_flight],
         )
-        assert response.status_code == 204
-    assert store.get_work(first).state == "pending"
-    assert store.get_work(second).state == "pending"
-
-
-def test_executor_defaults_to_eight_reviews(
-    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", raising=False)
-    executor = AutoReviewExecutor(_store(db), AsyncMock())
-    assert executor.max_running == 8
-
-
-@pytest.mark.parametrize("value", ["0", "9", "-1", "invalid"])
-def test_executor_rejects_unbounded_concurrency(
-    db: AppDatabase, monkeypatch: pytest.MonkeyPatch, value: str
-) -> None:
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", value)
-    with pytest.raises(ValueError):
-        AutoReviewExecutor(_store(db), AsyncMock())
-
-
-@pytest.mark.parametrize("value", ["0", "21", "-1", "invalid"])
-async def test_worker_rejects_unbounded_concurrency(
-    monkeypatch: pytest.MonkeyPatch, value: str
-) -> None:
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
-    monkeypatch.setenv("KORY_SOURCE_URL", "https://source.test")
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", "test-secret")
-    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY", value)
-    with pytest.raises(ValueError):
-        await run_worker()
+        assert response.status_code == 200
+        assert response.json()["work_id"] == last
+        response = await client.post(
+            "/api/auto-review/work", headers=headers, json={"exclude": "not-a-list"}
+        )
+        assert response.status_code == 422
+    assert all(store.get_work(work_id).state == "pending" for work_id in [*in_flight, last])

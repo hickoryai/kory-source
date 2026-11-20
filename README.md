@@ -261,21 +261,21 @@ back.
 
 ### Automatic review throughput
 
-When automatic reviews are enabled, the service and the seat worker have separate
-runtime concurrency limits:
+Automatic reviews have no concurrency cap. The service starts every queued
+head as soon as it is claimable, and the seat worker forwards every seat call
+to the relay as soon as it receives it. The relay starts review calls without a
+cap too. The only ordering rule is per pull request: one review per role runs
+at a time, and a newer push replaces the queued head behind it.
+`KORY_SOURCE_AUTO_REVIEW_CONCURRENCY` and `KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY`
+are no longer read.
 
-| Variable | Process | Default | Allowed range |
-| --- | --- | --- | --- |
-| `KORY_SOURCE_AUTO_REVIEW_CONCURRENCY` | Service | 8 reviews | 1–8 |
-| `KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY` | Seat worker | 16 relay calls | 1–20 |
-
-Run one service process and one seat worker. The worker polls sequentially and
-excludes its in-flight work IDs, then dispatches distinct calls concurrently.
+Run one service process and one seat worker. The worker polls sequentially with
+`POST /api/auto-review/work`, sending its in-flight work IDs in the JSON body
+(`{"exclude": [...], "import_capacity": 0|1}`), so the list has no length limit.
 The exclusion list is local to that worker; it is not a distributed work lease.
-Deploy the service before upgrading/restarting the worker. An upgraded worker
-against an older service safely continues serially if the service ignores its
-exclusion list. Both processes must be upgraded to get the full throughput gain.
-Set both limits to `1` to restore serial execution. Invalid limits fail startup.
+`GET /api/auto-review/work` still serves a worker that predates the body form.
+Deploy the service before upgrading/restarting the worker: an upgraded worker
+needs the body form.
 A newer push does not cancel a review that is already running. That review
 posts on the head it started, and at most one newer head of the same pull
 request stays queued behind it. A later push replaces that queued head.
@@ -288,14 +288,15 @@ A replacement process waits 60 seconds before adopting a lease that just
 lapsed, so it does not take the shutting-down process's head. The seat
 worker still cancels its in-flight relay calls on shutdown.
 
-These limits change scheduling only. Model selection, prompts, chunk limits,
+Concurrency changes scheduling only. Model selection, prompts, chunk limits,
 filters, head eligibility, posting guards, and the tracing requirement are
 unchanged. Each model call still uses the router provider's tracing adapter;
 configure `MIRA_TRACING_MODULE=mira.tracing.otlp` and its collector at runtime.
 The automatic-review store uses the existing application connection, and the
 Postgres index store shares its process-wide connection. Concurrency adds no
 connection pool or database connection per review. Keep the deployment's existing
-database connection budget and instance limit when adjusting these values.
+database connection budget and instance limit. Size service memory for the
+number of reviews that run at once.
 
 Service logs record review queue wait, snapshot duration, each seat-call duration
 (including its wait for the worker), and final review state/duration. Snapshot

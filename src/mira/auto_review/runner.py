@@ -19,7 +19,6 @@ from typing import Any
 
 from mira.auto_review.config import (
     CALL_TIMEOUT_SECONDS,
-    concurrency_limit,
     flag_on,
     paused,
     trial_mira_config,
@@ -391,7 +390,6 @@ class AutoReviewExecutor:
         self.worker_id = "arw_" + uuid.uuid4().hex[:12]
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
-        self.max_running = concurrency_limit("KORY_SOURCE_AUTO_REVIEW_CONCURRENCY", 8, 8)
         self._tasks: set[asyncio.Task[None]] = set()
         self._stopping = False
 
@@ -419,12 +417,12 @@ class AutoReviewExecutor:
         while not self._stopping:
             try:
                 self.store.interrupt_expired(grace_seconds=ROLLOUT_GRACE_SECONDS)
-                while len(self._tasks) < self.max_running:
+                # Every claimable head starts now. Reviews have no concurrency cap.
+                while True:
                     job = self.store.claim_next(
                         self.worker_id,
                         lease_seconds=LEASE_SECONDS,
                         deadline_seconds=DEADLINE_SECONDS,
-                        max_running=self.max_running,
                     )
                     if job is None:
                         break
@@ -524,9 +522,7 @@ async def start_auto_review(app_auth: Any) -> None:
         return
     _executor = AutoReviewExecutor(store, _reader_factory(app_auth))
     await _executor.start()
-    logger.info(
-        "auto review executor %s started concurrency=%d", _executor.worker_id, _executor.max_running
-    )
+    logger.info("auto review executor %s started", _executor.worker_id)
 
 
 async def stop_auto_review() -> None:
