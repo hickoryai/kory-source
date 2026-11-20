@@ -121,6 +121,7 @@ def test_dry_run_does_not_write_or_classify(setup):
     assert report["new_revisions"] == 1
     assert report["counts"] == {
         "files_in_bundle": 1,
+        "empty_files": 0,
         "files_read": 1,
         "excluded_events": 2,
         "stored_evidence": 0,
@@ -358,3 +359,48 @@ def test_cutover_refuses_new_unavailable_source_revisions(setup):
             importer.run(apply=apply)
     assert registry.db.execute("SELECT COUNT(*) FROM registry_source_revisions") == [(4,)]
     assert registry.db.execute("SELECT COUNT(*) FROM registry_import_runs") == [(1,)]
+
+
+def test_failed_export_can_retry_at_same_path(tmp_path):
+    source = tmp_path / "memory"
+    source.mkdir()
+    (source / "a.md").write_text(QUOTE)
+    bad_file = source / "b.md"
+    bad_file.write_bytes(b"invalid memory\x00")
+    bundle = tmp_path / "bundle"
+    options = {"user": USER, "sources": [("agent_memory", source)], "unavailable": []}
+    with pytest.raises(RegistryError, match="contains a NUL"):
+        export_bundle(bundle, **options)
+    assert not bundle.exists()
+    bad_file.write_text("The source reads the existing file.")
+    assert export_bundle(bundle, **options)["files_read"] == 2
+    assert (bundle / "manifest.json").is_file()
+
+
+def test_tool_only_transcript_is_reported_empty_and_cannot_mark_cutover(setup, monkeypatch, capsys):
+    tmp_path, _, registry, sources, transcript, classifier = setup
+    transcript.write_text(json.dumps({"type": "tool_result", "content": "synthetic output"}) + "\n")
+    bundle = tmp_path / "bundle"
+    export = export_bundle(
+        bundle, user=USER, sources=[("kory_code_session", sources)], unavailable=[]
+    )
+    assert export["empty_files"] == 1
+    mark = _importer(registry, bundle, classifier, mark_cutover=True)
+    with pytest.raises(RegistryError, match="with importable text"):
+        mark.run(apply=True)
+    report = _importer(registry, bundle, classifier).run(apply=True)
+    assert report["cutover"] is False
+    assert report["counts"]["empty_files"] == report["counts"]["excluded_events"] == 1
+    assert report["counts"]["stored_evidence"] == classifier.calls == 0
+
+    monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
+    monkeypatch.setattr("mira.registry.get_registry", lambda: registry)
+    with pytest.raises(SystemExit) as exit_info:
+        main(["import", "--user", USER, "--bundle", str(bundle), "--apply", "--mark-cutover"])
+    assert exit_info.value.code == 1
+    assert (
+        capsys.readouterr().err
+        == "marking cutover requires at least one file with importable text\n"
+    )
+    for table in ("source_revisions", "sync_state", "import_runs"):
+        assert registry.db.execute(f"SELECT 1 FROM registry_{table}") == []  # noqa: S608

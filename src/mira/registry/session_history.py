@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import sqlite3
 import sys
 from collections import Counter
@@ -53,6 +54,7 @@ VERSION = "1"
 SYSTEMS = ("kory_code_session", "agent_memory", "offbox_session")
 EVENT_TYPES = ("user", "text")
 FILE_DIGEST = re.compile(r"[0-9a-f]{64}")
+EMPTY_TEXT_SHA256 = sha256_text("")
 
 
 def digest(data: bytes) -> str:
@@ -168,13 +170,28 @@ def export_bundle(
         raise RegistryError("a valid session subject is required")
     for entry in unavailable:
         _unavailable_revision(entry, "")
-    bundle.mkdir(mode=0o700)
-    files = []
     for system, root in sources:
         if system not in SYSTEMS or root.is_symlink() or not root.is_dir():
             raise RegistryError("each source must be a supported type and an explicit directory")
         if bundle.resolve().is_relative_to(root.resolve()):
             raise RegistryError("the bundle must be outside the source directories")
+    bundle.mkdir(mode=0o700)
+    try:
+        return _write_bundle(bundle, user=user, sources=sources, unavailable=unavailable)
+    except BaseException:
+        shutil.rmtree(bundle)
+        raise
+
+
+def _write_bundle(
+    bundle: Path,
+    *,
+    user: str,
+    sources: list[tuple[str, Path]],
+    unavailable: list[dict[str, str]],
+) -> dict:
+    files = []
+    for system, root in sources:
         # Memory roots may have nested projects. Transcript roots are flat.
         root_id = f"{root.name}-{digest(str(root.resolve()).encode())[:16]}"
         paths = root.rglob("*.md") if system == "agent_memory" else root.glob("*.jsonl")
@@ -207,7 +224,7 @@ def export_bundle(
                     "system": system,
                     "source_id": source_id,
                     "sha256": checksum,
-                    "text_sha256": sha256_text(text),
+                    "text_sha256": sha256_text(text) if text.strip() else EMPTY_TEXT_SHA256,
                     "excluded": excluded,
                     "meta": meta,
                 }
@@ -221,6 +238,7 @@ def export_bundle(
     (bundle / "manifest.json").write_bytes(_json_bytes(manifest))
     return {
         "files_read": len(files),
+        "empty_files": sum(entry["text_sha256"] == EMPTY_TEXT_SHA256 for entry in files),
         "excluded_events": sum(entry["excluded"] for entry in files),
         "unavailable": manifest["unavailable"],
     }
@@ -469,19 +487,27 @@ class SessionHistoryImporter:
             raise RegistryError("marking cutover requires apply")
         namespace = digest(_json_bytes([policy.corpus_id, self.user]))
         files, unavailable, exceptions, checksum = self._load(namespace)
-        if self.mark_cutover and not files:
-            raise EmptyCutover("marking cutover requires at least one file")
+        empty = [file for file in files if file.text_sha256 == EMPTY_TEXT_SHA256]
+        importable = [file for file in files if file.text_sha256 != EMPTY_TEXT_SHA256]
+        if self.mark_cutover:
+            if not files:
+                raise EmptyCutover("marking cutover requires at least one file")
+            if not importable:
+                raise EmptyCutover(
+                    "marking cutover requires at least one file with importable text"
+                )
         counts: Counter[str] = Counter(
             files_in_bundle=len(files),
             files_read=0,
-            excluded_events=0,
+            empty_files=len(empty),
+            excluded_events=sum(file.excluded for file in empty),
             stored_evidence=0,
             unavailable_stored=0,
             proposed=0,
         )
         out = {"apply": apply, "unavailable": unavailable, "counts": counts}
         if not apply:
-            pending = self._new_files(files, namespace)
+            pending = self._new_files(importable, namespace)
             self._new_unavailable(exceptions, namespace)
             candidate_passages = 0
             seen = set()
@@ -499,7 +525,7 @@ class SessionHistoryImporter:
         run = None
         try:
             with self._lock(namespace):
-                pending = self._new_files(files, namespace)
+                pending = self._new_files(importable, namespace)
                 missing = self._new_unavailable(exceptions, namespace)
                 if not pending and not missing:
                     if self.mark_cutover and not self._cutover(namespace):
@@ -704,8 +730,8 @@ def main(argv: list[str] | None = None) -> int:
                 url, path = default_location()
                 with closing(RegistryDB(url=url, path=path, read_only=True)) as db:
                     out = SessionHistoryImporter(Registry(db), **settings).run()
-    except EmptyCutover:
-        parser.exit(1, "marking cutover requires at least one file\n")
+    except EmptyCutover as exc:
+        parser.exit(1, f"{exc}\n")
     except AccessDenied:
         parser.exit(1, "session history import denied by corpus policy\n")
     except DATABASE_ERRORS:
