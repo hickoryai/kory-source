@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Mapping
@@ -95,6 +96,7 @@ class CorpusPolicy:
     legacy_reviewer_sources: tuple[str, ...]
     manifest_sha256: str
     raw: Mapping[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    slack_channels: tuple[str, ...] = ()
 
     def active(self, now: float) -> bool:
         return self.enabled and now < self.expires_at
@@ -237,6 +239,14 @@ def parse_policy(raw: str | Mapping[str, Any]) -> CorpusPolicy:
     for name in (n for _, n in repositories):
         if "/" not in name:
             raise PolicyError(f"repository {name!r} must be owner/name")
+    channels = data.get("slack_channels", [])
+    if not isinstance(channels, list) or any(
+        not isinstance(channel, str) or not re.fullmatch(r"[CG][A-Z0-9]{1,63}", channel)
+        for channel in channels
+    ):
+        raise PolicyError("slack_channels must be a list of Slack channel IDs")
+    if len(set(channels)) != len(channels):
+        raise PolicyError("slack_channels must not contain duplicate IDs")
     legacy = data.get("legacy_reviewer_sources") or []
     if not isinstance(legacy, list) or not all(isinstance(s, str) and s for s in legacy):
         raise PolicyError("legacy_reviewer_sources must be a list of source system names")
@@ -258,6 +268,7 @@ def parse_policy(raw: str | Mapping[str, Any]) -> CorpusPolicy:
         legacy_reviewer_sources=tuple(legacy),
         manifest_sha256=canonical_sha256(data),
         raw=data,
+        slack_channels=tuple(channels),
     )
 
 

@@ -11,7 +11,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -184,23 +184,35 @@ SCHEMA = [
 class RegistryDB:
     """Thread-safe connection wrapper. Rows come back as tuples."""
 
-    def __init__(self, *, url: str | None = None, path: str | None = None) -> None:
+    def __init__(
+        self, *, url: str | None = None, path: str | None = None, read_only: bool = False
+    ) -> None:
         self._lock = threading.RLock()
         self._depth = 0
         self.postgres = bool(url)
         self._url = url
+        self._path = path
         if url:
             from mira.db.postgres import connect
 
             self._conn: Any = connect(url)
+            if read_only:
+                self._conn.execute("SET default_transaction_read_only = on")
         else:
             assert path is not None
+            if read_only:
+                self._conn = sqlite3.connect(
+                    Path(path).resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None
+                )
+                return
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(
                 path, check_same_thread=False, isolation_level=None, timeout=30.0
             )
             self._conn.execute("PRAGMA busy_timeout=30000")
             self._enable_wal()
+        if read_only:
+            return
         from mira.registry.migrations import ADVISORY_LOCK_KEY, migrate
 
         # Concurrent startups serialize on the schema: base tables, then the
@@ -309,6 +321,31 @@ class RegistryDB:
             self._conn = reconnect(self._url or "", self._conn)
             with self._conn.transaction():
                 yield
+
+    @contextmanager
+    def import_lock(self, key: int) -> Iterator[bool]:
+        """Try a process-wide import lock without keeping a transaction open."""
+        if self._url:
+            from mira.db.postgres import connect
+
+            # Dedicated connection so registry reconnects cannot release the lock.
+            with closing(connect(self._url)) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT pg_try_advisory_lock(%s)", (key,))
+                    (locked,) = cursor.fetchone()
+                yield locked
+            return
+
+        import fcntl
+
+        assert self._path is not None
+        with Path(self._path).open("rb") as database:
+            try:
+                fcntl.flock(database, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+            else:
+                yield True
 
     def close(self) -> None:
         with self._lock:

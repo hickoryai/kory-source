@@ -213,10 +213,27 @@ def repository_history_factory(registry: Any, config: Mapping[str, Any]) -> Sour
     )
 
 
+def slack_factory(registry: Any, config: Mapping[str, Any]) -> SourceImporter:
+    """Lazy adapter for :class:`SlackImporter`."""
+    from mira.registry.slack import SlackImporter
+
+    values = dict(config)
+    try:
+        access = values.pop("access")
+    except KeyError:
+        raise SourceImporterError("slack source importer requires 'access'") from None
+    client = values.pop("client", None)
+    classifier = values.pop("classifier", None)
+    values.pop("repo", None)
+    _reject_options("slack", values)
+    return SlackImporter(registry, client, access=access, classifier=classifier)
+
+
 def default_source_importers() -> SourceImporterRegistry:
     """Return a new registry with the built-in adapters registered lazily."""
     sources = SourceImporterRegistry()
     sources.register("linear", linear_factory)
+    sources.register("slack", slack_factory)
     sources.register("repository-history", repository_history_factory)
     return sources
 
