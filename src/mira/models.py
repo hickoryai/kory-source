@@ -7,12 +7,9 @@ from dataclasses import dataclass, field
 
 WALKTHROUGH_MARKER = "<!-- mira-walkthrough -->"
 WALKTHROUGH_HEADING = "## Kory Source PR Walkthrough"
-# Reviews already posted under this heading are still the same comment.
-LEGACY_WALKTHROUGH_HEADINGS = ("## Mira PR Walkthrough",)
 PR_SUMMARY_START = "<!-- mira-pr-summary-start -->"
 PR_SUMMARY_END = "<!-- mira-pr-summary-end -->"
 PR_SUMMARY_HEADING = "## Summary by Kory Source"
-LEGACY_PR_SUMMARY_HEADINGS = ("## Summary by Mira",)
 
 
 class FileChangeType(enum.Enum):

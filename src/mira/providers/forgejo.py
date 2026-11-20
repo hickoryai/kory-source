@@ -629,9 +629,12 @@ class ForgejoProvider(BaseProvider):
         )
 
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
+        # 404: the label is already absent. Resume clears the current label
+        # and the older pause label, and only one of them is present.
         await self._request(
             "DELETE",
             f"{self._repo(pr_info)}/issues/{pr_info.number}/labels?name={quote(label, safe='')}",
+            ok=(200, 204, 404),
         )
 
     async def get_discussion_root_body(self, pr_info: PRInfo, discussion_id: str) -> str:

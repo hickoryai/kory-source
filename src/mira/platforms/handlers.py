@@ -46,11 +46,26 @@ _THREAD_REPLY_ENV = Environment(
 
 _THREAD_REPLY_TEMPLATE = _THREAD_REPLY_ENV.get_template("thread_reply.jinja2")
 
-PAUSE_LABEL = "mira-paused"
+# New pauses use this label. Older pauses used ``mira-paused``; that label
+# still means paused, and resume removes it.
+PAUSE_LABEL = "kory-source-paused"
+LEGACY_PAUSE_LABEL = "mira-paused"
+_PAUSE_LABELS = frozenset({PAUSE_LABEL, LEGACY_PAUSE_LABEL})
 
 _PAUSE_KEYWORDS = {"pause"}
 
 _RESUME_KEYWORDS = {"resume"}
+
+
+def is_pause_label(name: str | None) -> bool:
+    """True when a PR label should stop automatic review."""
+    return name in _PAUSE_LABELS
+
+
+async def clear_pause_labels(provider: Any, pr_info: Any) -> None:
+    """Remove the current pause label and any label left by an older pause."""
+    await provider.remove_label(pr_info, PAUSE_LABEL)
+    await provider.remove_label(pr_info, LEGACY_PAUSE_LABEL)
 
 
 def classify_command(text: str, names: list[str], *, inline: bool = False) -> str:
@@ -86,7 +101,7 @@ def _help_message(bot_name: str) -> str:
         f"|---|---|\n"
         f"| `@{bot_name} review` | Re-run the full review on this PR. Useful after force-pushes or when you want a fresh pass. |\n"
         f"| `@{bot_name} review-rest` | Review files that were skipped on the first pass because the PR was too large. Aliases: `rest`, `continue`. |\n"
-        f"| `@{bot_name} pause` | Pause Kory Source on this PR. No more reviews until you resume. Adds a `mira-paused` label. |\n"
+        f"| `@{bot_name} pause` | Pause Kory Source on this PR. No more reviews until you resume. Adds a `kory-source-paused` label. |\n"
         f"| `@{bot_name} resume` | Resume Kory Source on a paused PR and re-review the latest diff. |\n"
         f"| `@{bot_name} help` | Show this message. Aliases: `?`, `commands`. |\n"
         f"| `@{bot_name} <anything else>` | Ask a free-form question about the PR. Kory Source will reply inline using the PR diff as context. |\n\n"

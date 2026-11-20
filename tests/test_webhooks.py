@@ -320,10 +320,11 @@ async def test_review_comment_from_bot_self_ignored(client: AsyncClient) -> None
 
 
 @patch("mira.platforms.github.webhook.handle_pull_request", new_callable=AsyncMock)
+@pytest.mark.parametrize("label", ["kory-source-paused", "mira-paused"])
 async def test_pr_with_paused_label_returns_paused(
-    mock_handler: AsyncMock, client: AsyncClient
+    mock_handler: AsyncMock, client: AsyncClient, label: str
 ) -> None:
-    payload = _make_pr_payload(labels=[{"name": "mira-paused"}])
+    payload = _make_pr_payload(labels=[{"name": label}])
     payload_bytes = json.dumps(payload).encode()
     resp = await client.post(
         "/webhook",

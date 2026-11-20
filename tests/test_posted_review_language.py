@@ -7,6 +7,7 @@ import re
 from mira.config import MiraConfig
 from mira.llm.prompts.review import build_review_prompt
 from mira.models import FileChangeType, FileDiff, HunkInfo, KeyIssue, ReviewComment, Severity
+from mira.platforms.handlers import _help_message
 from mira.providers.formatting import (
     REVIEW_SUMMARY_HEADING,
     format_comment_body,
@@ -72,3 +73,12 @@ def test_summary_and_inline_comment_do_not_say_mira() -> None:
     assert "You are Kory Source" in system
     assert "HUMAN ATTENTION:" in system
     assert "Mira" not in system
+
+
+def test_help_message_does_not_say_mira() -> None:
+    text = _help_message("kory-source")
+    assert "Adds a `kory-source-paused` label." in text
+    assert "mira-paused" not in text
+    # The command docs host stays. The posted product name must not.
+    visible = re.sub(r"https://docs\.miracode\.ai\S*", "", text, flags=re.IGNORECASE)
+    assert "mira" not in visible.lower()
