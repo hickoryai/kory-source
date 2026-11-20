@@ -1,0 +1,115 @@
+name: Release preflight
+
+# Read-only evidence collection. It builds a candidate at main, audits it and
+# the complete package history, then retains the exact tar for human review.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Proposed stable version (for example v1.2.3); this does not publish or tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Refuse dispatches from non-main refs or invalid versions
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          python3 -c 'import os,re; assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", os.environ["VERSION"])'
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v7
+
+      - run: uv python install 3.12
+
+      - name: Test the proposed main revision
+        run: |
+          uv sync --extra dev --extra serve --extra bedrock
+          uv run pytest
+
+      - name: Audit source and effective Docker build context
+        run: |
+          set -o pipefail
+          python3 scripts/audit_public_image.py --source . | tee /tmp/source-audit.txt
+          docker build --target build-context --output type=local,dest=/tmp/public-context .
+          python3 scripts/audit_public_image.py --context /tmp/public-context | tee /tmp/context-audit.txt
+
+      - name: Audit all existing tagged and untagged package history
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE: ${{ github.event.repository.name }}
+        run: |
+          set -o pipefail
+          python3 -I scripts/audit_registry_history.py --owner "$OWNER" --package "$PACKAGE" \
+            | tee /tmp/registry-history-audit.txt
+          exit "${PIPESTATUS[0]}"
+
+      - name: Build and audit the exact image candidate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in v[0-9]*.[0-9]*.[0-9]*) ;; *) exit 2;; esac
+          docker build --provenance=false --sbom=false --tag "release-candidate:${VERSION}-${GITHUB_SHA}" .
+          docker save "release-candidate:${VERSION}-${GITHUB_SHA}" --output /tmp/candidate.tar
+          python3 scripts/audit_public_image.py --image /tmp/candidate.tar | tee /tmp/image-audit.txt
+          docker image inspect "release-candidate:${VERSION}-${GITHUB_SHA}" > /tmp/image-inspect.json
+          source_sha=$(git rev-parse HEAD)
+          python3 scripts/release_candidate.py write-manifest \
+            --archive /tmp/candidate.tar --version "$VERSION" --source-sha "$source_sha" \
+            --output /tmp/candidate.json
+
+      - name: Audit the wheel and frontend used by the candidate
+        run: |
+          set -euo pipefail
+          # Reuse the candidate build's cached wheel stage. Do not resolve
+          # dependencies again or build a second release image.
+          docker build --target python-builder --tag release-wheel-stage .
+          wheel_container=$(docker create release-wheel-stage)
+          docker cp "$wheel_container:/wheels" /tmp/candidate-wheels
+          docker rm "$wheel_container"
+          mapfile -t wheels < <(find /tmp/candidate-wheels -name 'mira_reviewer-*.whl')
+          test "${#wheels[@]}" = 1
+          cp "${wheels[0]}" /tmp/candidate.whl
+          python3 scripts/audit_public_image.py --wheel /tmp/candidate.whl | tee /tmp/wheel-audit.txt
+          python3 -m zipfile -l /tmp/candidate.whl > /tmp/wheel-inventory.txt
+          image_id=$(python3 -c 'import json; print(json.load(open("/tmp/candidate.json"))["image_id"])')
+          image_container=$(docker create "$image_id")
+          docker cp "$image_container:/app/ui_dist" /tmp/frontend
+          docker rm "$image_container"
+          python3 scripts/audit_public_image.py --frontend /tmp/frontend | tee /tmp/frontend-audit.txt
+          tar -C /tmp/frontend -czf /tmp/frontend-assets.tar.gz .
+          docker history --no-trunc --format '{{json .}}' "$image_id" > /tmp/image-history.jsonl
+
+      - name: Assemble human review inventory
+        run: |
+          mkdir /tmp/release-candidate
+          cp /tmp/candidate.tar /tmp/candidate.json /tmp/candidate.whl /tmp/image-inspect.json /tmp/image-history.jsonl /tmp/wheel-inventory.txt /tmp/frontend-assets.tar.gz /tmp/release-candidate/
+          find /tmp/public-context -type f -print0 | sort -z | xargs -0 sha256sum > /tmp/release-candidate/context-inventory.txt
+          mkdir /tmp/release-candidate/pipeline
+          cp .github/workflows/release.yml .github/workflows/release-preflight.yml Dockerfile .dockerignore pyproject.toml /tmp/release-candidate/pipeline/
+          cp /tmp/*-audit.txt /tmp/release-candidate/
+          (cd /tmp/release-candidate && sha256sum candidate.tar candidate.whl candidate.json image-inspect.json > SHA256SUMS)
+
+      - name: Retain reviewed candidate and evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-candidate-${{ github.run_id }}
+          path: /tmp/release-candidate
+          if-no-files-found: error
+          retention-days: 30

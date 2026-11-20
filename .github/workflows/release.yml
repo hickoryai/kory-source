@@ -1,91 +1,126 @@
 name: Release
 
-# Gated release: pushing a v* tag runs the offline test suite first; the
-# container is built and pushed ONLY if the tests pass. The gate needs no
-# provider API key: plain `uv run pytest` skips the `eval` and
-# `benchmark` markers via pyproject `addopts`. The LLM evals stay in
-# evals.yml (manual dispatch, and the beta release gate).
+# This workflow never builds. It only publishes the tar retained by a successful
+# main-only Release preflight after a maintainer has approved this exact version.
 on:
-  push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version approved for release (for example v1.2.3)
+        required: true
+        type: string
+      preflight_run_id:
+        description: Successful Release preflight run ID for this exact main SHA
+        required: true
+        type: string
+      approval:
+        description: Enter the exact approved version; the protected release environment records approval
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
 jobs:
-  # Gate: the offline test suite (no secrets, no `production` environment).
-  tests:
+  approval-gate:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-
-      - name: Set up Python
-        run: uv python install 3.12
-
-      - name: Install dependencies
-        run: uv sync --extra dev --extra serve --extra bedrock
-
-      - name: Run tests
-        run: uv run pytest
-
-  build-and-push:
-    needs: tests # ← only builds/pushes if the test gate is green
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v4.6.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-
-      - name: Audit build inputs
-        run: |
-          python3 scripts/audit_public_image.py --source .
-          docker build --target build-context --output type=local,dest=/tmp/public-context .
-          python3 scripts/audit_public_image.py --context /tmp/public-context
-
-      # Attestations stay off. A provenance or SBOM blob is not a layer of the
-      # candidate the next step audits, and the registry history audit scans it.
-      - name: Build candidate locally
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          load: true
-          provenance: false
-          sbom: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Audit every candidate layer before pushing the same image
+      - name: Require an existing protected release environment
         env:
-          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          first_tag=$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)
-          docker save "$first_tag" -o /tmp/candidate.tar
-          python3 scripts/audit_public_image.py --image /tmp/candidate.tar
-          while IFS= read -r tag; do
-            test -z "$tag" || docker push "$tag"
-          done <<< "$IMAGE_TAGS"
+          test "$GITHUB_REF" = refs/heads/main
+          gh api "repos/${GITHUB_REPOSITORY}/environments/release" > /tmp/release-environment.json
+          python3 -c 'import json; p=json.load(open("/tmp/release-environment.json")); assert any(r.get("type")=="required_reviewers" and r.get("reviewers") for r in p.get("protection_rules",[])), "release environment must require maintainer review"'
+
+  publish:
+    needs: approval-gate
+    # Configure required maintainers on this environment in repository settings.
+    environment: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+      packages: write
+    steps:
+      - name: Refuse anything but a main dispatch and version-specific approval
+        env:
+          APPROVAL: ${{ inputs.approval }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$APPROVAL" = "$VERSION"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Fetch the immutable preflight record
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.preflight_run_id }}
+        run: gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" > /tmp/preflight-run.json
+
+      - name: Download the retained candidate without rebuilding it
+        uses: actions/download-artifact@v8
+        with:
+          name: release-candidate-${{ inputs.preflight_run_id }}
+          path: /tmp/release-candidate
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.preflight_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate candidate, preflight identity, current main, and release tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          source_sha=$(git rev-parse HEAD)
+          tag="refs/tags/${VERSION}"
+          existing_tag=$(git ls-remote --tags origin "$tag")
+          python3 scripts/release_candidate.py validate \
+            --candidate /tmp/release-candidate/candidate.json \
+            --archive /tmp/release-candidate/candidate.tar \
+            --run-json /tmp/preflight-run.json \
+            --repository "$GITHUB_REPOSITORY" --version "$VERSION" --source-sha "$source_sha" \
+            --existing-tag "$existing_tag"
+
+      - name: Recheck package history immediately before publication
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PACKAGE: ${{ github.event.repository.name }}
+        run: python3 -I scripts/audit_registry_history.py --owner "$OWNER" --package "$PACKAGE"
+
+      - name: Load and push the reviewed image only
+        env:
+          VERSION: ${{ inputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          docker load --input /tmp/release-candidate/candidate.tar
+          image_id=$(python3 -c 'import json; print(json.load(open("/tmp/release-candidate/candidate.json"))["image_id"])')
+          version=${VERSION#v}
+          printf '%s' "$GITHUB_TOKEN" | docker login "$REGISTRY" --username "$GITHUB_ACTOR" --password-stdin
+          docker tag "$image_id" "$REGISTRY/$IMAGE_NAME:$version"
+          docker tag "$image_id" "$REGISTRY/$IMAGE_NAME:${version%.*}"
+          docker push "$REGISTRY/$IMAGE_NAME:$version"
+          docker push "$REGISTRY/$IMAGE_NAME:${version%.*}"
+
+      - name: Push the release tag after the reviewed image
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push origin "refs/tags/$VERSION"
