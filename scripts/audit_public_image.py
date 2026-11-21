@@ -54,29 +54,49 @@ UPSTREAM_FINDINGS = {
         "9c200ec975ff24c0a259d4f6cf0d0fc1736d0c86da30fff3d499ad3d9a368b65",
         frozenset({"credential"}),
     ),
-    # npm @openai/codex-linux-x64 0.145.0 includes the unrelated Hickory DNS
-    # library and concatenated token-prefix literals.
-    "usr/local/lib/node_modules/@openai/codex/node_modules/@openai/"
-    "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex": (
-        "a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14",
-        frozenset({"organization-reference", "credential"}),
-    ),
 }
 
 
 # Reviewed upstream strings. In the file at exactly this path, exactly these
-# byte strings may contain the organization name: the name of an unrelated
-# DNS library, and the address the agent CLI's updater downloads from. These
-# programs are rebuilt from their newest source for every release, so their
-# hashes cannot be pinned the way UPSTREAM_FINDINGS pins a package file. Any
-# other occurrence in these files still fails, as does every other pattern.
+# byte strings may match a pattern: the names of an unrelated DNS library and
+# its crates, the address the agent CLI's updater downloads from, a run of
+# environment-variable names that follows a token prefix, and three runs of
+# base64 in the Node runtime's embedded modules. These files are rebuilt or
+# re-downloaded at their newest version for every release, so their hashes
+# cannot be pinned the way UPSTREAM_FINDINGS pins a package file. Any other
+# match in these files still fails, and so does the same string anywhere else.
+_DNS_LIBRARY = (b"hickory-dns",)
+_CODEX = (
+    *_DNS_LIBRARY,
+    b"hickory-proto-0.",
+    b"hickory-resolver-0.",
+    b"hickory_proto",
+    b"hickory_resolver",
+    b"HickoryDns",
+    b"rama_dns::hickory",
+    b"/src/hickory.rs",
+    b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKEN",
+)
+_CODEX_BIN = "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/"
+_CODEX_HOMES = (
+    "usr/local/lib/node_modules/@openai/codex/",
+    "usr/local/lib/node_modules/@agentclientprotocol/codex-acp/",
+)
 UPSTREAM_STRINGS = {
     "usr/local/bin/kory": (
-        b"hickory-dns",
+        *_DNS_LIBRARY,
         b"api.github.com/repos/hickoryai/goose",
         b"github.com/hickoryai/goose",
     ),
-    "usr/local/bin/router-acp": (b"hickory-dns",),
+    "usr/local/bin/router-acp": _DNS_LIBRARY,
+    "usr/local/bin/node": (
+        b"AKIA1JDQACQCATIAFGDQ",
+        b"AKIASACKAKUARCSDCAAI",
+        b"AKIASACKAKUARCSDCABI",
+    ),
+    **{home + _CODEX_BIN + "codex": _CODEX for home in _CODEX_HOMES},
+    **{home + _CODEX_BIN + "codex-code-mode-host": _DNS_LIBRARY for home in _CODEX_HOMES},
+    "usr/local/lib/node_modules/@xai-official/grok/bin/grok-native": _DNS_LIBRARY,
 }
 
 
@@ -108,18 +128,11 @@ def scan(data: bytes, allowed: tuple[bytes, ...] = ()) -> set[str]:
         b"Copyright attribution",
         data,
     )
-    found = {
-        name
-        for name, pattern in PATTERNS.items()
-        if name != "organization-reference" and pattern.search(data)
-    }
-    organization = PATTERNS["organization-reference"]
-    if (
-        _outside_allowed(nonlegal, organization, allowed)
-        if allowed
-        else organization.search(nonlegal)
-    ):
-        found.add("organization-reference")
+    found = set()
+    for name, pattern in PATTERNS.items():
+        subject = nonlegal if name == "organization-reference" else data
+        if _outside_allowed(subject, pattern, allowed) if allowed else pattern.search(subject):
+            found.add(name)
     return found
 
 

@@ -238,11 +238,15 @@ checks known organization markers, internal hostnames, internal ticket IDs, cred
 configuration/history and every layer, including subsequently deleted files.
 It prints categories and hashed locators, never matching contents. It preserves
 copyright attribution and the public repository provenance labels. Known AWS
-documentation keys and a reviewed upstream Codex binary (exact path and SHA-256)
-have narrow exceptions; a changed binary requires a fresh upstream review. The
-router and agent CLI binaries are rebuilt for every release, so their exception
-is by content instead: at those two exact paths, only the listed reviewed
-strings may contain the organization marker, and anything else fails. This bounded
+documentation keys and two reviewed Debian libraries (exact path and SHA-256)
+have narrow exceptions; a changed library requires a fresh upstream review. The
+router, the agent CLI, the Node runtime and the bundled agents' native binaries
+are rebuilt or downloaded at their newest version for every release, so their
+exception is by content instead: at each exact path, only that file's listed
+reviewed strings may match a pattern, and any other match fails. The strings
+are the names of an unrelated DNS library and its crates, the address the
+agent CLI's updater downloads from, a run of environment-variable names that
+follows a token prefix, and three runs of base64 in the Node runtime. This bounded
 check supplements manual content review; it does not certify arbitrary data safe.
 Audit wheel archives (`--wheel`) and generated UI directories (`--frontend`) too.
 Export the effective context with `docker build --target build-context

@@ -54,6 +54,11 @@ the Release workflow from the version tag with `overrides`; do not add a
 version to the `Dockerfile`.
 
 After the pull request merges, the next version is released under the
-publication rules above: the audits pass for that exact image, and a
-maintainer with publishing authority approves that tag on the record. The
-script never tags and never publishes.
+publication rules above. A maintainer with publishing authority who gives the
+instruction to update to the latest dependencies and publish a new version has
+approved, on the record, the one version tag that refresh produces. That
+approval holds only if every audit passes for that exact image; a finding, a
+failed check or a failed build withdraws it, and the release waits for a new
+approval. It covers no other tag, no later refresh and no change of package
+visibility. Record the instruction on the release pull request. The script
+never tags and never publishes.

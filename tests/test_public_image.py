@@ -313,7 +313,18 @@ def test_reviewer_program_may_carry_only_its_reviewed_strings(tmp_path):
         {"layer.tar": {"usr/local/bin/kory": reviewed, "usr/local/bin/router-acp": b"hickory-dns"}},
     )
     assert audit_image(clean) == []
-    assert set(UPSTREAM_STRINGS) == {"usr/local/bin/kory", "usr/local/bin/router-acp"}
+    codex = "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/"
+    homes = (
+        "usr/local/lib/node_modules/@openai/codex/",
+        "usr/local/lib/node_modules/@agentclientprotocol/codex-acp/",
+    )
+    assert set(UPSTREAM_STRINGS) == {
+        "usr/local/bin/kory",
+        "usr/local/bin/router-acp",
+        "usr/local/bin/node",
+        "usr/local/lib/node_modules/@xai-official/grok/bin/grok-native",
+        *(home + codex + name for home in homes for name in ("codex", "codex-code-mode-host")),
+    }
 
     # The same bytes anywhere else are still findings.
     elsewhere = _image(tmp_path, {"layer.tar": {"usr/local/bin/other": reviewed}})
@@ -330,6 +341,47 @@ def test_reviewer_program_may_carry_only_its_reviewed_strings(tmp_path):
     # Every other pattern is unaffected by the allowance.
     ticket = _image(tmp_path, {"layer.tar": {"usr/local/bin/kory": reviewed + b" HAI-999999"}})
     assert audit_image(ticket) == [("usr/local/bin/kory", "internal-ticket")]
+
+
+def test_bundled_agent_may_carry_only_its_reviewed_strings(tmp_path):
+    codex = (
+        "usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/"
+        "vendor/x86_64-unknown-linux-musl/bin/codex"
+    )
+    host = codex + "-code-mode-host"
+    node = "usr/local/bin/node"
+    # Synthetic stand-ins shaped like the reviewed bytes: crate names run
+    # together with line numbers, and a token prefix followed by variable names.
+    names = (
+        b"registry/hickory-proto-0.25.2/src/op.rs:149hickory_resolver::name_server\x00"
+        b"208hickory_proto HickoryDns rama_dns::hickory/home rama-dns/src/hickory.rs:31 hickory-dns"
+    )
+    variables = b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKENevent"
+    base64 = b"QQxsaiENA0ACQCAKIA1JDQACQCATIAFGDQAAAkAgAigCjAEiAEUNACACKAKIASACKAKUARCSDCAAIx"
+    clean = _image(
+        tmp_path,
+        {"layer.tar": {codex: names + variables, host: b"hickory-dns", node: base64}},
+    )
+    assert audit_image(clean) == []
+
+    def findings(files):
+        return set(audit_image(_image(tmp_path, {"layer.tar": files})))
+
+    # Each list belongs to one path. The same bytes in another file fail.
+    assert findings({host: names}) == {(host, "organization-reference")}
+    assert findings({node: variables}) == {(node, "credential")}
+    assert findings({codex: base64}) == {(codex, "credential")}
+    assert findings({"usr/local/bin/other": base64}) == {("usr/local/bin/other", "credential")}
+
+    # A real-looking credential in a listed file still fails.
+    token = b"github_pat_" + b"A1b2C3d4E5" * 4
+    assert findings({codex: names + b" " + token}) == {(codex, "credential")}
+    assert findings({node: base64 + b" AKIAQQQQQQQQQQQQQQQQ"}) == {(node, "credential")}
+    assert findings({codex: b"ghp_" + b"a1B2" * 10}) == {(codex, "credential")}
+    # So does any other use of the name, and every other pattern.
+    for extra in (b"hickory.example", b"hickory-proto-internal", b"Hickory AI"):
+        assert findings({codex: names + extra}) == {(codex, "organization-reference")}, extra
+    assert findings({node: base64 + b" HAI-999999"}) == {(node, "internal-ticket")}
 
 
 def test_reviewer_info_reports_recorded_build_and_missing_commands(tmp_path, monkeypatch, capsys):
