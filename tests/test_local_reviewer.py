@@ -178,8 +178,12 @@ def test_two_service_instances_on_a_server_give_each_call_to_one_worker(
     """Each poll lands on its own service instance and database connection."""
     url = server_url(kind)
     monkeypatch.setenv("ADMIN_PASSWORD", "admin")
-    first = AutoReviewStore(AppDatabase(url=url, admin_password="admin"))
-    second = AutoReviewStore(AppDatabase(url=url, admin_password="admin"))
+    first_db = AppDatabase(url=url, admin_password="admin")
+    second_db = AppDatabase(url=url, admin_password="admin")
+    # A failed connection falls back to SQLite; that must not pass silently.
+    assert first_db._backend == kind and second_db._backend == kind
+    first = AutoReviewStore(first_db)
+    second = AutoReviewStore(second_db)
     stores = {"workstation": first, "container": second}
     marker = uuid.uuid4().hex[:8]
     calls = 30
@@ -247,6 +251,9 @@ def test_two_service_instances_on_a_server_give_each_call_to_one_worker(
             )
             cur.execute("DELETE FROM auto_review_requests WHERE repo = ?", (f"claim-{marker}",))
             cur.execute("DELETE FROM auto_review_workers WHERE id LIKE ?", (f"%-{marker}",))
+        for database in (first_db, second_db):
+            if database._pg_conn is not None:
+                database._pg_conn.close()
 
 
 def test_poll_renews_a_claim_and_a_silent_worker_loses_it(db: AppDatabase) -> None:
@@ -466,6 +473,10 @@ async def test_the_router_never_sees_the_service_secrets(
         "OPENROUTER_API_KEY": "synthetic-provider-key",
         "GITHUB_TOKEN": "synthetic-github-token",
         "ROUTER_ACP_API_TOKEN": "synthetic-router-token",
+        "ROUTER_ACP_APIKEY": "synthetic-router-apikey",
+        "ROUTER_ACP_BEARER": "synthetic-router-bearer",
+        "ROUTER_ACP_DSN": "synthetic-router-dsn",
+        "LC_SESSIONTOKEN": "synthetic-locale-lookalike",
         "KORY_SOURCE_AUTO_REVIEW_TOKEN": "synthetic-service-token",
     }
     for name, value in secrets.items():

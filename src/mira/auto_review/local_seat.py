@@ -183,18 +183,29 @@ _CHILD_ENV_NAMES = frozenset(
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
         "NODE_EXTRA_CA_CERTS",
+        # The router's own settings, by exact name. None of them is a secret.
+        "ROUTER_ACP_BIN",
+        "ROUTER_ACP_CONFIG",
+        "ROUTER_ACP_CREDENTIAL_REFRESH",
+        "ROUTER_ACP_HELPER_EXE",
+        "ROUTER_ACP_MCP_CATALOGS",
+        "ROUTER_ACP_MCP_DIR",
+        "ROUTER_ACP_OPERATOR_TOOL_WAIT_MS",
     }
 )
-_CHILD_ENV_PREFIXES = ("LC_", "ROUTER_ACP_")
-_SECRET_NAME = re.compile(r"(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH)(?:_|$)|CREDENTIALS?$")
+# Locale variables are the only prefix, and a secret-looking name is still
+# dropped among them.
+_CHILD_ENV_PREFIXES = ("LC_",)
+_SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSW|AUTH|CREDENTIAL|BEARER|COOKIE|SESSION")
 
 
 def child_environment(source: dict[str, str] | os._Environ[str]) -> dict[str, str]:
     """The allowlisted subset of ``source`` passed to ``router-acp``."""
     kept: dict[str, str] = {}
     for name, value in source.items():
-        allowed = name in _CHILD_ENV_NAMES or name.startswith(_CHILD_ENV_PREFIXES)
-        if allowed and not _SECRET_NAME.search(name.upper()):
+        if name in _CHILD_ENV_NAMES or (
+            name.startswith(_CHILD_ENV_PREFIXES) and not _SECRET_NAME.search(name.upper())
+        ):
             kept[name] = value
     return kept
 

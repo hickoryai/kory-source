@@ -354,9 +354,9 @@ relay returns, so reviews do not depend on which worker ran them.
 logins, and `IS_SANDBOX=1` for the Claude agent. The agent CLI (`kory`) is
 installed but is not in the path of a review call. The router and the agents
 it starts get an allowlisted environment only: `PATH`, `HOME`, user, locale,
-temporary-directory, XDG and CA-bundle variables, `IS_SANDBOX` and
-`ROUTER_ACP_*`, minus any name that looks like a key, token, secret, password
-or credential. The service's GitHub App key, webhook secret, database address
+temporary-directory, XDG and CA-bundle variables, `IS_SANDBOX` and the
+router's own settings, each by exact name. `LC_*` is the only prefix, and a
+secret-looking name is dropped even there. The service's GitHub App key, webhook secret, database address
 and provider keys never reach them.
 
 `docker run --rm --entrypoint python <image> -m mira.auto_review.reviewer_info`
