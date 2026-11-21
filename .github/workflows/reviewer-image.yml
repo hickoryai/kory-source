@@ -12,6 +12,8 @@ on:
       - Dockerfile
       - .dockerignore
       - pyproject.toml
+      - uv.lock
+      - ui/mira/package-lock.json
       - scripts/audit_public_image.py
       - scripts/build_reviewer_image.sh
       - scripts/resolve_reviewer_deps.py

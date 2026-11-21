@@ -233,37 +233,40 @@ keep that generated credential out of Git.
 The baseline smoke check used `GET http://127.0.0.1:8765/health` and received
 `{"status":"ok"}`, then fetched the dashboard HTML from `/`.
 
-## Monthly upstream sync
+## Upstream sync
 
-1. Fetch both remotes and start a sync branch from the current fork default:
+Upstream `miracodeai/mira` is merged into this fork with a merge commit.
+`main` is never rebased and never force-pushed. A sync is an ordinary pull
+request, and that pull request is merged with a merge commit, not a squash or
+a rebase, so upstream's commits stay ancestors of `main` and the next merge
+starts from the right base.
 
-   ```bash
-   git fetch --prune origin
-   git fetch --prune upstream
-   git switch main
-   git pull --ff-only origin main
-   git switch -c upstream-sync/$(date +%Y-%m)
-   git merge --no-edit upstream/main
-   ```
+`scripts/update_dependencies.sh` does the whole refresh on a branch: it merges
+upstream `main`, upgrades the Python and UI lockfiles, records the new
+upstream baseline above and in the log below, runs lint, the full suite, the
+UI build and the audits, and opens a draft PR. It stops at the first failure.
+The procedure and what follows the PR are in `AGENTS.md`, "Update to the
+latest dependencies".
 
-2. Resolve conflicts without broadening the fork-delta policy. Re-run the
-   drift command and review every remaining fork-owned source line.
-3. Rebuild and verify:
+When the merge conflicts the script stops and lists the files. Resolve them
+without broadening the fork-delta policy, commit the merge, and run the
+script again with `--continue`. Then re-run the drift command and review
+every remaining fork-owned source line:
 
-   ```bash
-   uv sync --all-extras
-   npm --prefix ui/mira ci
-   npm --prefix ui/mira run build
-   uv run pytest
-   git diff --stat upstream/main -- src/ tests/ ui/
-   ```
+```bash
+git diff --stat <upstream sha> -- src/ tests/ ui/
+```
 
-4. Push the sync branch and open a draft PR into `main`. Record the upstream
-   SHA, test results, drift output, and any intentional divergent files in the
-   PR body. Never sync by force-pushing `main`.
-5. After review and merge, update the fixture/baseline only when the monthly
-   benchmark policy calls for it; do not expose golden comments to reviewer
-   prompts or configuration.
+Record the upstream SHA, test results, drift output, and any intentional
+divergent files in the PR body. After review and merge, update the
+fixture/baseline only when the monthly benchmark policy calls for it; do not
+expose golden comments to reviewer prompts or configuration.
+
+Upstream commits merged by the script:
+
+| Date | Upstream `main` |
+| --- | --- |
+<!-- upstream-sync-log -->
 
 ## Symbol anchors and the indexer
 
@@ -537,3 +540,40 @@ and ignored bot 0.1, configurable under `feedback`. Own comments are audit-only.
 Historical rules without lineage retain original confidence and carry an
 explicit uncertainty flag when repaired. See `docs/review-feedback-repair.md`
 for the post-merge dev-only operation; no repair runs during startup.
+
+## In-service reviewer and work claims (HAI-14441)
+
+The service can answer its own seat calls when the host holds a router
+configuration with at least one account, beside any outside seat worker. The
+first worker to claim a call runs it. The operator contract is in `README.md`,
+"Reviewing inside the service". No upstream file is edited; the review
+passes, prompts, and requested model are unchanged.
+
+Fork-owned files:
+
+- `src/mira/auto_review/local_seat.py` (new: speaks ACP to `router-acp serve`
+  and returns the relay's status and payload; kept conversations; the
+  activation test);
+- `src/mira/auto_review/reviewer_info.py` (new: what the image was built
+  from);
+- `src/mira/auto_review/store.py` (`claim_work`, the claim columns on
+  `auto_review_work`, and the `auto_review_workers` and
+  `auto_review_seat_owners` tables, all created idempotently; `answer_work`
+  takes the answering worker);
+- `src/mira/auto_review/routes.py` (the `X-Kory-Source-Worker` header and the
+  renew-only poll);
+- `src/mira/auto_review/worker.py` (the completion seam, the worker id, and
+  `start_local_reviewer`) and `src/mira/auto_review/runner.py` (starts and
+  stops it with the executor);
+- `Dockerfile`, `scripts/resolve_reviewer_deps.py`,
+  `scripts/build_reviewer_image.sh`, `scripts/smoke_reviewer_image.sh`,
+  `scripts/update_dependencies.sh`, `scripts/audit_public_image.py` (the
+  reviewed-string exception for the two rebuilt programs), and the release
+  and reviewer-image workflows;
+- `tests/test_local_reviewer.py`, `tests/smoke/local_reviewer_smoke.py`,
+  `tests/fixtures/local_reviewer/stub_router.py`, and additions to
+  `tests/test_public_image.py`.
+
+`src/mira/platforms/server.py` and `src/mira/core/engine.py` are unchanged.
+The routing overlay in `local_seat.py` is a copy of the relay's completion
+overlay. A routing change has to be made in both until they share one source.
