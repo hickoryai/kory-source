@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 import threading
 import time
@@ -27,13 +26,13 @@ from mira.auto_review.routes import router as auto_review_router
 from mira.auto_review.store import LEGACY_WORKER, WORK_LEASE_SECONDS, AutoReviewStore
 from mira.dashboard.auth import AuthMiddleware
 from mira.dashboard.db import AppDatabase
+from tests.server_db import SERVERS, server_url
 
 HEAD = "a" * 40
 BASE = "c" * 40
 STUB = Path(__file__).parent / "fixtures" / "local_reviewer" / "stub_router.py"
 STUB_MODEL = "grok@" + "ab" * 16 + "/grok-4.7"
 TOKEN = "seat-secret"
-PG_URL = os.environ.get("REGISTRY_TEST_POSTGRES_URL", "")
 
 
 @pytest.fixture
@@ -172,14 +171,15 @@ def test_two_concurrent_claimants_get_one_claim_per_call(db: AppDatabase) -> Non
             assert store.answer_work(work_id, text="x", actual_model="m", worker=name)
 
 
-@pytest.mark.skipif(not PG_URL, reason="REGISTRY_TEST_POSTGRES_URL not set")
-def test_two_service_instances_on_postgres_give_each_call_to_one_worker(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("kind", SERVERS)
+def test_two_service_instances_on_a_server_give_each_call_to_one_worker(
+    kind: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Each poll lands on its own service instance and database connection."""
+    url = server_url(kind)
     monkeypatch.setenv("ADMIN_PASSWORD", "admin")
-    first = AutoReviewStore(AppDatabase(url=PG_URL, admin_password="admin"))
-    second = AutoReviewStore(AppDatabase(url=PG_URL, admin_password="admin"))
+    first = AutoReviewStore(AppDatabase(url=url, admin_password="admin"))
+    second = AutoReviewStore(AppDatabase(url=url, admin_password="admin"))
     stores = {"workstation": first, "container": second}
     marker = uuid.uuid4().hex[:8]
     calls = 30

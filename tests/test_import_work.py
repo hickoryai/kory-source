@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-import os
+import threading
 import time
 
 import httpx
@@ -17,17 +17,14 @@ from mira.registry.import_work import ImportWorkStore
 from mira.registry.imports import ImportRuns
 from mira.registry.service import Registry
 from tests import registry_policy as rp
+from tests.server_db import SERVERS, server_url
 
 
-@pytest.fixture(params=["sqlite", "postgres"])
+@pytest.fixture(params=["sqlite", *SERVERS])
 def queue(tmp_path_factory, monkeypatch, request):
     with rp.policy():
         monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
-        url = (
-            os.environ.get("REGISTRY_TEST_POSTGRES_URL", "") if request.param == "postgres" else ""
-        )
-        if request.param == "postgres" and not url:
-            pytest.skip("REGISTRY_TEST_POSTGRES_URL not set")
+        url = server_url(request.param) if request.param != "sqlite" else ""
         # Share SQLite too, so local tests exercise the same isolation contract as CI.
         registry = Registry(
             RegistryDB(
@@ -503,3 +500,30 @@ def test_slack_work_admission_checks_current_channel(queue):
 
     with pytest.raises(AccessDenied):
         enqueue(queue)
+
+
+def test_concurrent_claims_have_one_winner(queue):
+    """Each worker holds its own registry connection; one claim wins."""
+    store, _run = queue
+    work_id = enqueue(queue)
+    db = store.db
+    workers = [ImportWorkStore(Registry(RegistryDB(url=db._url, path=db._path))) for _ in range(4)]
+    barrier = threading.Barrier(len(workers))
+    results: list = []
+
+    def claim(worker: ImportWorkStore) -> None:
+        barrier.wait()
+        results.append(worker.claim())
+
+    threads = [threading.Thread(target=claim, args=(w,)) for w in workers]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    try:
+        winners = [r for r in results if r is not None]
+        assert len(winners) == 1
+        assert winners[0]["work_id"] == f"{work_id}:1"
+    finally:
+        for w in workers:
+            w.db.close()

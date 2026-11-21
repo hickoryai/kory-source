@@ -4,6 +4,7 @@ attribution, and the contributors API endpoints."""
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,11 +13,13 @@ import pytest
 from mira.dashboard import api
 from mira.dashboard.db import AppDatabase, _epoch_to_day
 from mira.index.store import IndexStore
+from tests.server_db import BACKENDS, app_database
 
 
-@pytest.fixture
-def db(tmp_path: Path) -> AppDatabase:
-    return AppDatabase(url=str(tmp_path / "app.db"), admin_password="admin")
+@pytest.fixture(params=BACKENDS)
+def db(tmp_path: Path, request: pytest.FixtureRequest) -> Iterator[AppDatabase]:
+    with app_database(request.param, str(tmp_path / "app.db")) as database:
+        yield database
 
 
 # ── AppDatabase contributor storage ──

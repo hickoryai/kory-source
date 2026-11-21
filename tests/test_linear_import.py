@@ -21,6 +21,7 @@ from mira.registry.db import RegistryDB
 from mira.registry.linear import LinearClient, LinearError, LinearImporter
 from mira.registry.service import Registry
 from tests import registry_policy as rp
+from tests.server_db import SERVERS, server_url
 
 HUMAN = Actor("human", "zane")
 AGENT = Actor("agent", "claude-session-1", "claude-opus-5-5")
@@ -1106,25 +1107,22 @@ def test_transaction_rolls_back_on_error(reg):
     assert reg.works(rp.reader()) == []
 
 
-# ── Postgres (opt-in) ───────────────────────────────────────────────────
-# Set REGISTRY_TEST_POSTGRES_URL to a throwaway database to run these. They
-# create the registry tables there and drop them afterwards.
-
-PG_URL = os.environ.get("REGISTRY_TEST_POSTGRES_URL", "")
-pg_only = pytest.mark.skipif(not PG_URL, reason="REGISTRY_TEST_POSTGRES_URL not set")
+# ── Postgres and MySQL (opt-in) ─────────────────────────────────────────
+# Set REGISTRY_TEST_POSTGRES_URL or REGISTRY_TEST_MYSQL_URL to a throwaway
+# database to run these. They create the registry tables there and drop them
+# afterwards.
 
 
-@pytest.fixture
-def pg_regs(clock):
-    regs = [Registry(RegistryDB(url=PG_URL), clock=clock) for _ in range(2)]
+@pytest.fixture(params=SERVERS)
+def pg_regs(clock, request):
+    regs = [Registry(RegistryDB(url=server_url(request.param)), clock=clock) for _ in range(2)]
     yield regs
     rp.drop_registry_tables(regs[0].db)
     for r in regs:
         r.db.close()
 
 
-@pg_only
-def test_postgres_concurrent_importers_keep_one_row(pg_regs):
+def test_server_concurrent_importers_keep_one_row(pg_regs):
     item = {"source_id": "uuid-HAI-1", "source_version": 5, "kind": "work", "title": "A"}
     barrier = threading.Barrier(2)
     outcomes: list[str] = []
@@ -1144,8 +1142,7 @@ def test_postgres_concurrent_importers_keep_one_row(pg_regs):
     assert len(pg_regs[0].works(rp.reader())) == 1
 
 
-@pg_only
-def test_postgres_transaction_rolls_back(pg_regs):
+def test_server_transaction_rolls_back(pg_regs):
     reg = pg_regs[0]
     with pytest.raises(RuntimeError), reg.db.transaction():
         reg.import_items(

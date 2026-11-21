@@ -752,6 +752,13 @@ class ProvenanceStore:
                         "AND corpus_id = ''",
                         (policy.corpus_id, oid),
                     )
+                    if self.db.mysql:
+                        comments += self.db.execute_rowcount(
+                            "UPDATE registry_comments SET corpus_id = ? WHERE source_system = "
+                            "'linear' AND parent_source_id = ? AND corpus_id = ''",
+                            (policy.corpus_id, source_id),
+                        )
+                        continue
                     got = self.db.execute(
                         "UPDATE registry_comments SET corpus_id = ? WHERE source_system = "
                         "'linear' AND parent_source_id = ? AND corpus_id = '' RETURNING id",

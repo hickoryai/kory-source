@@ -34,7 +34,7 @@ FROM ${PYTHON_IMAGE} AS python-builder
 WORKDIR /build
 COPY pyproject.toml README.md LICENSE ./
 COPY src/mira/ src/mira/
-RUN pip wheel --no-cache-dir --wheel-dir /wheels ".[serve,bedrock]"
+RUN pip wheel --no-cache-dir --wheel-dir /wheels ".[serve,bedrock,mysql]"
 
 # ── Reviewer programs, built from source ──────────────────────────
 # Each build reads its source from the named context and leaves its binaries
@@ -128,7 +128,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 # Mount wheels so neither build inputs nor wheel archives persist in a layer.
 RUN --mount=type=bind,from=python-builder,source=/wheels,target=/wheels \
-    pip install --no-cache-dir --no-index --find-links=/wheels "mira-reviewer[serve,bedrock]"
+    pip install --no-cache-dir --no-index --find-links=/wheels "mira-reviewer[serve,bedrock,mysql]"
 
 # Node and the agent packages. The command links are relative, so they
 # resolve under /usr/local here as they did in the agents stage.

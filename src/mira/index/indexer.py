@@ -16,6 +16,7 @@ from jinja2 import Environment, FileSystemLoader
 
 from mira.config import MiraConfig, load_config
 from mira.core.file_types import is_indexable_path, language_from_path
+from mira.db.url import is_server
 from mira.index.manifests import is_manifest, parse_manifest
 from mira.index.store import DirectorySummary, ExternalRef, FileSummary, IndexStore, SymbolInfo
 from mira.llm import create_llm
@@ -428,7 +429,7 @@ def _finish_index(
 def _bump_repo_freshness(owner: str, repo: str, files_indexed: int) -> None:
     """Best-effort stamp on the app registry. SQLite indexes carry their own run row."""
     url = os.environ.get("DATABASE_URL", "")
-    if not (url.startswith("postgresql://") or url.startswith("postgres://")):
+    if not is_server(url):
         return
     try:
         from mira.dashboard.db import AppDatabase

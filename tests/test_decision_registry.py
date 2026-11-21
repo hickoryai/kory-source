@@ -718,8 +718,11 @@ def _diff_lines(path: str) -> int | None:
 # 46 is the next integer, so another edit still fails. HAI-12775 adds 2 lines
 # so a PR with no reviewable file still gets the uncited-decision comment: 47,
 # and the cap moves by exactly those 2, to 48. server.py is 15.
+# HAI-14442 changes one upstream line in server.py (+1/-1) so the health check
+# also probes a MySQL DATABASE_URL: server.py measures 26, and its cap moves by
+# exactly those 2, to 27.
 @pytest.mark.parametrize(
-    ("path", "cap"), [("src/mira/core/engine.py", 48), ("src/mira/platforms/server.py", 25)]
+    ("path", "cap"), [("src/mira/core/engine.py", 48), ("src/mira/platforms/server.py", 27)]
 )
 def test_upstream_edit_stays_under_cap(path, cap):
     changed = _diff_lines(path)

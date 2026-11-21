@@ -50,7 +50,20 @@ CORPUS_TAG = (CORPUS, "test-1")
 
 
 def drop_registry_tables(db) -> None:
-    """Drop every registry table, ledger included, from a disposable Postgres."""
+    """Drop every registry table, ledger included, from a disposable server database."""
+    if db.mysql:
+        raw = db._conn.raw
+        with raw.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() AND table_name LIKE 'registry\\_%'"
+            )
+            tables = [r[0] for r in cur.fetchall()]
+            cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+            for table in tables:
+                cur.execute(f"DROP TABLE IF EXISTS `{table}`")
+            cur.execute("SET FOREIGN_KEY_CHECKS = 1")
+        return
     rows = db.execute(
         "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
         "AND left(tablename, 9) = 'registry_'"
