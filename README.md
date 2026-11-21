@@ -270,10 +270,8 @@ Without `DATABASE_URL`, Kory Source keeps its data in SQLite files under
   **Without TLS parameters, treat the connection as plaintext:** Kory Source
   does not require encryption, so credentials and data can cross the network
   unencrypted. Add `?ssl_ca=/path/to/ca.pem` to require TLS and verify the
-  server certificate,
-  `?ssl_mode=VERIFY_IDENTITY`
-  to also check the host name, or `?ssl_mode=REQUIRED` to require encryption
-  without verifying. `ssl_cert` and `ssl_key` add a client certificate. With
+  server certificate, `?ssl_mode=VERIFY_IDENTITY` to also check the host name,
+  or `?ssl_mode=REQUIRED` to require encryption without verifying. `ssl_cert` and `ssl_key` add a client certificate. With
   any of these, the connection fails rather than falling back to plaintext,
   so `ssl_mode=PREFERRED` is refused. MariaDB is not supported.
 
