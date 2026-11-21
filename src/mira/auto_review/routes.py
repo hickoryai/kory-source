@@ -10,6 +10,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
 import time
 from typing import Annotated, Any
 
@@ -25,6 +26,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auto-review", tags=["auto-review"])
 
 WORK_ERRORS = ("seat_exhausted", "workstation_outage", "model_mismatch", "timeout")
+# A seat worker names itself here on every poll and answer. The first worker
+# to claim a call owns it. A worker that sends no name shares one identity.
+WORKER_HEADER = "X-Kory-Source-Worker"
+_WORKER_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
+
+
+def worker_id(request: Request) -> str:
+    raw = request.headers.get(WORKER_HEADER, "").strip()
+    return raw if _WORKER_ID.fullmatch(raw) else ""
 
 
 class PauseBody(BaseModel):
@@ -96,6 +106,8 @@ class PollBody(BaseModel):
 
     exclude: list[str] = []
     import_capacity: int = Field(default=0, ge=0, le=1)
+    # False renews this worker's claims and takes no new call.
+    claim: bool = True
 
 
 @router.post("/work")
@@ -110,8 +122,13 @@ async def poll_work(request: Request) -> Response:
     try:
         body = PollBody.model_validate(await request.json())
     except (ValidationError, ValueError):
-        return _error(422, "invalid_request", "Body must be {exclude: [...], import_capacity}.")
-    return _next_work(tuple(body.exclude), body.import_capacity)
+        return _error(
+            422, "invalid_request", "Body must be {exclude: [...], import_capacity, claim}."
+        )
+    if not body.claim:
+        _store().claim_work(worker_id(request), tuple(body.exclude), claim=False)
+        return Response(status_code=204)
+    return _next_work(tuple(body.exclude), body.import_capacity, worker_id(request))
 
 
 @router.get("/work")
@@ -123,14 +140,15 @@ def poll_work_query(
     """Query form for a worker that predates the body form."""
     if not getattr(request.state, "auto_review_worker", False):
         return _error(401, "worker_token_required", "The seat worker token is required.")
-    return _next_work(tuple(exclude or ()), import_capacity)
+    return _next_work(tuple(exclude or ()), import_capacity, worker_id(request))
 
 
-def _next_work(exclude: tuple[str, ...], import_capacity: int) -> Response:
+def _next_work(exclude: tuple[str, ...], import_capacity: int, worker: str = "") -> Response:
     # Review work this worker is not already running still comes first.
-    # In-flight review rows stay pending until answered. An unfiltered
-    # next_pending() would treat those rows as a queue and never claim import.
-    work = _store().next_pending(exclude)
+    # In-flight review rows stay pending until answered, so the worker's own
+    # ids are excluded. The claim keeps a call another worker took out of
+    # this answer, and renews this worker's claims on the excluded ids.
+    work = _store().claim_work(worker, exclude)
     if work is None and import_capacity:
         # Workers that omit import_capacity never receive an import envelope.
         imports = _import_store()
@@ -157,6 +175,7 @@ async def answer_work(work_id: str, request: Request) -> JSONResponse:
     if not getattr(request.state, "auto_review_worker", False):
         return _error(401, "worker_token_required", "The seat worker token is required.")
     store = _store()
+    worker = worker_id(request)
     imports = _import_store() if work_id.startswith("iw_") else None
     is_import = imports is not None
     work = None if is_import else store.get_work(work_id)
@@ -183,11 +202,14 @@ async def answer_work(work_id: str, request: Request) -> JSONResponse:
                 work_id,
                 actual_model=str(raw.get("actual_model") or "unknown"),
                 error_code=code,
+                worker=worker,
             )
         )
         content: dict[str, Any] = {"work_id": work_id, "state": "failed", "error": code}
     elif not is_import and (work.is_close or raw.get("state") == "closed"):
-        accepted = store.answer_work(work_id, state=str(raw.get("state") or "closed"))
+        accepted = store.answer_work(
+            work_id, state=str(raw.get("state") or "closed"), worker=worker
+        )
         content = {"work_id": work_id, "state": "answered"}
     else:
         text = raw.get("text")
@@ -211,7 +233,7 @@ async def answer_work(work_id: str, request: Request) -> JSONResponse:
             imports.answer(work_id, {"text": text, "actual_model": actual})
             if is_import
             else store.answer_work(
-                work_id, text=text, actual_model=actual, conversation=conversation
+                work_id, text=text, actual_model=actual, conversation=conversation, worker=worker
             )
         )
         content = {"work_id": work_id, "state": "answered"}
