@@ -162,7 +162,7 @@ class ImportWorkStore:
         now = time.time()
         with self.db.transaction():
             # Serialize claims across service instances as well as SQLite threads.
-            if self.db.postgres:
+            if self.db.server:
                 self.db.execute("SELECT pg_advisory_xact_lock(?)", (1282_5002,))
             self.db.execute(
                 "UPDATE registry_import_work SET state = 'failed', error_code = "
@@ -252,9 +252,17 @@ class ImportWorkStore:
             state = "failed" if error else "answered"
             if error == "timeout" and row["attempt"] < 2:
                 state = "pending"
+            params = (state, json.dumps(payload), error, work_id, row["attempt"])
+            if self.db.mysql:
+                return bool(
+                    self.db.execute_rowcount(
+                        "UPDATE registry_import_work SET state = ?, result_json = ?, error_code = ? WHERE id = ? AND state = 'leased' AND attempt = ?",
+                        params,
+                    )
+                )
             rows = self.db.execute(
                 "UPDATE registry_import_work SET state = ?, result_json = ?, error_code = ? WHERE id = ? AND state = 'leased' AND attempt = ? RETURNING id",
-                (state, json.dumps(payload), error, work_id, row["attempt"]),
+                params,
             )
             return bool(rows)
 

@@ -9,6 +9,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
+from mira.db.url import is_server
 from mira.index._store_shared import _StoreSharedMixin
 from mira.index.anchor_model import IndexedSymbol, IndexRun, SymbolAnchor
 from mira.index.anchor_rows import (
@@ -503,13 +504,13 @@ class IndexStore(_StoreSharedMixin):
         """
         key_owner = owner if platform == "github" else f"_{platform}/{owner}"
         db_url = os.environ.get("DATABASE_URL", "")
-        if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+        if is_server(db_url):
             try:
                 from mira.index.pg_store import PgIndexStore
 
                 return PgIndexStore(key_owner, repo, db_url)
             except Exception as exc:
-                logger.warning("Postgres store unavailable (%s), falling back to SQLite", exc)
+                logger.warning("Server index store unavailable (%s), falling back to SQLite", exc)
 
         index_dir = os.environ.get("MIRA_INDEX_DIR", _INDEX_DIR)
         repo_dir = os.path.join(index_dir, key_owner)

@@ -21,7 +21,7 @@ import json
 import re
 import secrets
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -299,6 +299,22 @@ def record_cursor(
     expected_cursor: str | None = None,
 ) -> bool:
     """Record a cursor. When supplied, compare the existing cursor before advancing."""
+    if registry.db.mysql:
+        values = {
+            "watermark": float(watermark),
+            "walk_since": 0.0,
+            "walk_started_at": 0.0,
+            "after_cursor": cursor,
+            "updated_at": registry.clock(),
+        }
+        return upsert_sync_state_if(
+            registry.db,
+            source_system,
+            stream,
+            insert=values,
+            update=("watermark", "after_cursor", "updated_at"),
+            accept=lambda row: expected_cursor is None or row["after_cursor"] == expected_cursor,
+        )
     params = (source_system, stream, float(watermark), 0.0, 0.0, cursor, registry.clock())
     condition = " WHERE registry_sync_state.after_cursor = ?" if expected_cursor is not None else ""
     if expected_cursor is not None:
@@ -313,6 +329,59 @@ def record_cursor(
         params,
     )
     return bool(rows)
+
+
+def upsert_sync_state_if(
+    db: Any,
+    source_system: str,
+    stream: str,
+    *,
+    insert: dict[str, Any],
+    update: tuple[str, ...],
+    accept: Callable[[dict[str, Any]], bool],
+) -> bool:
+    """MySQL form of ``INSERT .. ON CONFLICT DO UPDATE .. WHERE .. RETURNING``.
+
+    MySQL has no conditional upsert. Lock the row, test it, then insert or
+    update, all in one transaction. When a concurrent writer inserts the row
+    first, the duplicate-key error sends this call back to test that row, as
+    Postgres tests its ``WHERE`` against the row that won. Returns whether
+    this call wrote.
+    """
+    from mira.registry.db import is_unique_violation
+
+    columns = ", ".join(insert)
+    marks = ", ".join("?" for _ in insert)
+    assignments = ", ".join(f"{c} = ?" for c in update)
+    for _ in range(2):
+        with db.transaction():
+            rows = db.execute(
+                "SELECT watermark, walk_since, walk_started_at, after_cursor, updated_at "
+                "FROM registry_sync_state WHERE source_system = ? AND stream = ? FOR UPDATE",
+                (source_system, stream),
+            )
+            if not rows:
+                try:
+                    db.execute(
+                        "INSERT INTO registry_sync_state "  # noqa: S608 - fixed column names
+                        f"(source_system, stream, {columns}) VALUES (?, ?, {marks})",
+                        (source_system, stream, *insert.values()),
+                    )
+                except Exception as exc:
+                    if not is_unique_violation(exc):
+                        raise
+                    continue
+                return True
+            names = ("watermark", "walk_since", "walk_started_at", "after_cursor", "updated_at")
+            if not accept(dict(zip(names, rows[0], strict=True))):
+                return False
+            db.execute(
+                f"UPDATE registry_sync_state SET {assignments} "  # noqa: S608 - fixed column names
+                "WHERE source_system = ? AND stream = ?",
+                (*(insert[c] for c in update), source_system, stream),
+            )
+            return True
+    return False
 
 
 def read_cursors(registry: Any, source_system: str) -> dict[str, dict]:

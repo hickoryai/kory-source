@@ -121,7 +121,7 @@ def migrate(db: Any, *, now: float = 0.0, known: list[Migration] | None = None) 
     ran: list[int] = []
     for mig in known:
         with db.transaction():
-            if db.postgres:
+            if db.server:
                 db.execute("SELECT pg_advisory_xact_lock(?)", (ADVISORY_LOCK_KEY,))
             done = applied(db)
             _check(known, done)

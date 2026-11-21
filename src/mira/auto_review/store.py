@@ -483,6 +483,9 @@ class AutoReviewStore:
                 return
             self._rebuild_sqlite_requests(cur)
             return
+        if self._db._backend == "mysql":
+            # MySQL support started after the role joined the key.
+            return
         cur.execute(
             "SELECT con.conname, pg_get_constraintdef(con.oid) "  # noqa: S608
             "FROM pg_constraint con "
@@ -630,32 +633,61 @@ class AutoReviewStore:
             old = AutoReviewRequest(*row)
             if old.state != "running" or old.posted_review_id:
                 return None
-            cur.execute(
-                "UPDATE auto_review_requests SET state = 'running', lease_owner = ?, "  # noqa: S608
-                "lease_expires_at = ?, started_at = ?, updated_at = ? "
-                "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
-                "AND head_sha = ? AND role = ? AND state IN ('queued', 'superseded') "
-                "AND NOT EXISTS (SELECT 1 FROM auto_review_requests AS waiting "
-                "WHERE waiting.platform = auto_review_requests.platform "
-                "AND waiting.owner = auto_review_requests.owner "
-                "AND waiting.repo = auto_review_requests.repo "
-                "AND waiting.pr_number = auto_review_requests.pr_number "
-                "AND waiting.role = auto_review_requests.role "
-                "AND waiting.head_sha != auto_review_requests.head_sha "
-                "AND waiting.state = 'queued')",
-                (
-                    old.lease_owner,
-                    old.lease_expires_at,
-                    now,
-                    now,
-                    old.platform,
-                    old.owner,
-                    old.repo,
-                    old.pr_number,
-                    head_sha,
-                    old.role,
-                ),
-            )
+            if self._db._backend == "mysql":
+                # MySQL refuses a subquery on the table being updated (error
+                # 1093); a self-join states the same "no other queued head".
+                cur.execute(
+                    "UPDATE auto_review_requests AS target "
+                    "LEFT JOIN auto_review_requests AS waiting "
+                    "ON waiting.platform = target.platform AND waiting.owner = target.owner "
+                    "AND waiting.repo = target.repo AND waiting.pr_number = target.pr_number "
+                    "AND waiting.role = target.role AND waiting.head_sha != target.head_sha "
+                    "AND waiting.state = 'queued' "
+                    "SET target.state = 'running', target.lease_owner = ?, "
+                    "target.lease_expires_at = ?, target.started_at = ?, target.updated_at = ? "
+                    "WHERE target.platform = ? AND target.owner = ? AND target.repo = ? "
+                    "AND target.pr_number = ? AND target.head_sha = ? AND target.role = ? "
+                    "AND target.state IN ('queued', 'superseded') AND waiting.id IS NULL",
+                    (
+                        old.lease_owner,
+                        old.lease_expires_at,
+                        now,
+                        now,
+                        old.platform,
+                        old.owner,
+                        old.repo,
+                        old.pr_number,
+                        head_sha,
+                        old.role,
+                    ),
+                )
+            else:
+                cur.execute(
+                    "UPDATE auto_review_requests SET state = 'running', lease_owner = ?, "  # noqa: S608
+                    "lease_expires_at = ?, started_at = ?, updated_at = ? "
+                    "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
+                    "AND head_sha = ? AND role = ? AND state IN ('queued', 'superseded') "
+                    "AND NOT EXISTS (SELECT 1 FROM auto_review_requests AS waiting "
+                    "WHERE waiting.platform = auto_review_requests.platform "
+                    "AND waiting.owner = auto_review_requests.owner "
+                    "AND waiting.repo = auto_review_requests.repo "
+                    "AND waiting.pr_number = auto_review_requests.pr_number "
+                    "AND waiting.role = auto_review_requests.role "
+                    "AND waiting.head_sha != auto_review_requests.head_sha "
+                    "AND waiting.state = 'queued')",
+                    (
+                        old.lease_owner,
+                        old.lease_expires_at,
+                        now,
+                        now,
+                        old.platform,
+                        old.owner,
+                        old.repo,
+                        old.pr_number,
+                        head_sha,
+                        old.role,
+                    ),
+                )
             if cur.rowcount != 1:
                 return None
             cur.execute(
@@ -701,6 +733,20 @@ class AutoReviewStore:
         """True when this running head may post. A second caller loses."""
         now = time.time()
         with self._cursor() as cur:
+            if self._db._backend == "mysql":
+                # Self-join instead of a same-table subquery (MySQL error 1093).
+                cur.execute(
+                    "UPDATE auto_review_requests AS target "
+                    "LEFT JOIN auto_review_requests AS newer "
+                    "ON newer.platform = target.platform AND newer.owner = target.owner "
+                    "AND newer.repo = target.repo AND newer.pr_number = target.pr_number "
+                    "AND newer.role = target.role AND newer.state = 'queued' "
+                    "SET target.posted_review_id = 'pending', target.updated_at = ? "
+                    "WHERE target.id = ? AND target.state = 'running' "
+                    "AND target.posted_review_id = '' AND newer.id IS NULL",
+                    (now, request_id),
+                )
+                return cur.rowcount == 1
             cur.execute(
                 "UPDATE auto_review_requests SET posted_review_id = 'pending', updated_at = ? "  # noqa: S608
                 "WHERE id = ? AND state = 'running' AND posted_review_id = '' "

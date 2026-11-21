@@ -59,6 +59,11 @@ serve = [
 bedrock = [
     "boto3>=1.35",
 ]
+# MySQL 8.0.23+ driver — used when DATABASE_URL is mysql://. Pure Python;
+# ``rsa`` adds the caching_sha2_password handshake over plain connections.
+mysql = [
+    "PyMySQL[rsa]>=1.1",
+]
 
 [project.scripts]
 mira = "mira.cli:main"

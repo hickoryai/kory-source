@@ -20,6 +20,7 @@ from mira.dashboard.api import (
     _require_admin,
     router,
 )
+from mira.db.url import is_server
 
 
 @router.get("/api/repos/{owner:path}/{repo}/context", response_model=list[ReviewContextModel])
@@ -115,7 +116,7 @@ def list_org_learned_rules(limit: int = 500, status: str = "") -> list[OrgLearne
     db_url = os.environ.get("DATABASE_URL", "")
     capped = max(1, min(limit, 2000))
     status_filter = status or None
-    if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+    if is_server(db_url):
         from mira.index.pg_store import list_learned_rules_org_wide
 
         rows = list_learned_rules_org_wide(db_url, limit=capped, status=status_filter)

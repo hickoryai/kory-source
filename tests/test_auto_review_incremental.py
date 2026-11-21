@@ -14,10 +14,10 @@ from mira.auto_review.runner import execute_request
 from mira.auto_review.store import AutoReviewStore
 from mira.config import MiraConfig
 from mira.core.engine import ReviewEngine
-from mira.dashboard.db import AppDatabase
 from mira.exceptions import ProviderError, StaleReviewError
 from mira.models import ReviewComment, ReviewResult, Severity
 from mira.review_api.snapshot import FrozenSnapshot, PullMeta, SnapshotError, SnapshotReader
+from tests.server_db import BACKENDS, app_database
 
 BASE = "0" * 40
 HEADS = [str(i) * 40 for i in range(1, 5)]
@@ -54,12 +54,12 @@ def frozen(head):
     )
 
 
-@pytest.fixture
-def store(tmp_path, monkeypatch):
+@pytest.fixture(params=BACKENDS)
+def store(tmp_path, monkeypatch, request):
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
-    db = AppDatabase(url="", admin_password="test")
-    monkeypatch.setattr("mira.dashboard.api._app_db", db)
-    return AutoReviewStore(db)
+    with app_database(request.param, "", admin_password="test") as db:
+        monkeypatch.setattr("mira.dashboard.api._app_db", db)
+        yield AutoReviewStore(db)
 
 
 def enqueue(store, head):

@@ -287,12 +287,20 @@ class ReviewJobStore:
         if candidate is None:
             return None
         now = time.time()
+        # MySQL refuses a subquery on the table being updated (error 1093);
+        # it reads the count through a derived table instead.
+        running = (
+            "(SELECT n FROM (SELECT COUNT(*) AS n FROM review_api_jobs "
+            "WHERE state = 'running') AS running_jobs)"
+            if self._db._backend == "mysql"
+            else "(SELECT COUNT(*) FROM review_api_jobs WHERE state = 'running')"
+        )
         with self._cursor() as cur:
             cur.execute(
-                "UPDATE review_api_jobs SET state = 'running', stage = 'capturing', "
+                "UPDATE review_api_jobs SET state = 'running', stage = 'capturing', "  # noqa: S608
                 "lease_owner = ?, lease_expires_at = ?, deadline_at = ?, started_at = ?, "
                 "updated_at = ? WHERE id = ? AND state = 'queued' "
-                "AND (SELECT COUNT(*) FROM review_api_jobs WHERE state = 'running') < ?",
+                f"AND {running} < ?",
                 (
                     worker,
                     now + lease_seconds,

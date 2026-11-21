@@ -452,7 +452,7 @@ class Registry:
 
     def _lock_row(self, object_id: str) -> None:
         """Take the per-object lock inside an already-open transaction."""
-        if self.db.postgres:
+        if self.db.server:
             self.db.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (object_id,))
 
     @contextmanager
@@ -464,7 +464,7 @@ class Registry:
         cannot both allocate the same decision revision.
         """
         with self.db.transaction():
-            if self.db.postgres:
+            if self.db.server:
                 self.db.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (object_id,))
             yield
 
@@ -475,7 +475,7 @@ class Registry:
             yield
             return
         with self.db.transaction():
-            if self.db.postgres:
+            if self.db.server:
                 self.db.execute("SELECT pg_advisory_xact_lock(?)", (_ANCESTRY_LOCK,))
             yield
 

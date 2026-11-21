@@ -30,12 +30,12 @@ Mira reviews your pull requests using your choice of LLM (via [OpenRouter](https
 - **Zero markup on LLM costs** — Bring your own key. You pay the model provider directly; Mira never proxies your spend or adds a multiplier. The dashboard shows real per-repo, per-model cost — not estimates.
 - **Learns from your context** — Mira synthesizes rules from your merged PRs: rejected comments and human review patterns become team rules that shape future reviews.
 - **You set the rules** — Define custom and org-wide review rules in plain language, per-repo via `.mira.yaml` or from the dashboard.
-- **Privacy first** — Self-hosted by default. Diffs, indexes, review history, and CVE data live in your SQLite or Postgres, on infra you own. No phone-home, no required telemetry, no "is this used for training?"
+- **Privacy first** — Self-hosted by default. Diffs, indexes, review history, and CVE data live in your SQLite, Postgres or MySQL, on infra you own. No phone-home, no required telemetry, no "is this used for training?"
 - **Low-noise reviews** — Confidence thresholds, dedup, a self-critique pass, and per-PR caps mean every comment is one worth reading — and Mira is the fastest tool on the public [Code Review Bench](#benchmark).
 - **Catches PRs stepping on each other** — While reviewing, Mira checks the repo's other open PRs and flags merge-conflict risk and duplicate effort right in the walkthrough.
 - **Indexed, cross-file context** — A full-repo code index gives the model real project context, not just the diff — plus org-wide package search and hourly OSV.dev CVE scanning across every repo.
 - **GitHub, GitLab, and Forgejo** — Auto-reviews every PR and merge request and answers `@miracodeai` questions inline, with full feature parity across GitHub, GitLab, and Forgejo (incl. Codeberg). A Bitbucket adapter is next; the engine, indexer, and dashboard are provider-agnostic, so a new host is a data entry plus one provider class.
-- **Self-host on day one** — Docker image with Railway / Fly.io / Render configs, SQLite or Postgres. Every feature included.
+- **Self-host on day one** — Docker image with Railway / Fly.io / Render configs, SQLite, Postgres or MySQL. Every feature included.
 
 ## Dashboard
 
@@ -45,7 +45,7 @@ Mira reviews your pull requests using your choice of LLM (via [OpenRouter](https
 
 Most AI reviewers are SaaS: your diffs (and often the full surrounding code) leave for a third-party server, and the only "view" you get is the comments that come back on a PR. Mira flips both halves of that:
 
-- **Your code never leaves your infra.** Diffs, embeddings, indexes, review history, vulnerability data, all stored in your SQLite or Postgres, on infrastructure you own. No phone-home, no required telemetry, no "is this used for training?" question.
+- **Your code never leaves your infra.** Diffs, embeddings, indexes, review history, vulnerability data, all stored in your SQLite, Postgres or MySQL, on infrastructure you own. No phone-home, no required telemetry, no "is this used for training?" question.
 - **The dashboard you see above is yours.** It's not a marketing screenshot of someone else's view of your code. CodeRabbit, Greptile, and similar SaaS reviewers don't expose anything like it. Mira's dashboard surfaces signals you don't get anywhere else:
   - **Org-wide package inventory**: answer "which repos use `lodash@4.17.20`?" in one query. Stack it next to your CVE feed for instant blast-radius checks.
   - **CVE alerts on every dependency**: hourly OSV.dev poll, severity + advisory link + fix version surfaced inline next to the package.
@@ -258,6 +258,30 @@ ids it only lists the package; a real run needs the package name typed to confir
 the exact live version id set, and it deletes the whole package and then checks that
 it is gone. A restore within GitHub's 30-day window would bring the audited contents
 back.
+
+### Database
+
+Without `DATABASE_URL`, Kory Source keeps its data in SQLite files under
+`MIRA_INDEX_DIR`. Set `DATABASE_URL` to use a shared server instead:
+
+- PostgreSQL: `postgresql://user:password@host:5432/dbname`
+- MySQL 8.0.23 or newer (8.0 and 8.4 LTS are tested):
+  `mysql://user:password@host:3306/dbname`. `mysql+pymysql://` is accepted too.
+  Add `?ssl_ca=/path/to/ca.pem` to verify the server certificate, or
+  `?ssl_mode=REQUIRED` to encrypt without verifying. MariaDB is not supported.
+
+The database must exist; the service creates its tables. The account needs
+`CREATE`, `ALTER`, `INDEX`, `REFERENCES`, `SELECT`, `INSERT`, `UPDATE` and
+`DELETE` on it. The published image includes both drivers. A source install
+adds the MySQL driver with `pip install 'mira-reviewer[mysql]'`.
+
+On MySQL, tables use `utf8mb4` with the binary `utf8mb4_0900_bin` collation,
+so names, paths and keys compare case-sensitively, as on Postgres and SQLite.
+Keys keep no length limit: a primary or unique key over text columns is
+enforced on a hidden SHA-256 column, and lookups use a prefix index. Schema
+changes that MySQL cannot run in one transaction are applied one statement at
+a time and are safe to rerun after an interrupted startup. The one-off
+`review-feedback repair` tool reads Postgres only.
 
 ### Automatic review throughput
 

@@ -22,6 +22,7 @@ from mira.registry.db import RegistryDB
 from mira.registry.realization import observe_github
 from mira.registry.service import Registry
 from tests import registry_policy as rp
+from tests.server_db import SERVERS, server_url
 
 HUMAN = Actor("human", "zane")
 AGENT = Actor("agent", "claude-session-1", "claude-opus-5-5")
@@ -243,10 +244,10 @@ async def test_concurrent_inverse_ancestry_inserts_admit_only_one(tmp_path):
     assert sorted(results) == ["ok", "refused"]
 
 
-@pytest.mark.skipif(not PG_URL, reason="REGISTRY_TEST_POSTGRES_URL not set")
-async def test_postgres_concurrent_inverse_ancestry_inserts_admit_only_one():
-    a = Registry(RegistryDB(url=PG_URL))
-    b = Registry(RegistryDB(url=PG_URL))
+@pytest.mark.parametrize("server", SERVERS)
+async def test_server_concurrent_inverse_ancestry_inserts_admit_only_one(server):
+    a = Registry(RegistryDB(url=server_url(server)))
+    b = Registry(RegistryDB(url=server_url(server)))
     try:
         x = await _claim(a, "X", branch="bx")
         y = await _claim(a, "Y", branch="by")
