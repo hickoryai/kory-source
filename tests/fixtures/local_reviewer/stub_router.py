@@ -44,7 +44,8 @@ def main():
     log = os.environ.get("STUB_ROUTER_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps({"config": open(config, encoding="utf-8").read()}) + "\n")
+            started = {"config": open(config, encoding="utf-8").read(), "env": dict(os.environ)}
+            handle.write(json.dumps(started) + "\n")
     turns = 0
     pinned = ""
     for line in sys.stdin:

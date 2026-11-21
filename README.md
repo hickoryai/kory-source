@@ -323,7 +323,12 @@ relay returns, so reviews do not depend on which worker ran them.
 `KORY_SOURCE_ROUTER_OVERLAY` names a replacement overlay file. The image sets
 `ROUTER_ACP_CREDENTIAL_REFRESH=off`, so the service never rotates the mounted
 logins, and `IS_SANDBOX=1` for the Claude agent. The agent CLI (`kory`) is
-installed but is not in the path of a review call.
+installed but is not in the path of a review call. The router and the agents
+it starts get an allowlisted environment only: `PATH`, `HOME`, user, locale,
+temporary-directory, XDG and CA-bundle variables, `IS_SANDBOX` and
+`ROUTER_ACP_*`, minus any name that looks like a key, token, secret, password
+or credential. The service's GitHub App key, webhook secret, database address
+and provider keys never reach them.
 
 `docker run --rm --entrypoint python <image> -m mira.auto_review.reviewer_info`
 prints the router and agent CLI commits, the agent package versions and base

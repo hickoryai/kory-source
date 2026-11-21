@@ -32,7 +32,8 @@ directory that is removed with the process.
 ``router-acp`` binary is found and the configuration directory holds a
 ``router.yaml`` and at least one account. This module never writes to that
 directory and starts the router with credential refresh off unless the
-environment already sets it.
+environment already sets it. The router gets an allowlisted environment
+(``child_environment``), never the service's secrets.
 """
 
 from __future__ import annotations
@@ -155,6 +156,47 @@ def reviewer_available(directory: Path | None = None) -> bool:
     if not configured_accounts(root):
         return False
     return shutil.which(router_bin()) is not None
+
+
+# The router and the agents it starts see only these variables. The service's
+# own environment holds its GitHub App key, webhook secret, database address
+# and provider keys, and an agent reviewing an untrusted diff can read its
+# environment. Account credentials come from the mounted configuration.
+_CHILD_ENV_NAMES = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "TERM",
+        "TMPDIR",
+        "IS_SANDBOX",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+    }
+)
+_CHILD_ENV_PREFIXES = ("LC_", "ROUTER_ACP_")
+_SECRET_NAME = re.compile(r"(?:^|_)(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|AUTH)(?:_|$)|CREDENTIALS?$")
+
+
+def child_environment(source: dict[str, str] | os._Environ[str]) -> dict[str, str]:
+    """The allowlisted subset of ``source`` passed to ``router-acp``."""
+    kept: dict[str, str] = {}
+    for name, value in source.items():
+        allowed = name in _CHILD_ENV_NAMES or name.startswith(_CHILD_ENV_PREFIXES)
+        if allowed and not _SECRET_NAME.search(name.upper()):
+            kept[name] = value
+    return kept
 
 
 def _bounded(raw: str | None, fallback: int, limit: int) -> int:
@@ -457,23 +499,24 @@ class LocalSeat:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._bin = bin_path or router_bin()
-        self._env = dict(os.environ if env is None else env)
+        settings = dict(os.environ if env is None else env)
+        self._env = child_environment(settings)
         # The mounted logins belong to another host. This one never rotates them.
         self._env.setdefault(ENV_CREDENTIAL_REFRESH, "off")
         self._idle_seconds = (
             idle_seconds
             if idle_seconds is not None
             else _bounded(
-                self._env.get(ENV_CONVERSATION_IDLE),
+                settings.get(ENV_CONVERSATION_IDLE),
                 CONVERSATION_IDLE_SECONDS,
                 _CONVERSATION_IDLE_LIMIT_SECONDS,
             )
         )
         self._cap = cap or _bounded(
-            self._env.get(ENV_CONVERSATION_CAP), CONVERSATION_CAP, _CONVERSATION_CAP_LIMIT
+            settings.get(ENV_CONVERSATION_CAP), CONVERSATION_CAP, _CONVERSATION_CAP_LIMIT
         )
         self._timeout_cap = _bounded(
-            self._env.get(ENV_TIMEOUT_CAP), TIMEOUT_CAP_SECONDS, _TIMEOUT_CAP_LIMIT_SECONDS
+            settings.get(ENV_TIMEOUT_CAP), TIMEOUT_CAP_SECONDS, _TIMEOUT_CAP_LIMIT_SECONDS
         )
         self._monotonic = monotonic
         self._sessions: dict[str, _Session] = {}

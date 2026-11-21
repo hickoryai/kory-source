@@ -52,11 +52,13 @@ def stub_router(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     launcher = bin_dir / "router-acp"
-    launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{STUB}" "$@"\n')
-    launcher.chmod(0o755)
     log = tmp_path / "router.log"
+    # The router gets an allowlisted environment, so the launcher names the log.
+    launcher.write_text(
+        f'#!/bin/sh\nSTUB_ROUTER_LOG="{log}" exec "{sys.executable}" "{STUB}" "$@"\n'
+    )
+    launcher.chmod(0o755)
     monkeypatch.setenv("ROUTER_ACP_BIN", str(launcher))
-    monkeypatch.setenv("STUB_ROUTER_LOG", str(log))
     monkeypatch.delenv("KORY_SOURCE_ROUTER_OVERLAY", raising=False)
     return log
 
@@ -452,6 +454,35 @@ async def test_an_unreadable_overlay_file_is_an_answered_failure(
     status, payload = await LocalSeat().complete({"prompt": "hello"}, 30)
     assert status >= 400
     assert payload["state"]
+
+
+async def test_the_router_never_sees_the_service_secrets(
+    stub_router: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secrets = {
+        "MIRA_GITHUB_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----synthetic",
+        "MIRA_WEBHOOK_SECRET": "synthetic-webhook",
+        "DATABASE_URL": "postgresql://user:synthetic@db/mira",
+        "OPENROUTER_API_KEY": "synthetic-provider-key",
+        "GITHUB_TOKEN": "synthetic-github-token",
+        "ROUTER_ACP_API_TOKEN": "synthetic-router-token",
+        "KORY_SOURCE_AUTO_REVIEW_TOKEN": "synthetic-service-token",
+    }
+    for name, value in secrets.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    monkeypatch.setenv("LC_ALL", "C.UTF-8")
+    status, _payload = await LocalSeat().complete({"prompt": "hello"}, 30)
+    assert status == 200
+    env = _log(stub_router)[0]["env"]
+    for name, value in secrets.items():
+        assert name not in env
+        assert value not in json.dumps(env)
+    assert env["IS_SANDBOX"] == "1"
+    assert env["LC_ALL"] == "C.UTF-8"
+    assert env["ROUTER_ACP_CREDENTIAL_REFRESH"] == "off"
+    assert env["PATH"] and env["HOME"]
+    assert set(env) <= set(local_seat.child_environment(dict(env))) | {"STUB_ROUTER_LOG", "PWD"}
 
 
 async def test_a_pinned_model_that_did_not_run_is_a_mismatch(stub_router: Path) -> None:
