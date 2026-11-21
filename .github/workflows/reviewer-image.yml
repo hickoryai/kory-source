@@ -67,11 +67,11 @@ jobs:
       - name: Record what was bundled
         run: python3 scripts/resolve_reviewer_deps.py --markdown /tmp/reviewer-manifest.json >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Smoke test the bundled reviewer
+        run: scripts/smoke_reviewer_image.sh kory-source:reviewer-ci
+
       - name: Audit image configuration, history, and all layers
         run: |
           docker save kory-source:reviewer-ci -o /tmp/candidate.tar
           python3 scripts/audit_public_image.py --image /tmp/candidate.tar
           rm -f /tmp/candidate.tar
-
-      - name: Smoke test the bundled reviewer
-        run: scripts/smoke_reviewer_image.sh kory-source:reviewer-ci
