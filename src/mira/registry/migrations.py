@@ -6,8 +6,14 @@ transaction per file, and recorded in ``registry_schema_migrations`` with the
 file's SHA-256.
 
 - A rerun is a no-op. Concurrent startups serialize: SQLite on
-  ``BEGIN IMMEDIATE``, PostgreSQL on a transaction-scoped advisory lock, and
-  each re-reads the ledger after taking the lock.
+  ``BEGIN IMMEDIATE``, PostgreSQL on a transaction-scoped advisory lock,
+  MySQL on a named lock held until the transaction block ends, and each
+  re-reads the ledger after taking the lock.
+- MySQL commits each schema statement on its own, so a migration interrupted
+  there can leave its first statements applied and no ledger row. Each
+  statement runs behind an existence check (``mira.db.mysql``), so the
+  restart skips what exists and records the ledger row last. Statement kinds
+  without such a check are refused on MySQL.
 - A ledger row this code does not know (a newer deployment ran first), or a
   checksum that no longer matches a released file, stops startup. Released
   migration files are never edited; add a new one instead.
