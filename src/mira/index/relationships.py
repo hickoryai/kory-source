@@ -15,6 +15,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 
+from mira.db.url import is_server
 from mira.index.store import ExternalRef, IndexStore
 
 logger = logging.getLogger(__name__)
@@ -238,9 +239,9 @@ class RelationshipStore:
         self._scan_repos()
 
     def _scan_repos(self) -> None:
-        """Discover indexed repos via Postgres registry, falling back to SQLite files on disk."""
+        """Discover indexed repos via the server registry (Postgres or MySQL), falling back to SQLite files on disk."""
         db_url = os.environ.get("DATABASE_URL", "")
-        if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+        if is_server(db_url):
             try:
                 from mira.dashboard.api import _app_db
 

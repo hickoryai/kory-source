@@ -12,6 +12,7 @@ from mira.dashboard.api import (
     _open_store,
     router,
 )
+from mira.db.url import is_server
 
 
 @router.get(
@@ -42,7 +43,7 @@ def get_repo_vulnerabilities(owner: str, repo: str) -> list[VulnerabilityModel]:
 def get_vulnerabilities_summary() -> VulnerabilitySummary:
     """Org-wide vulnerability count by severity, for the dashboard widget."""
     db_url = os.environ.get("DATABASE_URL", "")
-    if not (db_url.startswith("postgresql://") or db_url.startswith("postgres://")):
+    if not is_server(db_url):
         # SQLite single-repo deployments don't support org-wide aggregation.
         return VulnerabilitySummary()
     from mira.index.pg_store import count_vulnerabilities_org_wide
@@ -63,7 +64,7 @@ def list_org_vulnerabilities(limit: int = 1000) -> list[OrgVulnerabilityModel]:
     """List every open vulnerability across the org."""
     db_url = os.environ.get("DATABASE_URL", "")
     capped = max(1, min(limit, 5000))
-    if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+    if is_server(db_url):
         from mira.index.pg_store import list_vulnerabilities_org_wide
 
         rows = list_vulnerabilities_org_wide(db_url, limit=capped)
@@ -109,7 +110,7 @@ def search_packages(
 
     db_url = os.environ.get("DATABASE_URL", "")
     capped_limit = max(1, min(limit, 2000))
-    if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+    if is_server(db_url):
         from mira.index.pg_store import search_packages_org_wide
 
         rows = search_packages_org_wide(

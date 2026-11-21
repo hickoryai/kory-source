@@ -141,7 +141,7 @@ def create_app(
     @app.get("/health")
     async def health() -> dict[str, str]:
         db_url = os.environ.get("DATABASE_URL", "")
-        if db_url.startswith("postgresql://") or db_url.startswith("postgres://"):
+        if db_url.startswith(("postgresql://", "postgres://", "mysql://", "mysql+pymysql://")):
             from mira.db.postgres import connect
 
             conn = None

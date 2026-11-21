@@ -58,6 +58,7 @@ from mira.registry.imports import (
     assert_read_only_graphql,
     extract_decisions,
     materialize,
+    upsert_sync_state_if,
 )
 from mira.registry.model import Actor
 from mira.registry.provenance import ProvenanceStore, SourceRevision
@@ -557,6 +558,17 @@ class LinearImporter:
     def _claim_incremental_lease(self) -> str | None:
         owner = uuid4().hex
         now = self.clock()
+        db = self.registry.db
+        if db.mysql:
+            won = upsert_sync_state_if(
+                db,
+                SOURCE_SYSTEM,
+                INCREMENTAL_LEASE_STREAM,
+                insert={"after_cursor": owner, "updated_at": now},
+                update=("after_cursor", "updated_at"),
+                accept=lambda row: row["updated_at"] <= now - INCREMENTAL_LEASE_SECONDS,
+            )
+            return owner if won else None
         claimed = self.registry.db.execute(
             "INSERT INTO registry_sync_state (source_system, stream, after_cursor, updated_at) "
             "VALUES (?, ?, ?, ?) ON CONFLICT (source_system, stream) DO UPDATE SET "
@@ -568,11 +580,22 @@ class LinearImporter:
 
     def _renew_lease(self) -> None:
         assert self._lease_owner is not None
-        renewed = self.registry.db.execute(
-            "UPDATE registry_sync_state SET updated_at = ? "
-            "WHERE source_system = ? AND stream = ? AND after_cursor = ? RETURNING after_cursor",
-            (self.clock(), SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, self._lease_owner),
-        )
+        params = (self.clock(), SOURCE_SYSTEM, INCREMENTAL_LEASE_STREAM, self._lease_owner)
+        if self.registry.db.mysql:
+            renewed = self.registry.db.execute_rowcount(
+                "UPDATE registry_sync_state SET updated_at = ? "
+                "WHERE source_system = ? AND stream = ? AND after_cursor = ?",
+                params,
+            )
+        else:
+            renewed = len(
+                self.registry.db.execute(
+                    "UPDATE registry_sync_state SET updated_at = ? "
+                    "WHERE source_system = ? AND stream = ? AND after_cursor = ? "
+                    "RETURNING after_cursor",
+                    params,
+                )
+            )
         if not renewed:
             raise RuntimeError("the Linear import lease expired and another run acquired it")
 

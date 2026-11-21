@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import sqlite3
 import threading
 import zipfile
@@ -15,9 +14,8 @@ from mira.registry import migrations
 from mira.registry.db import SCHEMA, RegistryDB
 from mira.registry.migrations import Migration, MigrationError
 from tests import registry_policy as rp
+from tests.server_db import SERVERS, server_url
 
-PG_URL = os.environ.get("REGISTRY_TEST_POSTGRES_URL", "")
-pg_only = pytest.mark.skipif(not PG_URL, reason="REGISTRY_TEST_POSTGRES_URL not set")
 NEW_TABLES = (
     "registry_import_runs",
     "registry_source_revisions",
@@ -239,8 +237,8 @@ def test_built_wheel_contains_the_migration_sql():
             )
 
 
-@pg_only
-def test_postgres_concurrent_startups_apply_once():
+@pytest.mark.parametrize("server", SERVERS)
+def test_server_concurrent_startups_apply_once(server):
     errors: list[BaseException] = []
     barrier = threading.Barrier(3)
     dbs: list[RegistryDB] = []
@@ -248,7 +246,7 @@ def test_postgres_concurrent_startups_apply_once():
     def start() -> None:
         try:
             barrier.wait()
-            dbs.append(RegistryDB(url=PG_URL))
+            dbs.append(RegistryDB(url=server_url(server)))
         except BaseException as exc:  # pragma: no cover
             errors.append(exc)
 
@@ -267,3 +265,58 @@ def test_postgres_concurrent_startups_apply_once():
         rp.drop_registry_tables(dbs[0])
         for db in dbs:
             db.close()
+
+
+def _mysql_schema(db: RegistryDB) -> dict[str, list[tuple]]:
+    """Columns, indexes and ledger of a MySQL registry database."""
+    raw = db._conn.raw
+    with raw.cursor() as cur:
+        cur.execute(
+            "SELECT table_name, column_name, column_type, is_nullable, column_default, extra "
+            "FROM information_schema.columns WHERE table_schema = DATABASE() "
+            "ORDER BY table_name, column_name"
+        )
+        columns = [tuple(r) for r in cur.fetchall()]
+        cur.execute(
+            "SELECT table_name, index_name, seq_in_index, column_name, sub_part, non_unique "
+            "FROM information_schema.statistics WHERE table_schema = DATABASE() "
+            "ORDER BY table_name, index_name, seq_in_index"
+        )
+        indexes = [tuple(r) for r in cur.fetchall()]
+        cur.execute("SELECT version, name, sha256 FROM registry_schema_migrations ORDER BY version")
+        ledger = [tuple(r) for r in cur.fetchall()]
+    return {"columns": columns, "indexes": indexes, "ledger": ledger}
+
+
+def test_mysql_migration_resumes_after_failing_at_any_statement(monkeypatch):
+    """MySQL commits each DDL statement on its own, so a failed migration can
+    leave its first statements applied and no ledger row. A restart must skip
+    what exists, finish the rest, and end on the same schema as a clean run."""
+    from tests.server_db import fresh_database
+
+    if not server_url("mysql"):
+        pytest.skip("REGISTRY_TEST_MYSQL_URL not set")
+    with fresh_database("mysql") as url:
+        clean = RegistryDB(url=url)
+        expected = _mysql_schema(clean)
+        clean.close()
+    known = migrations.available()
+    # Up to and including every statement: the last crash point is "all DDL
+    # committed, ledger row not yet written".
+    cases = [(m, k) for m in known for k in range(1, len(m.statements()) + 1)]
+    assert cases
+    for mig, applied_count in cases:
+        with fresh_database("mysql") as url:
+            earlier = [m for m in known if m.version < mig.version]
+            monkeypatch.setattr(migrations, "available", lambda earlier=earlier: earlier)
+            db = RegistryDB(url=url)
+            # The crash: this migration's first statements ran, its ledger row did not.
+            for stmt in mig.statements()[:applied_count]:
+                db.execute(stmt)
+            db.close()
+            monkeypatch.setattr(migrations, "available", lambda: known)
+            restarted = RegistryDB(url=url)
+            try:
+                assert _mysql_schema(restarted) == expected, (mig.name, applied_count)
+            finally:
+                restarted.close()

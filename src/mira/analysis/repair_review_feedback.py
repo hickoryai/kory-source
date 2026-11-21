@@ -122,6 +122,22 @@ def apply_repair(store, plan, *, report):
     report({"after_counts": counts(store.list_all_feedback())})
 
 
+def require_postgres(*urls):
+    """This one-off repair reads Postgres directly and is not ported to MySQL.
+
+    It fixes rows written by releases that predate MySQL support, so a MySQL
+    database has nothing for it to repair.
+    """
+    from mira.db.url import backend
+
+    for url in urls:
+        if backend(url) != "postgres":
+            raise RuntimeError(
+                "review-feedback repair supports PostgreSQL URLs only; "
+                "MySQL databases were created after the rows it repairs"
+            )
+
+
 def audit_production(database_url, config, bot_login):
     """Read-only production check; no store initialization or schema mutation."""
     import psycopg
@@ -162,6 +178,7 @@ async def _main(args):
     dev_url = os.environ.get("REVIEW_REPAIR_DEV_DATABASE_URL", "")
     if not prod_url or not dev_url or prod_url == dev_url:
         raise RuntimeError("distinct explicit production and dev database URLs required")
+    require_postgres(prod_url, dev_url)
     evidence = audit_production(prod_url, config.feedback, args.bot_login)
     import psycopg
 

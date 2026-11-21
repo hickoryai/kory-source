@@ -14,6 +14,7 @@ import os
 from collections import defaultdict
 from collections.abc import Iterable
 
+from mira.db.url import is_server
 from mira.index.manifests import _is_lockfile_path
 from mira.security.osv import (
     PackageQuery,
@@ -65,11 +66,11 @@ async def poll_org_wide() -> dict[str, int]:
     """Run a full vulnerability scan across every indexed repo.
 
     Returns severity counts (e.g. ``{"high": 3, "critical": 1}``) for logging.
-    Postgres-only — SQLite per-repo stores can't be enumerated globally.
+    Server databases only (Postgres or MySQL): SQLite per-repo stores cannot be enumerated globally.
     """
     db_url = os.environ.get("DATABASE_URL", "")
-    if not (db_url.startswith("postgresql://") or db_url.startswith("postgres://")):
-        logger.debug("Skipping vuln poll: DATABASE_URL is not Postgres")
+    if not is_server(db_url):
+        logger.debug("Skipping vuln poll: DATABASE_URL is not a Postgres or MySQL server")
         return {}
 
     from mira.index.pg_store import (
@@ -175,7 +176,7 @@ async def poll_repo(owner: str, repo: str) -> dict[str, int]:
     indexing run so freshly-added packages get a vuln check without waiting
     for the next hourly tick."""
     db_url = os.environ.get("DATABASE_URL", "")
-    if not (db_url.startswith("postgresql://") or db_url.startswith("postgres://")):
+    if not is_server(db_url):
         return {}
 
     from mira.index.pg_store import PgIndexStore

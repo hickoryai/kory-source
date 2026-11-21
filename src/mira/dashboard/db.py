@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from datetime import UTC
 from typing import Any
 
+from mira.db.url import backend
+
 logger = logging.getLogger(__name__)
 
 _SQLITE_SCHEMA = """
@@ -493,10 +495,11 @@ class AppDatabase:
         self._pg_lock = threading.Lock()
         self._sqlite_conn: sqlite3.Connection | None = None
 
-        if url.startswith("postgresql://") or url.startswith("postgres://"):
-            self._init_postgres(url)
-        else:
+        kind = backend(url)
+        if kind == "sqlite":
             self._init_sqlite(url)
+        else:
+            self._init_server(url, kind)
 
         self._ensure_default_admin()
 
@@ -587,8 +590,10 @@ class AppDatabase:
         self._sqlite_conn.commit()
         logger.info("App database: SQLite at %s", db_path)
 
-    def _init_postgres(self, url: str) -> None:
-        self._backend = "postgres"
+    def _init_server(self, url: str, kind: str) -> None:
+        """Postgres or MySQL. MySQL runs this same SQL through ``mira.db.mysql``."""
+        self._backend = kind
+        label = "PostgreSQL" if kind == "postgres" else "MySQL"
         try:
             from mira.db.postgres import connect
 
@@ -626,6 +631,11 @@ class AppDatabase:
                     "ALTER TABLE pr_review_progress ADD COLUMN IF NOT EXISTS "
                     "platform TEXT NOT NULL DEFAULT 'github'"
                 )
+                if kind == "mysql":
+                    # No MySQL database predates the platform key; the base
+                    # schema above already has it.
+                    logger.info("App database: MySQL")
+                    return
                 cur.execute(
                     "DO $$ BEGIN "
                     "IF NOT EXISTS (SELECT 1 FROM information_schema.key_column_usage "
@@ -646,18 +656,24 @@ class AppDatabase:
                 )
             logger.info("App database: PostgreSQL")
         except ImportError:
+            install = (
+                "pip install 'psycopg[binary]>=3.1'"
+                if kind == "postgres"
+                else "pip install 'mira-reviewer[mysql]'"
+            )
             logger.warning(
-                "psycopg not installed, falling back to SQLite. "
-                "Install with: pip install 'psycopg[binary]>=3.1'"
+                "%s driver not installed, falling back to SQLite. Install with: %s",
+                label,
+                install,
             )
             self._init_sqlite("")
         except Exception as exc:
-            logger.warning("PostgreSQL connection failed (%s), falling back to SQLite", exc)
+            logger.warning("%s connection failed (%s), falling back to SQLite", label, exc)
             self._init_sqlite("")
 
     @contextmanager
     def _pg_cursor(self) -> Iterator[Any]:
-        """Yield a Postgres cursor that reconnects once on stale-connection errors."""
+        """Yield a server (Postgres or MySQL) cursor that reconnects once on a lost connection."""
         from mira.db.postgres import ReconnectingCursor, connect, reconnect
 
         def refresh() -> Any:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,6 +54,7 @@ from mira.platforms.github.webhook import dispatch_github_event, handle_pull_req
 from mira.platforms.server import create_app
 from mira.providers.github import GitHubProvider
 from mira.review_api.snapshot import FrozenSnapshot, PullMeta, ReadOnlySnapshotProvider
+from tests.server_db import BACKENDS, app_database
 
 HEAD = "a" * 40
 HEAD_NEXT = "b" * 40
@@ -61,14 +63,16 @@ ROUTEABLE_ACCOUNT = "grok@" + "ab" * 16
 ROUTEABLE_MODEL = f"{ROUTEABLE_ACCOUNT}/grok-4.7"
 
 
-@pytest.fixture
-def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AppDatabase:
+@pytest.fixture(params=BACKENDS)
+def db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[AppDatabase]:
     monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW", raising=False)
     monkeypatch.delenv("KORY_SOURCE_AUTO_REVIEW_TOKEN", raising=False)
-    database = AppDatabase(url="", admin_password="admin")
-    monkeypatch.setattr("mira.dashboard.api._app_db", database)
-    return database
+    with app_database(request.param, "") as database:
+        monkeypatch.setattr("mira.dashboard.api._app_db", database)
+        yield database
 
 
 def _store(database: AppDatabase) -> AutoReviewStore:
@@ -899,6 +903,8 @@ def test_lapsed_lease_is_requeued_unless_superseded_or_posting(db: AppDatabase) 
 
 
 def test_existing_table_gains_role_skill_and_head_role_key(db: AppDatabase) -> None:
+    if db._backend != "sqlite":
+        pytest.skip("rebuilds a legacy SQLite table; server schemas have the key from the start")
     _store(db)
     conn = db._sqlite_conn
     assert conn is not None
