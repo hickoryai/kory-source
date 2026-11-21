@@ -523,11 +523,18 @@ async def start_auto_review(app_auth: Any) -> None:
     _executor = AutoReviewExecutor(store, _reader_factory(app_auth))
     await _executor.start()
     logger.info("auto review executor %s started", _executor.worker_id)
+    # A host that holds a router configuration answers its own seat calls.
+    from mira.auto_review.worker import start_local_reviewer
+
+    await start_local_reviewer()
 
 
 async def stop_auto_review() -> None:
     global _executor, _app_auth
     executor, _executor = _executor, None
     _app_auth = None
+    from mira.auto_review.worker import stop_local_reviewer
+
+    await stop_local_reviewer()
     if executor is not None:
         await executor.stop()

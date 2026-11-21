@@ -8,6 +8,14 @@ name: Release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # Run from a version tag (`--ref vX.Y.Z`) to release it with pinned entries
+  # when an upstream head is broken.
+  workflow_dispatch:
+    inputs:
+      overrides:
+        description: "Space-separated NAME=VALUE pins for scripts/resolve_reviewer_deps.py"
+        required: false
+        default: ""
 
 env:
   REGISTRY: ghcr.io
@@ -37,8 +45,10 @@ jobs:
   build-and-push:
     needs: tests # ← only builds/pushes if the test gate is green
     runs-on: ubuntu-latest
+    # A manual run builds only from a version tag.
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
-      contents: read
+      contents: write # the release notes record the bundled dependencies
       packages: write
     steps:
       - uses: actions/checkout@v7
@@ -65,18 +75,55 @@ jobs:
           docker build --target build-context --output type=local,dest=/tmp/public-context .
           python3 scripts/audit_public_image.py --context /tmp/public-context
 
+      # The same tag must never name two different images: every build
+      # resolves the newest bundled dependencies, so a rebuild would differ.
+      - name: Refuse to rebuild a published version
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          first_tag=$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)
+          if docker manifest inspect "$first_tag" > /dev/null 2>&1; then
+            echo "::error::$first_tag is already published. Release a new version instead."
+            exit 1
+          fi
+
+      # Two Rust release builds and the agent packages need more room than a
+      # fresh runner has.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Expose the Actions cache to buildx
+        uses: crazy-max/ghaction-github-runtime@v4
+
+      # Every release bundles the newest router and agent CLI commits, the
+      # newest agent packages, and the current base image digests. Nothing is
+      # pinned in the repository. A manual run may pin entries with
+      # `overrides`; the release notes mark each pinned entry.
       # Attestations stay off. A provenance or SBOM blob is not a layer of the
       # candidate the next step audits, and the registry history audit scans it.
-      - name: Build candidate locally
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: false
-          load: true
-          provenance: false
-          sbom: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+      - name: Build candidate locally with the newest bundled dependencies
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE_LABELS: ${{ steps.meta.outputs.labels }}
+          REVIEWER_OVERRIDES: ${{ inputs.overrides }}
+          REVIEWER_MANIFEST: /tmp/reviewer-manifest.json
+          BUILDX_ARGS: >-
+            --cache-from type=gha,scope=reviewer-image
+            --cache-to type=gha,mode=max,scope=reviewer-image
+        run: |
+          set -euo pipefail
+          mapfile -t tags < <(printf '%s\n' "$IMAGE_TAGS" | sed '/^$/d')
+          scripts/build_reviewer_image.sh "${tags[@]}"
+
+      # A reviewer command that does not answer fails the release here, not a
+      # review after deployment.
+      - name: Smoke test the bundled reviewer
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: scripts/smoke_reviewer_image.sh "$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)"
 
       - name: Audit every candidate layer before pushing the same image
         env:
@@ -89,3 +136,25 @@ jobs:
           while IFS= read -r tag; do
             test -z "$tag" || docker push "$tag"
           done <<< "$IMAGE_TAGS"
+
+      - name: Record the bundled dependencies in the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Bundled dependencies"
+            echo
+            echo "Resolved when this image was built."
+            echo
+            python3 scripts/resolve_reviewer_deps.py --markdown /tmp/reviewer-manifest.json
+          } > /tmp/release-notes.md
+          cat /tmp/release-notes.md >> "$GITHUB_STEP_SUMMARY"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release view "$GITHUB_REF_NAME" --json body --jq .body > /tmp/existing-notes.md
+            cat /tmp/existing-notes.md /tmp/release-notes.md > /tmp/combined-notes.md
+            gh release edit "$GITHUB_REF_NAME" --notes-file /tmp/combined-notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+              --notes-file /tmp/release-notes.md
+          fi
