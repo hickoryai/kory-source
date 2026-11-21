@@ -1,0 +1,75 @@
+name: Reviewer image
+
+# Builds the image with the bundled reviewer exactly as a release does:
+# newest router and agent CLI commits, newest agent packages, current base
+# image digests. Then audits every layer and smoke-tests the reviewer. The
+# image is never pushed. Runs on changes to the image or the reviewer, and on
+# demand to check that the newest upstream versions still build.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - pyproject.toml
+      - scripts/audit_public_image.py
+      - scripts/build_reviewer_image.sh
+      - scripts/resolve_reviewer_deps.py
+      - scripts/smoke_reviewer_image.sh
+      - src/mira/auto_review/**
+      - tests/smoke/**
+      - tests/fixtures/local_reviewer/**
+      - .github/workflows/reviewer-image.yml
+  workflow_dispatch:
+    inputs:
+      overrides:
+        description: "Space-separated NAME=VALUE pins for scripts/resolve_reviewer_deps.py"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reviewer-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v7
+
+      # Two Rust release builds and the agent packages need more room than a
+      # fresh runner has.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Expose the Actions cache to buildx
+        uses: crazy-max/ghaction-github-runtime@v4
+
+      - name: Build with the newest bundled dependencies
+        env:
+          REVIEWER_OVERRIDES: ${{ inputs.overrides }}
+          REVIEWER_MANIFEST: /tmp/reviewer-manifest.json
+          BUILDX_ARGS: >-
+            --cache-from type=gha,scope=reviewer-image
+            --cache-to type=gha,mode=max,scope=reviewer-image
+        run: scripts/build_reviewer_image.sh kory-source:reviewer-ci
+
+      - name: Record what was bundled
+        run: python3 scripts/resolve_reviewer_deps.py --markdown /tmp/reviewer-manifest.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Audit image configuration, history, and all layers
+        run: |
+          docker save kory-source:reviewer-ci -o /tmp/candidate.tar
+          python3 scripts/audit_public_image.py --image /tmp/candidate.tar
+          rm -f /tmp/candidate.tar
+
+      - name: Smoke test the bundled reviewer
+        run: scripts/smoke_reviewer_image.sh kory-source:reviewer-ci

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -31,6 +33,7 @@ BASE = "c" * 40
 STUB = Path(__file__).parent / "fixtures" / "local_reviewer" / "stub_router.py"
 STUB_MODEL = "grok@" + "ab" * 16 + "/grok-4.7"
 TOKEN = "seat-secret"
+PG_URL = os.environ.get("REGISTRY_TEST_POSTGRES_URL", "")
 
 
 @pytest.fixture
@@ -165,6 +168,83 @@ def test_two_concurrent_claimants_get_one_claim_per_call(db: AppDatabase) -> Non
             assert store.work_claim(work_id)[0] == name
             assert not store.answer_work(work_id, text="x", actual_model="m", worker=other)
             assert store.answer_work(work_id, text="x", actual_model="m", worker=name)
+
+
+@pytest.mark.skipif(not PG_URL, reason="REGISTRY_TEST_POSTGRES_URL not set")
+def test_two_service_instances_on_postgres_give_each_call_to_one_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each poll lands on its own service instance and database connection."""
+    monkeypatch.setenv("ADMIN_PASSWORD", "admin")
+    first = AutoReviewStore(AppDatabase(url=PG_URL, admin_password="admin"))
+    second = AutoReviewStore(AppDatabase(url=PG_URL, admin_password="admin"))
+    stores = {"workstation": first, "container": second}
+    marker = uuid.uuid4().hex[:8]
+    calls = 30
+    work_ids = set()
+    for number in range(calls):
+        row, _inserted = first.enqueue(
+            platform="github",
+            owner="example",
+            repo=f"claim-{marker}",
+            pr_number=number,
+            head_sha=HEAD,
+            base_sha=BASE,
+            installation_id=42,
+            title="trial",
+        )
+        with first._cursor() as cur:
+            cur.execute("UPDATE auto_review_requests SET state = 'running' WHERE id = ?", (row.id,))
+        work_ids.add(_work(first, row.id, prompt=f"p{number}"))
+    start = threading.Barrier(2)
+    claimed: dict[str, list[str]] = {"workstation": [], "container": []}
+    errors: list[BaseException] = []
+
+    def claim_all(name: str) -> None:
+        try:
+            start.wait()
+            while True:
+                item = stores[name].claim_work(f"{name}-{marker}", tuple(claimed[name]))
+                if item is None:
+                    return
+                claimed[name].append(item.id)
+        except BaseException as exc:  # surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=claim_all, args=(name,)) for name in claimed]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+            assert not thread.is_alive()
+        assert not errors
+        ours = {name: [w for w in ids if w in work_ids] for name, ids in claimed.items()}
+        assert not set(ours["workstation"]) & set(ours["container"])
+        assert set(ours["workstation"]) | set(ours["container"]) == work_ids
+        for name, ids in ours.items():
+            other = "container" if name == "workstation" else "workstation"
+            for work_id in ids:
+                assert not stores[other].answer_work(
+                    work_id, text="x", actual_model="m", worker=f"{other}-{marker}"
+                )
+                assert stores[name].answer_work(
+                    work_id, text="x", actual_model="m", worker=f"{name}-{marker}"
+                )
+    finally:
+        with first._cursor() as cur:
+            cur.execute(
+                "DELETE FROM auto_review_work WHERE request_id IN "
+                "(SELECT id FROM auto_review_requests WHERE repo = ?)",
+                (f"claim-{marker}",),
+            )
+            cur.execute(
+                "DELETE FROM auto_review_seat_owners WHERE request_id IN "
+                "(SELECT id FROM auto_review_requests WHERE repo = ?)",
+                (f"claim-{marker}",),
+            )
+            cur.execute("DELETE FROM auto_review_requests WHERE repo = ?", (f"claim-{marker}",))
+            cur.execute("DELETE FROM auto_review_workers WHERE id LIKE ?", (f"%-{marker}",))
 
 
 def test_poll_renews_a_claim_and_a_silent_worker_loses_it(db: AppDatabase) -> None:

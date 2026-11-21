@@ -64,7 +64,41 @@ UPSTREAM_FINDINGS = {
 }
 
 
-def scan(data: bytes) -> set[str]:
+# Reviewed upstream strings. In the file at exactly this path, exactly these
+# byte strings may contain the organization name: the name of an unrelated
+# DNS library, and the address the agent CLI's updater downloads from. These
+# programs are rebuilt from their newest source for every release, so their
+# hashes cannot be pinned the way UPSTREAM_FINDINGS pins a package file. Any
+# other occurrence in these files still fails, as does every other pattern.
+UPSTREAM_STRINGS = {
+    "usr/local/bin/kory": (
+        b"hickory-dns",
+        b"api.github.com/repos/hickoryai/goose",
+        b"github.com/hickoryai/goose",
+    ),
+    "usr/local/bin/router-acp": (b"hickory-dns",),
+}
+
+
+def _outside_allowed(data: bytes, pattern: re.Pattern, allowed: tuple[bytes, ...]) -> bool:
+    """True when a match is not inside one of the allowed strings."""
+    for match in pattern.finditer(data):
+        covered = False
+        for literal in allowed:
+            # Every place the match could sit inside this literal.
+            for inner in pattern.finditer(literal):
+                start = match.start() - inner.start()
+                if start >= 0 and data[start : start + len(literal)] == literal:
+                    covered = True
+                    break
+            if covered:
+                break
+        if not covered:
+            return True
+    return False
+
+
+def scan(data: bytes, allowed: tuple[bytes, ...] = ()) -> set[str]:
     for example in AWS_DOCUMENTATION_KEYS:
         data = data.replace(example, b"AWS_DOCUMENTATION_EXAMPLE")
     # Preserve legal attribution, but never exempt credentials on those lines.
@@ -74,14 +108,26 @@ def scan(data: bytes) -> set[str]:
         b"Copyright attribution",
         data,
     )
-    return {
+    found = {
         name
         for name, pattern in PATTERNS.items()
-        if pattern.search(nonlegal if name == "organization-reference" else data)
+        if name != "organization-reference" and pattern.search(data)
     }
+    organization = PATTERNS["organization-reference"]
+    if (
+        _outside_allowed(nonlegal, organization, allowed)
+        if allowed
+        else organization.search(nonlegal)
+    ):
+        found.add("organization-reference")
+    return found
 
 
 def scan_stream(stream, name: str = "") -> set[str]:
+    allowed = UPSTREAM_STRINGS.get(name, ())
+    if allowed:
+        # Read whole, so an allowed string is never split across two windows.
+        return scan(stream.read(), allowed)
     found = set()
     digest = hashlib.sha256()
     tail = b""
@@ -89,9 +135,9 @@ def scan_stream(stream, name: str = "") -> set[str]:
         digest.update(chunk)
         found.update(scan(tail + chunk))
         tail = chunk[-4096:]
-    expected, allowed = UPSTREAM_FINDINGS.get(name, ("", frozenset()))
+    expected, allowed_reasons = UPSTREAM_FINDINGS.get(name, ("", frozenset()))
     if digest.hexdigest() == expected:
-        found.difference_update(allowed)
+        found.difference_update(allowed_reasons)
     return found
 
 

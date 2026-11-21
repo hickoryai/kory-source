@@ -163,7 +163,7 @@ async def run_worker(
         )
         return 0
     in_process = source is not None
-    source = source.rstrip("/") if in_process else _source_url()
+    source = _source_url() if source is None else source.rstrip("/")
     if not source or not (in_process or os.environ.get(ENV_TOKEN)):
         logger.error("seat worker needs %s and %s", ENV_SOURCE_URL, ENV_TOKEN)
         return 2
