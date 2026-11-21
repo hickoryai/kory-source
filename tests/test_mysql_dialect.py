@@ -71,6 +71,13 @@ def test_connect_kwargs_defaults_and_errors():
         mysql.connect_kwargs("mysql://root@localhost/")
     with pytest.raises(ValueError, match="ssl_mode"):
         mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=SOMETIMES")
+    # PREFERRED would silently mean plaintext under PyMySQL.
+    with pytest.raises(ValueError, match="PREFERRED is not supported"):
+        mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=PREFERRED")
+    disabled = mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=DISABLED")
+    assert "ssl" not in disabled
+    with pytest.raises(ValueError, match="conflicts"):
+        mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=DISABLED&ssl_ca=/etc/ca.pem")
 
 
 @pytest.mark.parametrize("version", ["8.0.23", "8.0.44", "8.4.10", "9.1.0"])

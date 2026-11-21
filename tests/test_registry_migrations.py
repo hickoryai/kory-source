@@ -301,7 +301,9 @@ def test_mysql_migration_resumes_after_failing_at_any_statement(monkeypatch):
         expected = _mysql_schema(clean)
         clean.close()
     known = migrations.available()
-    cases = [(m, k) for m in known for k in range(1, len(m.statements()))]
+    # Up to and including every statement: the last crash point is "all DDL
+    # committed, ledger row not yet written".
+    cases = [(m, k) for m in known for k in range(1, len(m.statements()) + 1)]
     assert cases
     for mig, applied_count in cases:
         with fresh_database("mysql") as url:

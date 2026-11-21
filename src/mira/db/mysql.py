@@ -91,6 +91,8 @@ def connect_kwargs(url: str) -> dict[str, Any]:
     TLS: ``?ssl_ca=/path`` (verifies the server), optional ``ssl_cert`` and
     ``ssl_key`` for client certificates, ``ssl_mode=REQUIRED`` to encrypt
     without verifying, ``ssl_mode=VERIFY_IDENTITY`` to also check the host name.
+    Without any of these the connection is plaintext. ``PREFERRED`` is refused
+    because PyMySQL cannot fall back from TLS the way MySQL's clients do.
     """
     from pymysql.constants import CLIENT
 
@@ -121,12 +123,20 @@ def connect_kwargs(url: str) -> dict[str, Any]:
         if query.get(name):
             ssl[name.removeprefix("ssl_")] = query[name]
     mode = query.get("ssl_mode", "").upper()
-    if mode in ("REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY") or ssl:
-        kwargs["ssl"] = ssl or {}
+    if mode == "PREFERRED":
+        # MySQL's own clients fall back to plaintext when the server lacks TLS;
+        # PyMySQL cannot, so accepting this would silently mean "no TLS".
+        raise ValueError("ssl_mode=PREFERRED is not supported; use REQUIRED or VERIFY_IDENTITY")
+    if mode == "DISABLED":
+        if ssl:
+            raise ValueError("ssl_mode=DISABLED conflicts with ssl_ca, ssl_cert or ssl_key")
+        return kwargs
+    if mode not in ("", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"):
+        raise ValueError(f"unknown ssl_mode {mode!r}")
+    if mode or ssl:
+        kwargs["ssl"] = ssl
         kwargs["ssl_verify_cert"] = bool(ssl.get("ca")) or mode in ("VERIFY_CA", "VERIFY_IDENTITY")
         kwargs["ssl_verify_identity"] = mode == "VERIFY_IDENTITY"
-    elif mode not in ("", "DISABLED", "PREFERRED"):
-        raise ValueError(f"unknown ssl_mode {mode!r}")
     return kwargs
 
 
