@@ -28,6 +28,8 @@ from mira.platforms.handlers import (
     _RESUME_KEYWORDS,
     PAUSE_LABEL,
     _open_store,
+    clear_pause_labels,
+    is_pause_label,
     run_pr_command,
     run_pr_merged_learning,
     run_pr_review,
@@ -579,8 +581,8 @@ async def dispatch_github_event(
             logger.info("PR ignored via @%s ignore in description", bot_name)
             return "ignored"
         pr_labels = payload.get("pull_request", {}).get("labels", [])
-        if any(lbl.get("name") == PAUSE_LABEL for lbl in pr_labels):
-            logger.info("PR paused via %s label", PAUSE_LABEL)
+        if any(is_pause_label(lbl.get("name")) for lbl in pr_labels):
+            logger.info("PR paused via label")
             return "paused"
         background_tasks.add_task(handle_pull_request, payload, app_auth, bot_name)
         return "processing"
@@ -970,7 +972,7 @@ async def handle_pause_resume(
             )
             logger.info("Paused automatic reviews on PR %s/%s#%d", owner, repo, number)
         elif command in _RESUME_KEYWORDS:
-            await provider.remove_label(pr_info, PAUSE_LABEL)
+            await clear_pause_labels(provider, pr_info)
             await provider.post_comment(
                 pr_info,
                 "Automatic reviews resumed.",

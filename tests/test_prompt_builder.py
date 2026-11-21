@@ -42,7 +42,8 @@ class TestBuildReviewPrompt:
         config = MiraConfig()
         messages = build_review_prompt(files, config)
         system = messages[0]["content"]
-        assert "Mira" in system
+        assert "Kory Source" in system
+        assert "Mira" not in system
         assert "submit_review" in system
         assert "blocker" in system
 

@@ -107,7 +107,7 @@ def _split_repo_path(full_name: str) -> tuple[str, str]:
 
 async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """Review a pull request (open / reopen / new commits)."""
-    from mira.platforms.handlers import PAUSE_LABEL, run_pr_review
+    from mira.platforms.handlers import is_pause_label, run_pr_review
     from mira.platforms.index_handlers import _get_app_db
 
     action = payload.get("action", "")
@@ -138,8 +138,8 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
     pr_url = pr.get("html_url", "")
     is_private = repo.get("private", True)
 
-    # Same opt-outs as GitHub: `@mira ignore` in the description and the
-    # mira-paused label both skip auto-review.
+    # Same opt-outs as GitHub: `@bot ignore` in the description and a pause
+    # label both skip auto-review.
     names = mention_names(bot_name, await auth.get_bot_identity())
     description = pr.get("body", "") or ""
     if any(re.search(rf"@{re.escape(n)}[ \t]+ignore\b", description, re.IGNORECASE) for n in names):
@@ -148,8 +148,8 @@ async def handle_forgejo_pr(payload: dict[str, Any], auth: PlatformAuth, bot_nam
         )
         return
     labels = pr.get("labels") or []
-    if any((lbl.get("name") or lbl.get("title")) == PAUSE_LABEL for lbl in labels):
-        logger.info("PR %s/%s#%d paused via %s label", owner, repo_name, number, PAUSE_LABEL)
+    if any(is_pause_label(lbl.get("name") or lbl.get("title")) for lbl in labels):
+        logger.info("PR %s/%s#%d paused via label", owner, repo_name, number)
         return
 
     try:
@@ -239,6 +239,7 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
         _RESUME_KEYWORDS,
         PAUSE_LABEL,
         _open_store,
+        clear_pause_labels,
         run_pr_command,
         run_thread_reply,
     )
@@ -312,7 +313,7 @@ async def handle_forgejo_note(payload: dict[str, Any], auth: PlatformAuth, bot_n
                 user_id=actor_id,
             ):
                 return
-            await provider.remove_label(pr_info, PAUSE_LABEL)
+            await clear_pause_labels(provider, pr_info)
             await provider.post_comment(pr_info, "Automatic reviews resumed.")
             return
 

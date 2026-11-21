@@ -296,7 +296,7 @@ class TestReviewPrSummaryPostingGate:
         new_body = provider.update_pr_description.call_args.args[1]
         assert new_body.startswith(PR_SUMMARY_START)
         assert new_body.endswith(PR_SUMMARY_END)
-        assert "## Summary by Mira" in new_body
+        assert "## Summary by Kory Source" in new_body
         assert "Author description." not in new_body
 
     @pytest.mark.asyncio

@@ -395,7 +395,7 @@ class TestWalkthroughToMarkdown:
             ],
         )
         md = result.to_markdown()
-        assert "## Mira PR Walkthrough" in md
+        assert "## Kory Source PR Walkthrough" in md
         assert "Added new features." in md
         lines = md.split("\n")
         assert "---" in lines, "Expected separator '---' in markdown output"
@@ -471,7 +471,7 @@ class TestWalkthroughToMarkdown:
         result = WalkthroughResult(summary="Changes.")
         stats = {Severity.BLOCKER: 1, Severity.WARNING: 2}
         md = result.to_markdown(review_stats=stats, existing_issues=3)
-        assert "## Mira PR Walkthrough" in md
+        assert "## Kory Source PR Walkthrough" in md
 
     def test_clean_output_no_changes_table(self):
         """Walkthrough markdown does not include a changes table."""

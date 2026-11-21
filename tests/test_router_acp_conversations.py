@@ -109,7 +109,7 @@ async def test_later_steps_send_only_new_messages_on_one_kept_session():
         # Only the new turn: no system prompt, diff, or tool schemas again.
         assert "SYSTEM-RULES" not in later and "THE-DIFF" not in later
         assert "### `read_file`" not in later and "Arguments schema" not in later
-        assert later.startswith("Mira's next messages in this review follow")
+        assert later.startswith("Kory Source's next messages in this review follow")
         assert "## Required output" in later
     assert "### Message 3: assistant" in second and "RESULT-1" in second and "RESULT-2" in second
     assert "RESULT-1" not in third and "RESULT-3" in third and "### Message 6: assistant" in third

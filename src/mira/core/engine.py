@@ -47,7 +47,9 @@ from mira.llm.response_parser import (
 )
 from mira.models import (
     PR_SUMMARY_END,
+    PR_SUMMARY_HEADING,
     PR_SUMMARY_START,
+    WALKTHROUGH_HEADING,
     WALKTHROUGH_MARKER,
     FileChangeType,
     KeyIssue,
@@ -452,7 +454,7 @@ class ReviewEngine:
         """
         if not self.provider:
             return None
-        placeholder = f"{WALKTHROUGH_MARKER}\n## Mira PR Walkthrough\n\n*🔍 Reviewing this PR…*\n"
+        placeholder = f"{WALKTHROUGH_MARKER}\n{WALKTHROUGH_HEADING}\n\n*🔍 Reviewing this PR…*\n"
         existing_id = await self.provider.find_bot_comment(pr_info, WALKTHROUGH_MARKER)
         if existing_id is not None:
             await self.provider.update_comment(pr_info, existing_id, placeholder)
@@ -761,7 +763,7 @@ class ReviewEngine:
                     else:
                         failure_body = (
                             f"{WALKTHROUGH_MARKER}\n"
-                            "## Mira PR Walkthrough\n\n"
+                            f"{WALKTHROUGH_HEADING}\n\n"
                             "---\n\n"
                             "<details>\n"
                             "<summary><b>❌ Review failed</b> — click for details</summary>\n\n"
@@ -897,7 +899,7 @@ class ReviewEngine:
             # failed) — finalize the placeholder so it doesn't sit on
             # "Reviewing this PR…" forever.
             reason = result.skipped_reason or "Walkthrough was not generated."
-            markdown = f"{WALKTHROUGH_MARKER}\n## Mira PR Walkthrough\n\n*{reason}*\n"
+            markdown = f"{WALKTHROUGH_MARKER}\n{WALKTHROUGH_HEADING}\n\n*{reason}*\n"
             try:
                 await self.provider.update_comment(pr_info, placeholder_id, markdown)
             except Exception as exc:
@@ -910,7 +912,7 @@ class ReviewEngine:
         ):
             try:
                 block = (
-                    f"{PR_SUMMARY_START}\n## Summary by Mira\n\n"
+                    f"{PR_SUMMARY_START}\n{PR_SUMMARY_HEADING}\n\n"
                     f"{result.pr_summary_block}\n{PR_SUMMARY_END}"
                 )
                 current_body = await self.provider.get_pr_description(pr_info)

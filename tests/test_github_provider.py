@@ -384,7 +384,7 @@ class TestPostReviewGracefulDegradation:
         # Summary-only call is the last /reviews call and has comments=[].
         final = review_calls[-1]
         assert final.get("comments") == []
-        assert "Mira Review Summary" in final.get("body", "")
+        assert "Kory Source Review Summary" in final.get("body", "")
 
     @pytest.mark.asyncio
     async def test_partial_individual_success(self):
@@ -480,7 +480,7 @@ class TestFormatCommentBody:
         body = _format_comment_body(self._make_comment(suggestion="return json.loads(f.read())"))
         assert "```suggestion" in body
         assert "return json.loads(f.read())" in body
-        assert "```\n\n>" in body
+        assert "Apply the fix at `src/foo.py:10`" in body
 
     def test_blocker_badge(self):
         body = _format_comment_body(self._make_comment(severity=Severity.BLOCKER))
@@ -520,14 +520,14 @@ class TestFormatCommentBodyAgentPrompt:
             self._make_comment(agent_prompt="In src/foo.py at line 10, replace foo() with bar().")
         )
         assert "<details>" in body
-        assert "Prompt for AI Agents" in body
+        assert "Fix instructions" in body
         assert "</details>" in body
         assert "In src/foo.py at line 10, replace foo() with bar()." in body
 
     def test_without_agent_prompt(self):
         body = _format_comment_body(self._make_comment(agent_prompt=None))
         assert "<details>" not in body
-        assert "Prompt for AI Agents" not in body
+        assert "Fix instructions" not in body
 
     def test_agent_prompt_after_suggestion(self):
         body = _format_comment_body(
@@ -1280,11 +1280,11 @@ class TestFormatCommentBodyDismissHint:
 
     def test_default_bot_name(self):
         body = _format_comment_body(self._make_comment())
-        assert "> Not useful? Reply `@miracodeai reject` to dismiss this suggestion." in body
+        assert "reply `@miracodeai reject` on this comment." in body
 
     def test_custom_bot_name(self):
         body = _format_comment_body(self._make_comment(), bot_name="mybot")
-        assert "> Not useful? Reply `@mybot reject` to dismiss this suggestion." in body
+        assert "reply `@mybot reject` on this comment." in body
 
 
 class TestAddLabel:

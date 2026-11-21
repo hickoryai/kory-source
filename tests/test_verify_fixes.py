@@ -56,6 +56,32 @@ class TestExtractIssueDescription:
         result = _extract_issue_description("Hardcoded API key.")
         assert result == "Hardcoded API key."
 
+    def test_keeps_human_attention_and_strips_new_fix_block(self):
+        body = (
+            "HUMAN ATTENTION: ask which status code to return\n"
+            "\n"
+            "**Bug**  \n"
+            "\u26a0\ufe0f Warning\n"
+            "\n"
+            "**Reject a null id**\n"
+            "\n"
+            "Fix `src/app.py:12`.\n"
+            "\n"
+            "Return 400 when the id is null.\n"
+            "\n"
+            "<details>\n"
+            "<summary>Fix instructions</summary>\n"
+            "\n"
+            "secret prompt\n"
+            "</details>"
+        )
+        result = _extract_issue_description(body)
+        assert result.startswith("HUMAN ATTENTION:")
+        assert "Reject a null id" in result
+        assert "Return 400" in result
+        assert "secret prompt" not in result
+        assert "Warning" not in result
+
     def test_strips_badges_and_suggestion_from_formatted_body(self):
         result = _extract_issue_description(_FORMATTED_BODY)
         # Should contain the title and explanation

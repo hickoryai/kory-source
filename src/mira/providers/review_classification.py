@@ -22,13 +22,23 @@ def normalize_login(login: str) -> str:
     return _BOT_SUFFIX.sub("", login.strip()).casefold()
 
 
-def is_own_review(author: str, bot_login: str) -> bool:
-    """Whether ``author`` is Mira itself or the configured posting identity."""
+# Current posting identity and the login used on reviews already posted.
+_OWN_LOGINS = ("kory-source", "miracodeai")
+
+
+def is_own_review(author: str, bot_login: str = "", *extra_logins: str) -> bool:
+    """Whether ``author`` is this reviewer.
+
+    Matches the configured posting identity, ``kory-source``, and reviews
+    already posted under the old ``miracodeai`` login. Extra logins cover a
+    provider that knows both the app slug and the configured bot name.
+    """
     normalized = normalize_login(author)
-    return bool(normalized) and normalized in {
-        normalize_login("kory-source"),
-        normalize_login(bot_login),
-    }
+    known = {normalize_login(name) for name in _OWN_LOGINS}
+    for name in (bot_login, *extra_logins):
+        if name:
+            known.add(normalize_login(name))
+    return bool(normalized) and normalized in known
 
 
 def classify_review_comment(

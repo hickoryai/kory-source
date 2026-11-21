@@ -15,19 +15,43 @@ _MAX_FULL_FILE_LINES = 500
 _LARGE_FILE_CONTEXT_LINES = 50  # ±50 lines = 100-line window
 
 
+# Category labels the formatter bolds on their own line. Older comments put an
+# emoji in front of that line; current comments do not. Skip either form.
+_CATEGORY_LABELS = {
+    "Bug",
+    "Security issue",
+    "Performance",
+    "Error Handling",
+    "Race Condition",
+    "Resource Leak",
+    "Refactor suggestion",
+    "Style",
+    "Clarity",
+    "Configuration",
+    "Note",
+}
+_BADGE_PREFIXES = ("⚠️", "🐛", "💡", "🔒", "⚡", "🛑", "🔵", "🟡", "🟠", "🔴", "HUMAN ATTENTION:")
+
+
 def short_thread_description(body: str) -> str:
     """One-line description of a bot review comment for 'already addressed' context.
 
-    Strips badge/category lines and returns the first bold title; falls back
-    to the first non-empty line.
+    Skips the category badge, a ``HUMAN ATTENTION:`` tag, and the ``Fix
+    `path:line`.` line. Returns the bold title. Falls back to the first
+    remaining line. Recognizes comments posted before the wording change.
     """
     body = body or ""
     for line in body.splitlines():
         s = line.strip()
-        if not s or s.startswith(("⚠️", "🐛", "💡", "🔒", "⚡", "🛑", "🔵", "🟡", "🟠", "🔴")):
+        if not s or s.startswith(_BADGE_PREFIXES):
+            continue
+        if s.startswith("Fix `") and "`" in s[5:]:
             continue
         if s.startswith("**") and s.endswith("**") and len(s) > 4:
-            return s.strip("* ")[:160]
+            title = s.strip("* ").strip()
+            if title in _CATEGORY_LABELS:
+                continue
+            return title[:160]
         return s[:160]
     return ""
 

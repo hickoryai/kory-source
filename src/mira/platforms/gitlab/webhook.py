@@ -87,7 +87,7 @@ def _split_project_path(path_with_namespace: str) -> tuple[str, str]:
 
 async def handle_merge_request(payload: dict[str, Any], auth: PlatformAuth, bot_name: str) -> None:
     """Review a merge request (open / reopen / new commits)."""
-    from mira.platforms.handlers import PAUSE_LABEL, run_pr_review
+    from mira.platforms.handlers import is_pause_label, run_pr_review
     from mira.platforms.index_handlers import _get_app_db
 
     attrs = payload.get("object_attributes", {})
@@ -97,16 +97,16 @@ async def handle_merge_request(payload: dict[str, Any], auth: PlatformAuth, bot_
     mr_url = attrs.get("url") or f"{project.get('web_url', '')}/-/merge_requests/{iid}"
     is_private = project.get("visibility", "private") != "public"
 
-    # Same opt-outs as GitHub: `@mira ignore` in the description and the
-    # mira-paused label both skip auto-review.
+    # Same opt-outs as GitHub: `@bot ignore` in the description and a pause
+    # label both skip auto-review.
     names = mention_names(bot_name, await auth.get_bot_identity())
     description = attrs.get("description", "") or ""
     if any(re.search(rf"@{re.escape(n)}[ \t]+ignore\b", description, re.IGNORECASE) for n in names):
         logger.info("MR %s/%s!%s ignored via @%s ignore in description", owner, repo, iid, bot_name)
         return
     labels = payload.get("labels") or attrs.get("labels") or []
-    if any((lbl.get("title") or lbl.get("name")) == PAUSE_LABEL for lbl in labels):
-        logger.info("MR %s/%s!%s paused via %s label", owner, repo, iid, PAUSE_LABEL)
+    if any(is_pause_label(lbl.get("title") or lbl.get("name")) for lbl in labels):
+        logger.info("MR %s/%s!%s paused via label", owner, repo, iid)
         return
 
     try:
@@ -196,6 +196,7 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
         _RESUME_KEYWORDS,
         PAUSE_LABEL,
         _open_store,
+        clear_pause_labels,
         run_pr_command,
         run_thread_reply,
     )
@@ -251,7 +252,7 @@ async def handle_gitlab_note(payload: dict[str, Any], auth: PlatformAuth, bot_na
                 user_id=actor_id,
             ):
                 return
-            await provider.remove_label(pr_info, PAUSE_LABEL)
+            await clear_pause_labels(provider, pr_info)
             await provider.post_comment(pr_info, "Automatic reviews resumed.")
             return
 

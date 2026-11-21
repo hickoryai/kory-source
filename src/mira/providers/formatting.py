@@ -13,6 +13,11 @@ import re
 
 from mira.models import KeyIssue, ReviewComment, Severity
 
+# Heading on the review summary comment. Older posts used the legacy heading;
+# callers that recognize a summary must accept both.
+REVIEW_SUMMARY_HEADING = "**Kory Source Review Summary**"
+LEGACY_REVIEW_SUMMARY_HEADINGS = ("**Mira Review Summary**",)
+
 _CATEGORY_DISPLAY: dict[str, tuple[str, str]] = {
     "bug": ("\U0001f41b", "Bug"),
     "security": ("\U0001f512", "Security issue"),
@@ -110,14 +115,26 @@ def parse_bot_comment_metadata(body: str) -> dict[str, str]:
     return {"category": category, "severity": severity, "title": title}
 
 
+def is_review_summary_body(body: str) -> bool:
+    """True when ``body`` is a current or previously posted review summary."""
+    text = body or ""
+    return any(
+        heading in text for heading in (REVIEW_SUMMARY_HEADING, *LEGACY_REVIEW_SUMMARY_HEADINGS)
+    )
+
+
 def format_key_issues(key_issues: list[KeyIssue]) -> str:
-    """Format key issues as a markdown table for the review body."""
+    """Format key issues as fix instructions for the agent reading the review."""
     lines = [
         "",
         "",
         "### Key Issues",
         "",
-        "| | Issue | Location |",
+        "Handle each row before the other findings. The location is the file and line to change. "
+        "A fix that starts with `HUMAN ATTENTION:` needs a human decision: tell the human, "
+        "and do not edit that code until the human answers.",
+        "",
+        "| | Fix | Location |",
         "|---|---|---|",
     ]
     for ki in key_issues:
@@ -156,21 +173,71 @@ def _close_open_fences(parts: list[str]) -> None:
         parts.append("```")
 
 
+def _location(comment: ReviewComment) -> str:
+    if comment.end_line and comment.end_line > comment.line:
+        return f"{comment.path}:{comment.line}-{comment.end_line}"
+    return f"{comment.path}:{comment.line}"
+
+
+_HUMAN_ATTENTION_LINE = re.compile(r"^HUMAN ATTENTION:\s*(.*)$", re.IGNORECASE)
+
+
+def _hoist_human_attention(*texts: str) -> tuple[str, list[str]]:
+    """Move the first ``HUMAN ATTENTION:`` line to the top of the comment.
+
+    A duplicate tag is dropped. Text after the tag on a duplicate line stays,
+    so the instruction is not lost.
+    """
+    attention = ""
+    cleaned: list[str] = []
+    for text in texts:
+        kept: list[str] = []
+        for line in (text or "").split("\n"):
+            match = _HUMAN_ATTENTION_LINE.match(line.strip())
+            if match and not attention:
+                rest = match.group(1).strip()
+                attention = "HUMAN ATTENTION:" + (f" {rest}" if rest else "")
+                continue
+            if match and attention:
+                rest = match.group(1).strip()
+                if rest:
+                    kept.append(rest)
+                continue
+            kept.append(line)
+        cleaned.append("\n".join(kept).strip())
+    return attention, cleaned
+
+
 def format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") -> str:
-    """Format a review comment body with category badge, severity, and suggestion block."""
+    """Format a review comment as fix instructions for the agent that will edit the PR.
+
+    Category, severity, and title stay on the lines parsers already read.
+    ``HUMAN ATTENTION:`` is hoisted to the first line when the finding needs a
+    human decision. The bot login in the reject line is the posting identity.
+    """
     label = _CATEGORY_DISPLAY.get(comment.category, ("\U0001f4cc", "Note"))[1]
     badge = _SEVERITY_BADGE.get(comment.severity, "")
+    attention, cleaned = _hoist_human_attention(comment.body or "", comment.agent_prompt or "")
+    body_text = cleaned[0]
+    prompt_text = cleaned[1]
 
     # Two trailing spaces = a Markdown hard break. GitHub renders a bare
     # newline as a break but GitLab doesn't, so the category and severity
     # would otherwise run together on one line on GitLab.
-    parts = [f"**{label}**" + ("  " if badge else "")]
+    parts: list[str] = []
+    if attention:
+        parts.append(attention)
+        parts.append("")
+    parts.append(f"**{label}**" + ("  " if badge else ""))
     if badge:
         parts.append(badge)
     parts.append("")
     parts.append(f"**{comment.title}**")
     parts.append("")
-    parts.append(comment.body)
+    parts.append(f"Fix `{_location(comment)}`.")
+    if body_text:
+        parts.append("")
+        parts.append(body_text)
 
     if comment.suggestion:
         clean_suggestion = html.unescape(comment.suggestion)
@@ -182,8 +249,7 @@ def format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") ->
         parts.append(clean_suggestion)
         parts.append("```")
 
-    if comment.agent_prompt:
-        prompt_text = comment.agent_prompt
+    if prompt_text:
         if comment.suggestion:
             prompt_text += f"\n\nApply this code change:\n\n{html.unescape(comment.suggestion)}"
 
@@ -203,7 +269,7 @@ def format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") ->
         parts.append("")
         parts.append(
             "<details>\n"
-            "<summary>Prompt for AI Agents</summary>\n"
+            "<summary>Fix instructions</summary>\n"
             "\n"
             f"{fence}\n{prompt_text}\n{fence}\n"
             "\n"
@@ -211,6 +277,9 @@ def format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") ->
         )
 
     parts.append("")
-    parts.append(f"> Not useful? Reply `@{bot_name} reject` to dismiss this suggestion.")
+    parts.append(
+        f"Apply the fix at `{_location(comment)}` unless a human has rejected it. "
+        f"To reject it, reply `@{bot_name} reject` on this comment."
+    )
 
     return "\n".join(parts)

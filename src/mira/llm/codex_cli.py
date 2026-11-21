@@ -193,11 +193,12 @@ class CodexCLIProvider:
 
     def _messages_prompt(self, messages: list[dict]) -> str:
         parts = [
-            "You are running as Mira's model backend through Codex CLI.",
-            "Follow the Mira review instructions exactly. Do not mention Codex CLI.",
+            "You are running as Kory Source's model backend through Codex CLI.",
+            "Follow the Kory Source review instructions exactly. Do not mention Codex CLI.",
+            "Refer to yourself only as Kory Source.",
             "Return only the requested final answer; no prose wrappers unless explicitly requested.",
             "",
-            "## Mira messages",
+            "## Kory Source messages",
         ]
         for i, message in enumerate(messages, 1):
             role = message.get("role", "user")
