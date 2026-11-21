@@ -187,11 +187,12 @@ async def test_inline_mention_routes_to_thread_reply(gitlab_auth):
 
 
 @pytest.mark.asyncio
-async def test_paused_label_skips_review(gitlab_auth):
+@pytest.mark.parametrize("label", ["kory-source-paused", "mira-paused"])
+async def test_paused_label_skips_review(gitlab_auth, label):
     from mira.platforms.gitlab import webhook as gw
 
     payload = _mr_payload(action="open")
-    payload["labels"] = [{"title": "mira-paused"}]
+    payload["labels"] = [{"title": label}]
     with patch("mira.platforms.handlers.run_pr_review", new=AsyncMock()) as rpr:
         await gw.handle_merge_request(payload, gitlab_auth, "mira-bot")
     rpr.assert_not_called()

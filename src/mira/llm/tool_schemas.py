@@ -47,10 +47,20 @@ SUBMIT_REVIEW_TOOL = {
                                     "other",
                                 ],
                             },
-                            "title": {"type": "string", "description": "Short title (<80 chars)."},
+                            "title": {
+                                "type": "string",
+                                "description": "Short imperative title (<80 chars).",
+                            },
                             "body": {
                                 "type": "string",
-                                "description": "Detailed explanation of the issue. Use single backticks for inline code references. Do NOT use triple-backtick code blocks.",
+                                "description": (
+                                    "Imperative fix instructions for the LLM that will apply them. "
+                                    "Name the file and line, the expected behavior, and one way to "
+                                    "verify. No courtesy prose. No triple-backtick fences. If a "
+                                    "human must decide (product behavior, a risky migration, "
+                                    "security policy, or ambiguous intent), start with a line "
+                                    "'HUMAN ATTENTION:'."
+                                ),
                             },
                             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                             "existing_code": {
@@ -63,7 +73,11 @@ SUBMIT_REVIEW_TOOL = {
                             },
                             "agent_prompt": {
                                 "type": ["string", "null"],
-                                "description": "Concise imperative instruction for AI coding agents.",
+                                "description": (
+                                    "The same fix as one plain-text paragraph: file, line, "
+                                    "expected behavior, and how to verify. Start with "
+                                    "'HUMAN ATTENTION:' when a human must decide."
+                                ),
                             },
                         },
                         "required": [
@@ -80,7 +94,10 @@ SUBMIT_REVIEW_TOOL = {
                 },
                 "key_issues": {
                     "type": "array",
-                    "description": "1-3 most critical findings a human reviewer MUST examine.",
+                    "description": (
+                        "1-3 most critical findings the fixing agent must handle first. "
+                        "Imperative text. Start with 'HUMAN ATTENTION:' when a human must decide."
+                    ),
                     "items": {
                         "type": "object",
                         "properties": {
@@ -93,7 +110,10 @@ SUBMIT_REVIEW_TOOL = {
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Brief overall summary of the review.",
+                    "description": (
+                        "Instructions for the fixing agent covering only the filed findings. "
+                        "Name files. No courtesy. Mark HUMAN ATTENTION findings."
+                    ),
                 },
                 "metadata": {
                     "type": "object",
@@ -187,9 +207,13 @@ SUBMIT_THREAD_REPLY_TOOL = {
                 "reply": {
                     "type": "string",
                     "description": (
-                        "Your reply, 1-2 short sentences, plain text, no markdown. "
-                        'No emojis, no apologies, no "as an AI". For disagreement, '
-                        "concede gracefully. For questions, answer directly."
+                        "Instruction for the LLM that will act, 1-2 short sentences, "
+                        "plain text, no markdown. No emojis, no apologies, no greetings, "
+                        'no "as an AI". Refer to yourself only as Kory Source. '
+                        "Disagreement: tell the agent to drop the finding. "
+                        "Question: state the fact and the next action. "
+                        "Agreement: tell the agent to apply the fix. "
+                        "If a human must decide, start with 'HUMAN ATTENTION:'."
                     ),
                 },
             },

@@ -79,7 +79,7 @@ class TestFormatText:
         wt = WalkthroughResult(summary="PR adds helpers.")
         result = _make_result(walkthrough=wt)
         text = _format_text(result)
-        assert "## Mira PR Walkthrough" in text
+        assert "## Kory Source PR Walkthrough" in text
         assert "---" in text
         assert "PR adds helpers." in text
 

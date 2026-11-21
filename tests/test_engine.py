@@ -706,7 +706,7 @@ class TestReviewEngine:
         bodies = [c[0][1] for c in mock_provider.post_comment.call_args_list]
         bodies.extend(c[0][2] for c in mock_provider.update_comment.call_args_list)
         combined = "\n".join(bodies)
-        assert "## Mira PR Walkthrough" in combined
+        assert "## Kory Source PR Walkthrough" in combined
         assert "PR walkthrough summary." in combined
 
     @pytest.mark.asyncio
@@ -1237,6 +1237,23 @@ class TestShortThreadDescription:
 
         body = "🐛 **Bug**\n⚠️ Warning\n\n**Resource leak in handler**\n\nLong body text."
         assert _short_thread_description(body) == "Resource leak in handler"
+
+    def test_current_format_skips_category_and_fix_line(self):
+        from mira.core.threads import short_thread_description as _short_thread_description
+
+        body = (
+            "HUMAN ATTENTION: ask which status to return\n"
+            "\n"
+            "**Bug**  \n"
+            "⚠️ Warning\n"
+            "\n"
+            "**Reject a null id**\n"
+            "\n"
+            "Fix `src/app.py:12`.\n"
+            "\n"
+            "Return 400 when the id is null.\n"
+        )
+        assert _short_thread_description(body) == "Reject a null id"
 
     def test_skips_badge_lines(self):
         from mira.core.threads import short_thread_description as _short_thread_description
