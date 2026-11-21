@@ -75,7 +75,9 @@ _CODEX = (
     b"HickoryDns",
     b"rama_dns::hickory",
     b"/src/hickory.rs",
-    b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKEN",
+    # The whole match, up to the next non-token byte, in each Codex binary.
+    b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKENevent",
+    b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKENsk",
 )
 _CODEX_BIN = "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/"
 _CODEX_HOMES = (
@@ -101,14 +103,15 @@ UPSTREAM_STRINGS = {
 
 
 def _outside_allowed(data: bytes, pattern: re.Pattern, allowed: tuple[bytes, ...]) -> bool:
-    """True when a match is not inside one of the allowed strings."""
+    """True when a match is not entirely inside one of the allowed strings."""
     for match in pattern.finditer(data):
         covered = False
         for literal in allowed:
             # Every place the match could sit inside this literal.
             for inner in pattern.finditer(literal):
                 start = match.start() - inner.start()
-                if start >= 0 and data[start : start + len(literal)] == literal:
+                end = start + len(literal)
+                if start >= 0 and match.end() <= end and data[start:end] == literal:
                     covered = True
                     break
             if covered:

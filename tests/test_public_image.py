@@ -401,6 +401,10 @@ def test_bundled_agent_may_carry_only_its_reviewed_strings(tmp_path):
     assert findings({codex: names + b" " + token}) == {(codex, "credential")}
     assert findings({node: base64 + b" AKIAQQQQQQQQQQQQQQQQ"}) == {(node, "credential")}
     assert findings({codex: b"ghp_" + b"a1B2" * 10}) == {(codex, "credential")}
+    # A token joined to a reviewed string is not covered by it.
+    assert findings({codex: names + variables + b"11" + b"A" * 40}) == {(codex, "credential")}
+    joined = b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKEN11" + b"A" * 40
+    assert findings({codex: joined + b" " + variables}) == {(codex, "credential")}
     # So does any other use of the name, and every other pattern.
     for extra in (b"hickory.example", b"hickory-proto-internal", b"Hickory AI"):
         assert findings({codex: names + extra}) == {(codex, "organization-reference")}, extra
