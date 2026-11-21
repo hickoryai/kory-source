@@ -401,6 +401,17 @@ def test_bundled_agent_may_carry_only_its_reviewed_strings(tmp_path):
     assert findings({codex: names + b" " + token}) == {(codex, "credential")}
     assert findings({node: base64 + b" AKIAQQQQQQQQQQQQQQQQ"}) == {(node, "credential")}
     assert findings({codex: b"ghp_" + b"a1B2" * 10}) == {(codex, "credential")}
+    # Each reviewed suffix passes when a non-token byte ends the run. Any
+    # other token byte after the prefix, or after a suffix, fails.
+    from scripts.audit_public_image import CODEX_TOKEN_PREFIX, CODEX_TOKEN_SUFFIXES
+
+    for suffix in CODEX_TOKEN_SUFFIXES:
+        for end in (b"\x00", b" ", b"-"):
+            assert findings({codex: CODEX_TOKEN_PREFIX + suffix + end}) == set(), suffix
+        assert findings({codex: CODEX_TOKEN_PREFIX + suffix + b"_stream"}) == {
+            (codex, "credential")
+        }
+    assert findings({codex: CODEX_TOKEN_PREFIX + b"other\x00"}) == {(codex, "credential")}
     # A token joined to a reviewed string is not covered by it.
     assert findings({codex: names + variables + b"11" + b"A" * 40}) == {(codex, "credential")}
     joined = b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKEN11" + b"A" * 40

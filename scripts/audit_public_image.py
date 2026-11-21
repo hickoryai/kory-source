@@ -66,6 +66,12 @@ UPSTREAM_FINDINGS = {
 # cannot be pinned the way UPSTREAM_FINDINGS pins a package file. Any other
 # match in these files still fails, and so does the same string anywhere else.
 _DNS_LIBRARY = (b"hickory-dns",)
+# Codex stores a token prefix followed by environment-variable names. The
+# credential match runs on into whatever token bytes the linker places next,
+# so each reviewed suffix is listed. A Codex release that changes these bytes
+# fails the audit by design, and the new suffix needs a reviewed addition here.
+CODEX_TOKEN_PREFIX = b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKEN"
+CODEX_TOKEN_SUFFIXES = (b"event", b"sk")
 _CODEX = (
     *_DNS_LIBRARY,
     b"hickory-proto-0.",
@@ -75,9 +81,7 @@ _CODEX = (
     b"HickoryDns",
     b"rama_dns::hickory",
     b"/src/hickory.rs",
-    # The whole match, up to the next non-token byte, in each Codex binary.
-    b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKENevent",
-    b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKENsk",
+    *(CODEX_TOKEN_PREFIX + suffix for suffix in CODEX_TOKEN_SUFFIXES),
 )
 _CODEX_BIN = "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/"
 _CODEX_HOMES = (
