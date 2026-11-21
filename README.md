@@ -267,10 +267,10 @@ Without `DATABASE_URL`, Kory Source keeps its data in SQLite files under
 - PostgreSQL: `postgresql://user:password@host:5432/dbname`
 - MySQL 8.0.23 or newer (8.0 and 8.4 LTS are tested):
   `mysql://user:password@host:3306/dbname`. `mysql+pymysql://` is accepted too.
-  **Without TLS parameters the connection may be plaintext:** credentials and
-  data can cross the network unencrypted. Recent PyMySQL releases try TLS when
-  the server offers it, older ones never do, and neither requires it. Add
-  `?ssl_ca=/path/to/ca.pem` to require TLS and verify the server certificate,
+  **Without TLS parameters, treat the connection as plaintext:** Kory Source
+  does not require encryption, so credentials and data can cross the network
+  unencrypted. Add `?ssl_ca=/path/to/ca.pem` to require TLS and verify the
+  server certificate,
   `?ssl_mode=VERIFY_IDENTITY`
   to also check the host name, or `?ssl_mode=REQUIRED` to require encryption
   without verifying. `ssl_cert` and `ssl_key` add a client certificate. With
