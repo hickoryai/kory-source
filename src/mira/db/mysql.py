@@ -88,11 +88,8 @@ class UnsupportedSQL(ValueError):
 def connect_kwargs(url: str) -> dict[str, Any]:
     """PyMySQL keyword arguments for ``mysql://`` or ``mysql+pymysql://`` URLs.
 
-    TLS: ``?ssl_ca=/path`` (verifies the server), optional ``ssl_cert`` and
-    ``ssl_key`` for client certificates, ``ssl_mode=REQUIRED`` to encrypt
-    without verifying, ``ssl_mode=VERIFY_IDENTITY`` to also check the host name.
-    Without any of these the connection is plaintext. ``PREFERRED`` is refused
-    because PyMySQL cannot fall back from TLS the way MySQL's clients do.
+    TLS parameters are described in :func:`tls_settings`. Certificate files
+    are read here, so they must exist.
     """
     from pymysql.constants import CLIENT
 
@@ -118,26 +115,78 @@ def connect_kwargs(url: str) -> dict[str, Any]:
     }
     if "connect_timeout" in query:
         kwargs["connect_timeout"] = int(query["connect_timeout"])
-    ssl: dict[str, Any] = {}
-    for name in ("ssl_ca", "ssl_cert", "ssl_key"):
-        if query.get(name):
-            ssl[name.removeprefix("ssl_")] = query[name]
+    tls = tls_settings(query)
+    if tls is DISABLED:
+        kwargs["ssl_disabled"] = True
+    elif isinstance(tls, TLS):
+        # A ready SSLContext is used as given. PyMySQL otherwise rebuilds its
+        # TLS settings from separate arguments and can drop the CA, the client
+        # certificate, or the requirement to encrypt at all.
+        kwargs["ssl"] = tls.context()
+    return kwargs
+
+
+@dataclass(frozen=True)
+class TLS:
+    """TLS the connection must use. Without it the driver's default applies."""
+
+    ca: str | None = None
+    cert: str | None = None
+    key: str | None = None
+    verify_cert: bool = False
+    verify_identity: bool = False
+
+    def context(self) -> Any:
+        import ssl
+
+        ctx = ssl.create_default_context(cafile=self.ca)
+        # Python 3.13 enables strict X.509 checks that MySQL's auto-generated
+        # self-signed certificates fail; the CA and host checks below remain.
+        ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+        ctx.check_hostname = self.verify_identity
+        ctx.verify_mode = ssl.CERT_REQUIRED if self.verify_cert else ssl.CERT_NONE
+        if self.cert:
+            ctx.load_cert_chain(self.cert, keyfile=self.key)
+        return ctx
+
+
+DISABLED = "disabled"
+
+
+def tls_settings(query: dict[str, str]) -> TLS | str | None:
+    """TLS requirement from URL query parameters.
+
+    ``ssl_ca`` verifies the server certificate against that CA. ``ssl_cert`` and
+    ``ssl_key`` present a client certificate. ``ssl_mode=REQUIRED`` encrypts
+    (and verifies only when ``ssl_ca`` is given), ``VERIFY_CA`` verifies
+    against ``ssl_ca`` or the system trust store, ``VERIFY_IDENTITY`` also
+    checks the host name, ``DISABLED`` turns TLS off. Any of these makes TLS
+    mandatory: the connection fails rather than continuing in plaintext.
+    With none of them, TLS is not required.
+    """
+    ca, cert, key = (query.get(f"ssl_{name}") or None for name in ("ca", "cert", "key"))
     mode = query.get("ssl_mode", "").upper()
     if mode == "PREFERRED":
         # MySQL's own clients fall back to plaintext when the server lacks TLS;
-        # PyMySQL cannot, so accepting this would silently mean "no TLS".
+        # a URL that asks for TLS here must get it, so this mode is refused.
         raise ValueError("ssl_mode=PREFERRED is not supported; use REQUIRED or VERIFY_IDENTITY")
     if mode == "DISABLED":
-        if ssl:
+        if ca or cert or key:
             raise ValueError("ssl_mode=DISABLED conflicts with ssl_ca, ssl_cert or ssl_key")
-        return kwargs
+        return DISABLED
     if mode not in ("", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"):
         raise ValueError(f"unknown ssl_mode {mode!r}")
-    if mode or ssl:
-        kwargs["ssl"] = ssl
-        kwargs["ssl_verify_cert"] = bool(ssl.get("ca")) or mode in ("VERIFY_CA", "VERIFY_IDENTITY")
-        kwargs["ssl_verify_identity"] = mode == "VERIFY_IDENTITY"
-    return kwargs
+    if key and not cert:
+        raise ValueError("ssl_key needs ssl_cert")
+    if not (mode or ca or cert):
+        return None
+    return TLS(
+        ca=ca,
+        cert=cert,
+        key=key,
+        verify_cert=bool(ca) or mode in ("VERIFY_CA", "VERIFY_IDENTITY"),
+        verify_identity=mode == "VERIFY_IDENTITY",
+    )
 
 
 def connect(url: str) -> MySQLConnection:

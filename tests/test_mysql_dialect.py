@@ -40,11 +40,10 @@ def test_backend_from_url(url, expected):
     assert is_server(url) is (expected != "sqlite")
 
 
-def test_connect_kwargs_parse_credentials_database_and_tls():
+def test_connect_kwargs_parse_credentials_and_database():
     pytest.importorskip("pymysql")
     kwargs = mysql.connect_kwargs(
-        "mysql+pymysql://app%40svc:p%3Ass@db.example.test:3307/kory_source"
-        "?ssl_ca=/etc/ca.pem&ssl-mode=VERIFY_IDENTITY&connect_timeout=5"
+        "mysql+pymysql://app%40svc:p%3Ass@db.example.test:3307/kory_source?connect_timeout=5"
     )
     assert kwargs["host"] == "db.example.test"
     assert kwargs["port"] == 3307
@@ -52,32 +51,144 @@ def test_connect_kwargs_parse_credentials_database_and_tls():
     assert kwargs["password"] == "p:ss"
     assert kwargs["database"] == "kory_source"
     assert kwargs["connect_timeout"] == 5
-    assert kwargs["ssl"] == {"ca": "/etc/ca.pem"}
-    assert kwargs["ssl_verify_cert"] is True
-    assert kwargs["ssl_verify_identity"] is True
     assert kwargs["autocommit"] is True
     assert kwargs["collation"] == "utf8mb4_0900_bin"
-
-
-def test_connect_kwargs_defaults_and_errors():
-    pytest.importorskip("pymysql")
-    kwargs = mysql.connect_kwargs("mysql://root@localhost/db")
-    assert kwargs["port"] == 3306
-    assert "ssl" not in kwargs
-    required = mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=REQUIRED")
-    assert required["ssl"] == {}
-    assert required["ssl_verify_cert"] is False
+    assert "ssl" not in kwargs  # no TLS parameters: the driver default applies
     with pytest.raises(ValueError, match="name a database"):
         mysql.connect_kwargs("mysql://root@localhost/")
-    with pytest.raises(ValueError, match="ssl_mode"):
-        mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=SOMETIMES")
-    # PREFERRED would silently mean plaintext under PyMySQL.
-    with pytest.raises(ValueError, match="PREFERRED is not supported"):
-        mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=PREFERRED")
-    disabled = mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=DISABLED")
-    assert "ssl" not in disabled
-    with pytest.raises(ValueError, match="conflicts"):
-        mysql.connect_kwargs("mysql://root@localhost/db?ssl_mode=DISABLED&ssl_ca=/etc/ca.pem")
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ({}, None),
+        ({"ssl_mode": "REQUIRED"}, mysql.TLS()),
+        ({"ssl_mode": "required", "ssl_ca": "/ca"}, mysql.TLS(ca="/ca", verify_cert=True)),
+        ({"ssl_ca": "/ca"}, mysql.TLS(ca="/ca", verify_cert=True)),
+        ({"ssl_mode": "VERIFY_CA"}, mysql.TLS(verify_cert=True)),
+        (
+            {"ssl_mode": "VERIFY_IDENTITY", "ssl_ca": "/ca", "ssl_cert": "/c", "ssl_key": "/k"},
+            mysql.TLS(ca="/ca", cert="/c", key="/k", verify_cert=True, verify_identity=True),
+        ),
+        ({"ssl_cert": "/c", "ssl_key": "/k"}, mysql.TLS(cert="/c", key="/k")),
+        ({"ssl_mode": "DISABLED"}, mysql.DISABLED),
+    ],
+)
+def test_tls_settings(query, expected):
+    assert mysql.tls_settings(query) == expected
+
+
+@pytest.mark.parametrize(
+    ("query", "message"),
+    [
+        # MySQL clients fall back to plaintext under PREFERRED; refused here.
+        ({"ssl_mode": "PREFERRED"}, "PREFERRED is not supported"),
+        ({"ssl_mode": "DISABLED", "ssl_ca": "/ca"}, "conflicts"),
+        ({"ssl_mode": "SOMETIMES"}, "unknown ssl_mode"),
+        ({"ssl_key": "/k"}, "ssl_key needs ssl_cert"),
+    ],
+)
+def test_tls_settings_errors(query, message):
+    with pytest.raises(ValueError, match=message):
+        mysql.tls_settings(query)
+
+
+def _certificates(tmp_path):
+    """A self-signed CA and a client certificate it signed, as PEM files."""
+    import datetime as dt
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    def cert(subject, issuer, key, signer, *, ca):
+        now = dt.datetime.now(dt.UTC)
+        return (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, subject)]))
+            .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer)]))
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - dt.timedelta(days=1))
+            .not_valid_after(now + dt.timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+            .sign(signer, hashes.SHA256())
+        )
+
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    client_key = ec.generate_private_key(ec.SECP256R1())
+    files = {
+        "ca": cert("test-ca", "test-ca", ca_key, ca_key, ca=True),
+        "cert": cert("test-client", "test-ca", client_key, ca_key, ca=False),
+    }
+    paths = {}
+    for name, c in files.items():
+        paths[name] = tmp_path / f"{name}.pem"
+        paths[name].write_bytes(c.public_bytes(serialization.Encoding.PEM))
+    paths["key"] = tmp_path / "key.pem"
+    paths["key"].write_bytes(
+        client_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return paths
+
+
+def _driver(url):
+    """The PyMySQL connection these settings produce, without connecting."""
+    pymysql = pytest.importorskip("pymysql")
+    return pymysql.connections.Connection(defer_connect=True, **mysql.connect_kwargs(url))
+
+
+def test_tls_modes_reach_the_driver(tmp_path):
+    import ssl
+
+    pytest.importorskip("cryptography")
+    files = _certificates(tmp_path)
+    base = "mysql://u:p@db.example.test/kory"
+
+    required = _driver(base + "?ssl_mode=REQUIRED")
+    assert required.ssl is True and required._ssl_required is True
+    assert required.ctx.verify_mode == ssl.CERT_NONE
+
+    full = _driver(
+        f"{base}?ssl_mode=VERIFY_IDENTITY&ssl_ca={files['ca']}"
+        f"&ssl_cert={files['cert']}&ssl_key={files['key']}"
+    )
+    assert full.ssl is True and full._ssl_required is True
+    assert full.ctx.verify_mode == ssl.CERT_REQUIRED
+    assert full.ctx.check_hostname is True
+    # Only the given CA is trusted: the system store was not loaded.
+    assert [c["subject"] for c in full.ctx.get_ca_certs()] == [((("commonName", "test-ca"),),)]
+
+    verify_ca = _driver(f"{base}?ssl_ca={files['ca']}")
+    assert verify_ca._ssl_required is True
+    assert verify_ca.ctx.verify_mode == ssl.CERT_REQUIRED
+    assert verify_ca.ctx.check_hostname is False
+
+    disabled = _driver(base + "?ssl_mode=DISABLED")
+    assert disabled.ssl is False
+
+
+def test_required_tls_encrypts_a_live_connection():
+    """``ssl_mode=REQUIRED`` negotiates TLS with a real server."""
+    from tests.server_db import server_url
+
+    url = server_url("mysql")
+    if not url:
+        pytest.skip("REGISTRY_TEST_MYSQL_URL not set")
+    sep = "&" if "?" in url else "?"
+    conn = mysql.connect(url + sep + "ssl_mode=REQUIRED")
+    try:
+        with conn.raw.cursor() as cur:
+            cur.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+            (_, cipher) = cur.fetchone()
+        assert cipher
+    finally:
+        conn.close()
 
 
 @pytest.mark.parametrize("version", ["8.0.23", "8.0.44", "8.4.10", "9.1.0"])

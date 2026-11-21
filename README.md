@@ -267,11 +267,12 @@ Without `DATABASE_URL`, Kory Source keeps its data in SQLite files under
 - PostgreSQL: `postgresql://user:password@host:5432/dbname`
 - MySQL 8.0.23 or newer (8.0 and 8.4 LTS are tested):
   `mysql://user:password@host:3306/dbname`. `mysql+pymysql://` is accepted too.
-  Without TLS parameters the connection is plaintext. Add
-  `?ssl_ca=/path/to/ca.pem` to verify the server certificate, or
-  `?ssl_mode=REQUIRED` to encrypt without verifying. `ssl_mode=PREFERRED` is
-  refused, because the driver cannot fall back to plaintext the way MySQL's
-  own clients do. MariaDB is not supported.
+  Without TLS parameters, TLS is not required. Add `?ssl_ca=/path/to/ca.pem`
+  to require TLS and verify the server certificate, `?ssl_mode=VERIFY_IDENTITY`
+  to also check the host name, or `?ssl_mode=REQUIRED` to require encryption
+  without verifying. `ssl_cert` and `ssl_key` add a client certificate. With
+  any of these, the connection fails rather than falling back to plaintext,
+  so `ssl_mode=PREFERRED` is refused. MariaDB is not supported.
 
 The database must exist; the service creates its tables. The account needs
 `CREATE`, `ALTER`, `INDEX`, `REFERENCES`, `SELECT`, `INSERT`, `UPDATE` and
