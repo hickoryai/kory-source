@@ -187,7 +187,12 @@ def normalize_conversation_id(value: Any) -> str | None:
 def overlay_text(store_path: str) -> str:
     """The overlay written beside each router process."""
     custom = os.environ.get(ENV_OVERLAY, "").strip()
-    base = Path(custom).read_text(encoding="utf-8").rstrip("\n") if custom else COMPLETION_OVERLAY
+    base = COMPLETION_OVERLAY
+    if custom:
+        try:
+            base = Path(custom).read_text(encoding="utf-8").rstrip("\n")
+        except (OSError, ValueError) as exc:
+            raise RouterError(f"cannot read {ENV_OVERLAY}: {exc}", code="OVERLAY") from exc
     return f"{base}\nstate_file: {json.dumps(store_path)}\n"
 
 

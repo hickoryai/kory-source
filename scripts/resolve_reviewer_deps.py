@@ -124,8 +124,10 @@ def newest_package(name: str) -> str:
 
 def image_digest(reference: str) -> str:
     """``name:tag`` on Docker Hub as ``name:tag@sha256:…``."""
-    name, _, tag = reference.partition(":")
-    if not tag or "/" in name.split("/", 1)[0] and "." in name.split("/", 1)[0]:
+    name, _, tag = reference.rpartition(":")
+    host = name.split("/", 1)[0]
+    other_registry = "/" in name and ("." in host or ":" in host or host == "localhost")
+    if not name or not tag or "/" in tag or "@" in reference or other_registry:
         raise ResolveError(f"only Docker Hub name:tag references are resolved: {reference}")
     repository = name if "/" in name else f"library/{name}"
     try:

@@ -862,7 +862,8 @@ class AutoReviewStore:
         The first worker to claim any call of a head also gets that head's
         later calls while it keeps polling, because a kept conversation lives
         in that worker's router process. Once it has not polled for one lease
-        the head is open to any worker. ``claim=False`` only renews.
+        the head is open to any worker. ``claim=False`` only renews the leases
+        in ``exclude``; it does not count as polling for head affinity.
         """
         worker = worker or LEGACY_WORKER
         current = time.time() if now is None else now
@@ -870,15 +871,18 @@ class AutoReviewStore:
         if exclude:
             exclusions = "AND id NOT IN (" + ",".join("?" for _ in exclude) + ") "
         with self._cursor() as cur:
-            cur.execute(
-                "UPDATE auto_review_workers SET seen_at = ? WHERE id = ?", (current, worker)
-            )
-            if cur.rowcount != 1:
+            # Only a claiming poll keeps head affinity. A paused worker that
+            # only renews its calls in flight lets its heads open after a lease.
+            if claim:
                 cur.execute(
-                    "INSERT INTO auto_review_workers (id, seen_at) VALUES (?, ?) "
-                    "ON CONFLICT (id) DO UPDATE SET seen_at = excluded.seen_at",
-                    (worker, current),
+                    "UPDATE auto_review_workers SET seen_at = ? WHERE id = ?", (current, worker)
                 )
+                if cur.rowcount != 1:
+                    cur.execute(
+                        "INSERT INTO auto_review_workers (id, seen_at) VALUES (?, ?) "
+                        "ON CONFLICT (id) DO UPDATE SET seen_at = excluded.seen_at",
+                        (worker, current),
+                    )
             if exclude:
                 cur.execute(
                     "UPDATE auto_review_work SET claim_expires_at = ? "  # noqa: S608

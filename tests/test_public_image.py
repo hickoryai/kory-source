@@ -5,6 +5,7 @@ import json
 import tarfile
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 from scripts.audit_public_image import audit_image, audit_source, scan
 
@@ -157,6 +158,28 @@ def test_resolver_rejects_unusable_overrides(tmp_path):
     table = deps.markdown(manifest)
     assert f"| Agent CLI (main) | `{'b' * 40}` | yes |" in table
     assert f"| ACP session router (main) | `{'a' * 40}` | no |" in table
+
+
+def test_resolver_resolves_only_docker_hub_references(monkeypatch):
+    from scripts import resolve_reviewer_deps as deps
+
+    def offline(*_args, **_kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(deps, "_get", offline)
+    for bad in (
+        "ghcr.io/org/img:1",
+        "localhost:5000/img:1",
+        "registry.example:5000/img",
+        "node",
+        "node:22@sha256:" + "a" * 64,
+    ):
+        with pytest.raises(deps.ResolveError, match="only Docker Hub"):
+            deps.image_digest(bad)
+    for good in ("node:22-slim", "library/python:3.12-slim", "org/img:1"):
+        with pytest.raises(deps.ResolveError) as raised:
+            deps.image_digest(good)
+        assert "only Docker Hub" not in str(raised.value)
 
 
 def test_indexing_requires_explicit_repository():

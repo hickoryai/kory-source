@@ -272,6 +272,26 @@ def test_poll_renews_a_claim_and_a_silent_worker_loses_it(db: AppDatabase) -> No
     assert store.get_work(work_id).text == "fresh"
 
 
+def test_a_renew_only_poll_does_not_keep_head_affinity(db: AppDatabase) -> None:
+    store = AutoReviewStore(db)
+    job = _running(store)
+    t0 = time.time()
+    first = _work(store, job.id, conversation_id="conv-1")
+    assert store.claim_work("workstation", now=t0).id == first
+    in_flight = _work(store, job.id, conversation_id="conv-2")
+    assert store.claim_work("workstation", (first,), now=t0 + 1).id == in_flight
+    assert store.answer_work(first, text="ok", actual_model="m", worker="workstation")
+
+    # Paused, the workstation keeps renewing its call in flight but claims nothing.
+    later = _work(store, job.id, conversation_id="conv-1")
+    renewed_at = t0 + WORK_LEASE_SECONDS + 2
+    assert store.claim_work("workstation", (in_flight,), now=renewed_at, claim=False) is None
+    assert store.work_claim(in_flight)[1] == pytest.approx(renewed_at + WORK_LEASE_SECONDS)
+    # Its head is open to another worker, and its renewed call is not.
+    taken = store.claim_work("container", now=renewed_at + 1)
+    assert taken is not None and taken.id == later
+
+
 def test_a_worker_that_lost_its_list_is_offered_its_own_call_again(db: AppDatabase) -> None:
     store = AutoReviewStore(db)
     work_id = _work(store, _running(store).id)
@@ -423,6 +443,15 @@ async def test_an_overlay_file_replaces_the_default(
     assert status == 200
     config = _log(stub_router)[0]["config"]
     assert config.startswith("router: auto\nskill_routing: []\nstate_file: ")
+
+
+async def test_an_unreadable_overlay_file_is_an_answered_failure(
+    stub_router: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KORY_SOURCE_ROUTER_OVERLAY", str(tmp_path / "missing.yaml"))
+    status, payload = await LocalSeat().complete({"prompt": "hello"}, 30)
+    assert status >= 400
+    assert payload["state"]
 
 
 async def test_a_pinned_model_that_did_not_run_is_a_mismatch(stub_router: Path) -> None:
