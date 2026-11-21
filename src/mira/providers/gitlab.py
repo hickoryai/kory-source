@@ -631,14 +631,13 @@ class GitLabProvider(BaseProvider):
         await self._request("PUT", self._mr(pr_info), data={"add_labels": label})
 
     async def remove_label(self, pr_info: PRInfo, label: str) -> None:
-        # GitLab ignores a remove_labels name that is not on the MR (200).
-        # 404 is the same outcome: the label is already absent. Resume clears
-        # the current pause label and the older one, and only one is present.
+        # GitLab returns 200 and ignores a remove_labels name that is not on
+        # the MR, so resume can clear the current pause label and the older
+        # one when only one is present. 404 means the MR itself is missing.
         await self._request(
             "PUT",
             self._mr(pr_info),
             data={"remove_labels": label},
-            ok=(200, 404),
         )
 
 

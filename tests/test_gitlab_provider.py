@@ -491,7 +491,7 @@ class TestRemoveLabel:
             seen["method"] = method
             seen["url"] = url
             seen["data"] = kw.get("data")
-            return _FakeResp(status=404, text="label not found")
+            return _FakeResp(status=200, text="")
 
         with _patch(handler):
             await GitLabProvider("tok").remove_label(_PR, "kory-source-paused")
@@ -499,6 +499,14 @@ class TestRemoveLabel:
         assert seen["method"] == "PUT"
         assert seen["url"].endswith("/merge_requests/7")
         assert seen["data"] == {"remove_labels": "kory-source-paused"}
+
+    @pytest.mark.asyncio
+    async def test_missing_merge_request_is_an_error(self):
+        def handler(method, url, **kw):
+            return _FakeResp(status=404, text="404 Not found")
+
+        with _patch(handler), pytest.raises(ProviderError):
+            await GitLabProvider("tok").remove_label(_PR, "kory-source-paused")
 
 
 class TestRegistry:
