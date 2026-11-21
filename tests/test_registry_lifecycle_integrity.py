@@ -21,6 +21,7 @@ from mira.registry.db import RegistryDB
 from mira.registry.provenance import ProvenanceStore
 from mira.registry.service import Registry
 from tests import registry_policy as rp
+from tests.server_db import SERVERS, server_url
 
 HUMAN = Actor("human", "zane")
 ENGINEER = context_for_actor(Actor("human", "engineer-uuid"))
@@ -236,9 +237,9 @@ async def test_concurrent_lifecycle_writers_on_sqlite_never_collide(tmp_path):
     assert a.get(oid)["decision_revision"] == 30
 
 
-@pytest.mark.skipif(not PG_URL, reason="REGISTRY_TEST_POSTGRES_URL not set")
-async def test_concurrent_lifecycle_writers_on_postgres_never_collide():
-    regs = [Registry(RegistryDB(url=PG_URL)) for _ in range(3)]
+@pytest.mark.parametrize("server", SERVERS)
+async def test_concurrent_lifecycle_writers_on_a_server_never_collide(server):
+    regs = [Registry(RegistryDB(url=server_url(server))) for _ in range(3)]
     try:
         oid = await _legacy_decision(regs[0], "Shared", "bx")
         assert _hammer(regs, oid, per_thread=10) == []

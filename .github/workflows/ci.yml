@@ -49,7 +49,7 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --extra dev --extra serve --extra bedrock
+        run: uv sync --extra dev --extra serve --extra bedrock --extra mysql
 
       # Run the same pre-commit hooks contributors run locally. Single source
       # of truth — if a hook is added/removed/version-bumped in
@@ -61,6 +61,48 @@ jobs:
       - name: Type check (advisory — manual stage in pre-commit, non-blocking here)
         continue-on-error: true
         run: uv run pre-commit run --all-files --hook-stage manual mypy
+
+      - name: Test
+        run: uv run pytest tests/ -v --ignore=tests/evals --ignore=tests/test_integration.py
+
+  # The same suite against MySQL. Store tests parametrized over servers run
+  # their MySQL case here; the Postgres cases run in the job above.
+  python-mysql:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql-version: ["8.0", "8.4"]
+
+    # Throwaway server with synthetic credentials. The tests create and drop
+    # their own databases, so the URL uses an account allowed to do that.
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql-version }}
+        env:
+          MYSQL_ROOT_PASSWORD: registry
+          MYSQL_DATABASE: registry_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pregistry"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      REGISTRY_TEST_MYSQL_URL: mysql://root:registry@127.0.0.1:3306/registry_test
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra serve --extra bedrock --extra mysql
 
       - name: Test
         run: uv run pytest tests/ -v --ignore=tests/evals --ignore=tests/test_integration.py

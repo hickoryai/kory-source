@@ -18,7 +18,7 @@ FROM python:3.12-slim AS python-builder
 WORKDIR /build
 COPY pyproject.toml README.md LICENSE ./
 COPY src/mira/ src/mira/
-RUN pip wheel --no-cache-dir --wheel-dir /wheels ".[serve,bedrock]"
+RUN pip wheel --no-cache-dir --wheel-dir /wheels ".[serve,bedrock,mysql]"
 
 # ── Stage 3: backend + bundled UI ─────────────────────────────────
 FROM python:3.12-slim
@@ -32,7 +32,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 # Mount wheels so neither build inputs nor wheel archives persist in a layer.
 RUN --mount=type=bind,from=python-builder,source=/wheels,target=/wheels \
-    pip install --no-cache-dir --no-index --find-links=/wheels "mira-reviewer[serve,bedrock]"
+    pip install --no-cache-dir --no-index --find-links=/wheels "mira-reviewer[serve,bedrock,mysql]"
 
 # Codex CLI is bundled for the optional codex-cli backend. Keep the version
 # pinned above so image rebuilds do not silently change the review runtime.

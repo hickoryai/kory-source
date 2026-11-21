@@ -48,6 +48,12 @@ except ImportError:  # SQLite deployments do not need the Postgres driver.
     DATABASE_ERRORS = (sqlite3.Error,)
 else:
     DATABASE_ERRORS = (sqlite3.Error, PostgresError)
+try:
+    from pymysql.err import Error as MySQLError
+except ImportError:  # Only MySQL deployments install the MySQL driver.
+    pass
+else:
+    DATABASE_ERRORS = (*DATABASE_ERRORS, MySQLError)
 
 IMPORTER = "session_history"
 VERSION = "1"
@@ -408,7 +414,7 @@ class SessionHistoryImporter:
     def _lock(self, namespace: str) -> Iterator[None]:
         db = self.registry.db
         with db.transaction():
-            if db.postgres:
+            if db.server:
                 key = int(digest(f"{IMPORTER}:{namespace}".encode())[:15], 16)
                 db.execute("SELECT pg_advisory_xact_lock(?)", (key,))
             self._policy()

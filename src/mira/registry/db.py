@@ -1,8 +1,9 @@
-"""One org-wide registry database: Postgres when ``DATABASE_URL`` is set,
-otherwise ``$MIRA_INDEX_DIR/registry.db``.
+"""One org-wide registry database: Postgres or MySQL when ``DATABASE_URL`` names
+one, otherwise ``$MIRA_INDEX_DIR/registry.db``.
 
-SQL is written once with ``?`` placeholders and portable types; the Postgres
-path rewrites placeholders to ``%s``.
+SQL is written once with ``?`` placeholders and portable types; the server
+paths rewrite placeholders to ``%s``. MySQL receives the same SQL as Postgres
+and translates it (``mira.db.mysql``).
 """
 
 from __future__ import annotations
@@ -14,6 +15,11 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
+
+from mira.db.url import backend, is_server
+
+# Postgres syntax; the MySQL connection translates it.
+_READ_ONLY = "SET default_transaction_read_only = on"
 
 SCHEMA = [
     """
@@ -184,12 +190,20 @@ SCHEMA = [
 class RegistryDB:
     """Thread-safe connection wrapper. Rows come back as tuples."""
 
+    postgres = False
+    mysql = False
+    _read_only = False
+
     def __init__(
         self, *, url: str | None = None, path: str | None = None, read_only: bool = False
     ) -> None:
         self._lock = threading.RLock()
         self._depth = 0
-        self.postgres = bool(url)
+        kind = backend(url) if url else "sqlite"
+        if url and kind == "sqlite":
+            raise ValueError("the registry URL must be a PostgreSQL or MySQL URL")
+        self.postgres = kind == "postgres"
+        self.mysql = kind == "mysql"
         self._url = url
         self._path = path
         self._read_only = read_only
@@ -198,7 +212,7 @@ class RegistryDB:
 
             self._conn: Any = connect(url)
             if read_only:
-                self._conn.execute("SET default_transaction_read_only = on")
+                self._conn.execute(_READ_ONLY)
         else:
             assert path is not None
             if read_only:
@@ -222,7 +236,7 @@ class RegistryDB:
         # Concurrent startups serialize on the schema: base tables, then the
         # versioned migrations, in one transaction.
         with self.transaction():
-            if self.postgres:
+            if self.server:
                 self.execute("SELECT pg_advisory_xact_lock(?)", (ADVISORY_LOCK_KEY,))
             for stmt in SCHEMA:
                 self.execute(stmt)
@@ -241,39 +255,54 @@ class RegistryDB:
                     raise
                 time.sleep(0.05)
 
+    @property
+    def server(self) -> bool:
+        """True on a shared database server (Postgres or MySQL), not SQLite."""
+        return self.postgres or self.mysql
+
     def _sql(self, sql: str) -> str:
-        return sql.replace("?", "%s") if self.postgres else sql
+        return sql.replace("?", "%s") if self.server else sql
 
     def execute(self, sql: str, params: tuple | list = ()) -> list[tuple]:
+        return self._run(sql, params)[0]
+
+    def execute_rowcount(self, sql: str, params: tuple | list = ()) -> int:
+        """Run a write and return how many rows it matched."""
+        return self._run(sql, params)[1]
+
+    def _run(self, sql: str, params: tuple | list) -> tuple[list[tuple], int]:
         with self._lock:
-            if self.postgres and self._depth:
+            if self.server and self._depth:
                 # Inside a transaction a reconnect would silently drop the
                 # statements already run, so a dropped connection raises instead.
                 with self._conn.cursor() as cur:
                     cur.execute(self._sql(sql), tuple(params))
-                    return [tuple(r) for r in cur.fetchall()] if cur.description else []
-            if self.postgres:
+                    rows = [tuple(r) for r in cur.fetchall()] if cur.description else []
+                    return rows, getattr(cur, "rowcount", -1)
+            if self.server:
                 from mira.db.postgres import ReconnectingCursor, reconnect
 
                 def _reopen() -> Any:
                     self._conn = reconnect(self._url or "", self._conn)
                     if self._read_only:
-                        self._conn.execute("SET default_transaction_read_only = on")
+                        self._conn.execute(_READ_ONLY)
                     return self._conn
 
                 with ReconnectingCursor(self._conn.cursor(), on_reconnect=_reopen) as cur:
                     cur.execute(self._sql(sql), tuple(params))
-                    return [tuple(r) for r in cur.fetchall()] if cur.description else []
+                    rows = [tuple(r) for r in cur.fetchall()] if cur.description else []
+                    return rows, getattr(cur, "rowcount", -1)
             cur = self._conn.execute(sql, tuple(params))
-            return [tuple(r) for r in cur.fetchall()]
+            return [tuple(r) for r in cur.fetchall()], cur.rowcount
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
         """Run the enclosed statements atomically. Nested calls join the outer one.
 
         Holds the connection lock for the whole block, so other threads wait.
-        A Postgres socket that is already dead reconnects once before any
-        statement runs. A failure after that still raises.
+        A server socket that is already dead reconnects once before any
+        statement runs. A failure after that still raises. On MySQL, locks
+        taken with ``pg_advisory_xact_lock`` are released when the block ends.
         """
         with self._lock:
             if self._depth:
@@ -283,8 +312,8 @@ class RegistryDB:
                 finally:
                     self._depth -= 1
                 return
-            if self.postgres:
-                with self._postgres_transaction():
+            if self.server:
+                with self._server_transaction():
                     self._depth = 1
                     try:
                         yield
@@ -304,27 +333,27 @@ class RegistryDB:
                 self._depth = 0
 
     @contextmanager
-    def _postgres_transaction(self) -> Iterator[None]:
-        """Enter one Postgres transaction.
+    def _server_transaction(self) -> Iterator[None]:
+        """Enter one Postgres or MySQL transaction.
 
         The server can close an idle socket. The next ``transaction()`` then
-        raises OperationalError before any statement runs. Reconnect once and
-        enter again. A failure after the body starts still raises: reconnecting
-        there would drop statements already run.
+        raises before any statement runs. Reconnect once and enter again. A
+        failure after the body starts still raises: reconnecting there would
+        drop statements already run.
         """
-        import psycopg
-
-        from mira.db.postgres import reconnect
+        from mira.db.postgres import is_lost_connection, reconnect
 
         started = False
         try:
             with self._conn.transaction():
                 started = True
                 yield
-        except psycopg.OperationalError:
-            if started:
+        except Exception as exc:
+            if started or not is_lost_connection(exc):
                 raise
             self._conn = reconnect(self._url or "", self._conn)
+            if self._read_only:
+                self._conn.execute(_READ_ONLY)
             with self._conn.transaction():
                 yield
 
@@ -335,11 +364,12 @@ class RegistryDB:
             from mira.db.postgres import connect
 
             # Dedicated connection so registry reconnects cannot release the lock.
+            # The lock is session-scoped on both servers: closing releases it.
             with closing(connect(self._url)) as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("SELECT pg_try_advisory_lock(%s)", (key,))
                     (locked,) = cursor.fetchone()
-                yield locked
+                yield bool(locked)
             return
 
         import fcntl
@@ -359,9 +389,12 @@ class RegistryDB:
 
 
 def default_location() -> tuple[str | None, str]:
-    """Return ``(postgres_url, sqlite_path)`` for this deployment."""
+    """Return ``(server_url, sqlite_path)`` for this deployment.
+
+    ``server_url`` is the Postgres or MySQL ``DATABASE_URL``, or None.
+    """
     db_url = os.environ.get("DATABASE_URL", "")
-    url = db_url if db_url.startswith(("postgresql://", "postgres://")) else None
+    url = db_url if is_server(db_url) else None
     index_dir = os.environ.get("MIRA_INDEX_DIR", "/data/indexes")
     return url, os.path.join(index_dir, "registry.db")
 
@@ -370,6 +403,10 @@ def is_unique_violation(exc: BaseException) -> bool:
     """True when ``exc`` is a unique-constraint failure on either backend."""
     if isinstance(exc, sqlite3.IntegrityError):
         return "UNIQUE" in str(exc)
+    from mira.db.mysql import is_duplicate_key
+
+    if is_duplicate_key(exc):
+        return True
     try:
         from psycopg.errors import UniqueViolation
     except ImportError:  # pragma: no cover - psycopg is a dependency
