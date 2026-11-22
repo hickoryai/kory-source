@@ -121,7 +121,8 @@ TOOLS = [
         "ENG-123): the plan, then requirements, decisions, children, dependencies, "
         "evidence, and the ticket's comments. With repo plus paths, symbols, or concepts: "
         "claims in play with approval status, realization, and confidence, proposals "
-        "flagged.",
+        "flagged. Every answer adds stale and stale_sources: stale is true when an in-scope "
+        "source input is behind its threshold or freshness could not be read.",
         {
             "work_id": _STR,
             "ticket": _STR,
@@ -371,6 +372,10 @@ async def handle_message(msg: Any, actor: Actor) -> dict | None:
                 text = f"invalid or missing argument {exc}"
             return _result(msg_id, {"content": [{"type": "text", "text": text}], "isError": True})
         payload = value if isinstance(value, dict) else {"items": value}
+        if name == "get_context":
+            from mira.registry import freshness, get_registry
+
+            payload.update(freshness.for_context(get_registry(), context_for_actor(actor)))
         return _result(
             msg_id,
             {
