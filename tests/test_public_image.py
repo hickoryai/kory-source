@@ -5,6 +5,7 @@ import json
 import tarfile
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 from scripts.audit_public_image import audit_image, audit_source, scan
 
@@ -95,9 +96,90 @@ def test_release_build_omits_attestations_and_still_audits_layers():
     script_at = text.index(script)
     push_at = text.index('docker push "$tag"')
     build = text[build_at:audit_at]
-    assert "provenance: false" in build
-    assert "sbom: false" in build
+    # The build step runs the shared script, which is where the flags live.
+    assert "scripts/build_reviewer_image.sh" in build
+    build_script = (root / "scripts/build_reviewer_image.sh").read_text()
+    assert "--provenance=false" in build_script
+    assert "--sbom=false" in build_script
+    assert "--push" not in build_script
     assert build_at < audit_at < script_at < push_at
+    # A reviewer command that does not answer stops the release before the push.
+    assert build_at < text.index("scripts/smoke_reviewer_image.sh") < push_at
+    # A published version is never rebuilt with different bundled versions.
+    assert text.index("name: Refuse to rebuild a published version") < build_at
+
+
+def test_no_bundled_version_is_written_in_the_dockerfile():
+    """Every bundled version is resolved when the image is built."""
+    import re
+
+    from scripts.resolve_reviewer_deps import IMAGE_ARGS, PACKAGES, build_args, dockerfile_images
+
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "Dockerfile").read_text()
+    for arg in PACKAGES.values():
+        assert re.findall(rf"^ARG {arg}=(.*)$", text, re.M) == ["latest"], arg
+    for arg in ("ROUTER_ACP_REVISION", "AGENT_CLI_REVISION"):
+        assert re.findall(rf"^ARG {arg}=(.*)$", text, re.M) == ["unset"], arg
+    # Base images name a major line only; the digest comes from the resolver.
+    images = dockerfile_images(root / "Dockerfile")
+    assert set(images) == set(IMAGE_ARGS)
+    assert all(
+        "@" not in tag and re.fullmatch(r"[a-z]+:[0-9a-z.-]+", tag) for tag in images.values()
+    )
+    manifest = {
+        "router_acp": "a" * 40,
+        "agent_cli": "b" * 40,
+        "packages": dict.fromkeys(PACKAGES, "1.2.3"),
+        "images": {key: f"{tag}@sha256:{'c' * 64}" for key, tag in images.items()},
+        "overrides": [],
+    }
+    args = build_args(manifest)
+    assert "REVIEWER_AGENTS=1" in args
+    assert f"ROUTER_ACP_REVISION={'a' * 40}" in args
+    # Every argument the resolver passes is one the Dockerfile declares.
+    for arg in args:
+        assert re.search(rf"^ARG {arg.split('=')[0]}(=|$)", text, re.M), arg
+
+
+def test_resolver_rejects_unusable_overrides(tmp_path):
+    from scripts import resolve_reviewer_deps as deps
+
+    root = Path(__file__).resolve().parents[1]
+    for bad in ("router_acp=main", "@openai/codex=latest", "image.node=node:22-slim", "other=1"):
+        assert deps.main(["--dockerfile", str(root / "Dockerfile"), "--override", bad]) == 1
+    manifest = {
+        "router_acp": "a" * 40,
+        "agent_cli": "b" * 40,
+        "packages": dict.fromkeys(deps.PACKAGES, "1.2.3"),
+        "images": dict.fromkeys(deps.IMAGE_ARGS, "node:22-slim@sha256:" + "c" * 64),
+        "overrides": ["agent_cli"],
+    }
+    table = deps.markdown(manifest)
+    assert f"| Agent CLI (main) | `{'b' * 40}` | yes |" in table
+    assert f"| ACP session router (main) | `{'a' * 40}` | no |" in table
+
+
+def test_resolver_resolves_only_docker_hub_references(monkeypatch):
+    from scripts import resolve_reviewer_deps as deps
+
+    def offline(*_args, **_kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(deps, "_get", offline)
+    for bad in (
+        "ghcr.io/org/img:1",
+        "localhost:5000/img:1",
+        "registry.example:5000/img",
+        "node",
+        "node:22@sha256:" + "a" * 64,
+    ):
+        with pytest.raises(deps.ResolveError, match="only Docker Hub"):
+            deps.image_digest(bad)
+    for good in ("node:22-slim", "library/python:3.12-slim", "org/img:1"):
+        with pytest.raises(deps.ResolveError) as raised:
+            deps.image_digest(good)
+        assert "only Docker Hub" not in str(raised.value)
 
 
 def test_indexing_requires_explicit_repository():
@@ -239,3 +321,128 @@ def test_upstream_exception_requires_exact_path_and_bytes(monkeypatch):
         io.BytesIO(data + b"changed"), "vendor/binary"
     )
     assert "organization-reference" in audit.scan_stream(io.BytesIO(data), "other/binary")
+
+
+def test_reviewer_program_may_carry_only_its_reviewed_strings(tmp_path):
+    from scripts.audit_public_image import UPSTREAM_STRINGS
+
+    reviewed = (
+        b"\x00crate hickory-dns\x00https://github.com/hickoryai/goose/releases/download/\x00"
+        b"https://api.github.com/repos/hickoryai/goose/attestations/sha256\x00"
+    )
+    # Synthetic stand-ins for the two rebuilt programs.
+    clean = _image(
+        tmp_path,
+        {"layer.tar": {"usr/local/bin/kory": reviewed, "usr/local/bin/router-acp": b"hickory-dns"}},
+    )
+    assert audit_image(clean) == []
+    codex = "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/"
+    homes = (
+        "usr/local/lib/node_modules/@openai/codex/",
+        "usr/local/lib/node_modules/@agentclientprotocol/codex-acp/",
+    )
+    assert set(UPSTREAM_STRINGS) == {
+        "usr/local/bin/kory",
+        "usr/local/bin/router-acp",
+        "usr/local/bin/node",
+        "usr/local/lib/node_modules/@xai-official/grok/bin/grok-native",
+        *(home + codex + name for home in homes for name in ("codex", "codex-code-mode-host")),
+    }
+
+    # The same bytes anywhere else are still findings.
+    elsewhere = _image(tmp_path, {"layer.tar": {"usr/local/bin/other": reviewed}})
+    assert ("usr/local/bin/other", "organization-reference") in audit_image(elsewhere)
+
+    # Any other use of the name inside a reviewed program still fails.
+    for extra in (b"hickory.example", b"github.com/hickoryai/other", b"Hickory AI", b"hickory-dn"):
+        path = _image(tmp_path, {"layer.tar": {"usr/local/bin/kory": reviewed + extra}})
+        assert ("usr/local/bin/kory", "organization-reference") in audit_image(path), extra
+    # The router's list is shorter: it may not carry the updater address.
+    router = _image(tmp_path, {"layer.tar": {"usr/local/bin/router-acp": reviewed}})
+    assert ("usr/local/bin/router-acp", "organization-reference") in audit_image(router)
+
+    # Every other pattern is unaffected by the allowance.
+    ticket = _image(tmp_path, {"layer.tar": {"usr/local/bin/kory": reviewed + b" HAI-999999"}})
+    assert audit_image(ticket) == [("usr/local/bin/kory", "internal-ticket")]
+
+
+def test_bundled_agent_may_carry_only_its_reviewed_strings(tmp_path):
+    codex = (
+        "usr/local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/"
+        "vendor/x86_64-unknown-linux-musl/bin/codex"
+    )
+    host = codex + "-code-mode-host"
+    node = "usr/local/bin/node"
+    # Synthetic stand-ins shaped like the reviewed bytes: crate names run
+    # together with line numbers, and a token prefix followed by variable names.
+    names = (
+        b"registry/hickory-proto-0.25.2/src/op.rs:149hickory_resolver::name_server\x00"
+        b"208hickory_proto HickoryDns rama_dns::hickory/home rama-dns/src/hickory.rs:31 hickory-dns"
+    )
+    variables = b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKENevent"
+    base64 = b"QQxsaiENA0ACQCAKIA1JDQACQCATIAFGDQAAAkAgAigCjAEiAEUNACACKAKIASACKAKUARCSDCAAIx"
+    clean = _image(
+        tmp_path,
+        {"layer.tar": {codex: names + variables, host: b"hickory-dns", node: base64}},
+    )
+    assert audit_image(clean) == []
+
+    def findings(files):
+        return set(audit_image(_image(tmp_path, {"layer.tar": files})))
+
+    # Each list belongs to one path. The same bytes in another file fail.
+    assert findings({host: names}) == {(host, "organization-reference")}
+    assert findings({node: variables}) == {(node, "credential")}
+    assert findings({codex: base64}) == {(codex, "credential")}
+    assert findings({"usr/local/bin/other": base64}) == {("usr/local/bin/other", "credential")}
+
+    # A real-looking credential in a listed file still fails.
+    token = b"github_pat_" + b"A1b2C3d4E5" * 4
+    assert findings({codex: names + b" " + token}) == {(codex, "credential")}
+    assert findings({node: base64 + b" AKIAQQQQQQQQQQQQQQQQ"}) == {(node, "credential")}
+    assert findings({codex: b"ghp_" + b"a1B2" * 10}) == {(codex, "credential")}
+    # Each reviewed suffix passes when a non-token byte ends the run. Any
+    # other token byte after the prefix, or after a suffix, fails.
+    from scripts.audit_public_image import CODEX_TOKEN_PREFIX, CODEX_TOKEN_SUFFIXES
+
+    for suffix in CODEX_TOKEN_SUFFIXES:
+        for end in (b"\x00", b" ", b"-"):
+            assert findings({codex: CODEX_TOKEN_PREFIX + suffix + end}) == set(), suffix
+        assert findings({codex: CODEX_TOKEN_PREFIX + suffix + b"_stream"}) == {
+            (codex, "credential")
+        }
+    assert findings({codex: CODEX_TOKEN_PREFIX + b"other\x00"}) == {(codex, "credential")}
+    # A token joined to a reviewed string is not covered by it.
+    assert findings({codex: names + variables + b"11" + b"A" * 40}) == {(codex, "credential")}
+    joined = b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKEN11" + b"A" * 40
+    assert findings({codex: joined + b" " + variables}) == {(codex, "credential")}
+    # So does any other use of the name, and every other pattern.
+    for extra in (b"hickory.example", b"hickory-proto-internal", b"Hickory AI"):
+        assert findings({codex: names + extra}) == {(codex, "organization-reference")}, extra
+    assert findings({node: base64 + b" HAI-999999"}) == {(node, "internal-ticket")}
+
+
+def test_reviewer_info_reports_recorded_build_and_missing_commands(tmp_path, monkeypatch, capsys):
+    from mira.auto_review import reviewer_info
+
+    (tmp_path / "agent-versions").mkdir()
+    (tmp_path / "agent-versions" / "codex").write_text("1.2.3\n")
+    (tmp_path / "reviewer-build.json").write_text('{"router_acp": "abc", "agent_cli": "def"}')
+    present = tmp_path / "present"
+    present.write_text("#!/bin/sh\necho 'present 9.9.9'\n")
+    present.chmod(0o755)
+    monkeypatch.setenv("KORY_SOURCE_BUILD_INFO_DIR", str(tmp_path))
+    monkeypatch.setattr(reviewer_info, "COMMANDS", (("present", str(present)),))
+    assert reviewer_info.main(["--check"]) == 0
+    info = json.loads(capsys.readouterr().out)
+    assert info == {
+        "build": {"router_acp": "abc", "agent_cli": "def"},
+        "agent_packages": {"codex": "1.2.3"},
+        "commands": {"present": "present 9.9.9"},
+    }
+    monkeypatch.setattr(
+        reviewer_info, "COMMANDS", (("present", str(present)), ("absent", "/nonexistent/absent"))
+    )
+    assert reviewer_info.main([]) == 0
+    assert json.loads(capsys.readouterr().out)["commands"]["absent"] is None
+    assert reviewer_info.main(["--check"]) == 1

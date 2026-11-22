@@ -87,7 +87,22 @@ CREATE TABLE IF NOT EXISTS auto_review_work (
 );
 CREATE INDEX IF NOT EXISTS auto_review_work_request_idx
     ON auto_review_work (request_id, state);
+CREATE TABLE IF NOT EXISTS auto_review_workers (
+    id TEXT PRIMARY KEY,
+    seen_at DOUBLE PRECISION NOT NULL
+);
+CREATE TABLE IF NOT EXISTS auto_review_seat_owners (
+    request_id TEXT PRIMARY KEY,
+    worker TEXT NOT NULL
+);
 """
+
+# A seat worker's claim on one call. Each poll renews the claims of the calls
+# that worker still runs, so a worker that stops polling loses them.
+WORK_LEASE_SECONDS = 30.0
+# Polls that name no worker share this identity.
+LEGACY_WORKER = "legacy"
+_CLAIM_ATTEMPTS = 8
 
 _REQUEST_COLUMNS = (
     "id, platform, owner, repo, pr_number, head_sha, base_sha, title, installation_id, "
@@ -208,6 +223,7 @@ class AutoReviewStore:
             self._ensure_role(cur)
             self._ensure_skill(cur)
             self._ensure_head_role_unique(cur)
+            self._ensure_work_claim(cur)
 
     @contextmanager
     def _cursor(self) -> Iterator[Any]:
@@ -412,6 +428,26 @@ class AutoReviewStore:
                 (now + lease_seconds, now, request_id, worker),
             )
             return cur.rowcount == 1
+
+    def _ensure_work_claim(self, cur: Any) -> None:
+        """Add the seat worker's claim on a database created before it existed."""
+        columns = (
+            ("claim_owner", "claim_owner TEXT NOT NULL DEFAULT ''"),
+            ("claim_expires_at", "claim_expires_at DOUBLE PRECISION NOT NULL DEFAULT 0"),
+        )
+        if self._db._backend == "sqlite":
+            cur.execute("PRAGMA table_info(auto_review_work)")
+            names = {row[1] for row in cur.fetchall()}
+            for name, column in columns:
+                if name not in names:
+                    cur.execute(
+                        "ALTER TABLE auto_review_work ADD COLUMN " + column  # noqa: S608
+                    )
+            return
+        for _name, column in columns:
+            cur.execute(
+                "ALTER TABLE auto_review_work ADD COLUMN IF NOT EXISTS " + column  # noqa: S608
+            )
 
     def _ensure_interrupt_count(self, cur: Any) -> None:
         """Add the interruption counter on a database created before it existed."""
@@ -852,6 +888,112 @@ class AutoReviewStore:
             row = cur.fetchone()
         return AutoReviewWork(*row) if row else None
 
+    def claim_work(
+        self,
+        worker: str,
+        exclude: tuple[str, ...] = (),
+        *,
+        lease_seconds: float = WORK_LEASE_SECONDS,
+        now: float | None = None,
+        claim: bool = True,
+    ) -> AutoReviewWork | None:
+        """Claim the oldest seat call this worker may run, or return None.
+
+        The first worker to claim a call owns it until it answers or its
+        lease lapses. A poll renews the caller's leases on the ids in
+        ``exclude``, so a worker that keeps polling keeps its calls. A call
+        this worker already owns but does not list is offered to it again,
+        which covers a worker that lost its in-flight list.
+
+        The first worker to claim any call of a head also gets that head's
+        later calls while it keeps polling, because a kept conversation lives
+        in that worker's router process. Once it has not polled for one lease
+        the head is open to any worker. ``claim=False`` only renews the leases
+        in ``exclude``; it does not count as polling for head affinity.
+        """
+        worker = worker or LEGACY_WORKER
+        current = time.time() if now is None else now
+        exclusions = ""
+        if exclude:
+            exclusions = "AND id NOT IN (" + ",".join("?" for _ in exclude) + ") "
+        with self._cursor() as cur:
+            # Only a claiming poll keeps head affinity. A paused worker that
+            # only renews its calls in flight lets its heads open after a lease.
+            if claim:
+                cur.execute(
+                    "UPDATE auto_review_workers SET seen_at = ? WHERE id = ?", (current, worker)
+                )
+                if cur.rowcount != 1:
+                    cur.execute(
+                        "INSERT INTO auto_review_workers (id, seen_at) VALUES (?, ?) "
+                        "ON CONFLICT (id) DO UPDATE SET seen_at = excluded.seen_at",
+                        (worker, current),
+                    )
+            if exclude:
+                cur.execute(
+                    "UPDATE auto_review_work SET claim_expires_at = ? "  # noqa: S608
+                    "WHERE state = 'pending' AND claim_owner = ? AND id IN ("
+                    + ",".join("?" for _ in exclude)
+                    + ")",
+                    (current + lease_seconds, worker, *exclude),
+                )
+            skipped: list[str] = []
+            for _attempt in range(_CLAIM_ATTEMPTS if claim else 0):
+                skip = ""
+                if skipped:
+                    skip = "AND id NOT IN (" + ",".join("?" for _ in skipped) + ") "
+                cur.execute(
+                    f"SELECT {_WORK_COLUMNS} FROM auto_review_work WHERE state = 'pending' "  # noqa: S608
+                    "AND deadline_at >= ? AND EXISTS (SELECT 1 FROM auto_review_requests r "
+                    "WHERE r.id = auto_review_work.request_id AND r.state = 'running') "
+                    "AND (claim_owner = '' OR claim_owner = ? OR claim_expires_at < ?) "
+                    "AND NOT EXISTS (SELECT 1 FROM auto_review_seat_owners o "
+                    "JOIN auto_review_workers w ON w.id = o.worker "
+                    "WHERE o.request_id = auto_review_work.request_id AND o.worker <> ? "
+                    "AND w.seen_at >= ?) " + exclusions + skip + "ORDER BY created_at, id LIMIT 1",
+                    (
+                        current,
+                        worker,
+                        current,
+                        worker,
+                        current - lease_seconds,
+                        *exclude,
+                        *skipped,
+                    ),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                work = AutoReviewWork(*row)
+                # The conditional write is the claim. A racing worker's write
+                # changes no row, and that worker moves to the next call.
+                cur.execute(
+                    "UPDATE auto_review_work SET claim_owner = ?, claim_expires_at = ? "
+                    "WHERE id = ? AND state = 'pending' "
+                    "AND (claim_owner = '' OR claim_owner = ? OR claim_expires_at < ?)",
+                    (worker, current + lease_seconds, work.id, worker, current),
+                )
+                if cur.rowcount != 1:
+                    skipped.append(work.id)
+                    continue
+                cur.execute(
+                    "INSERT INTO auto_review_seat_owners (request_id, worker) VALUES (?, ?) "
+                    "ON CONFLICT (request_id) DO UPDATE SET worker = excluded.worker",
+                    (work.request_id, worker),
+                )
+                return work
+        return None
+
+    def work_claim(self, work_id: str) -> tuple[str, float] | None:
+        """The call's claim owner and lease end, for logs and tests."""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT claim_owner, claim_expires_at FROM auto_review_work WHERE id = ?",
+                (work_id,),
+            )
+            row = cur.fetchone()
+        return (str(row[0]), float(row[1])) if row else None
+
     def answer_work(
         self,
         work_id: str,
@@ -861,8 +1003,15 @@ class AutoReviewStore:
         error_code: str = "",
         conversation: dict[str, Any] | None = None,
         state: str = "",
+        worker: str = "",
     ) -> bool:
-        """Record one answer if the item is still pending and in time."""
+        """Record one answer if the item is still pending and in time.
+
+        A claimed call takes an answer only from the worker that holds the
+        claim. A worker whose lease lapsed and was taken over is refused.
+        A failed call releases its head, so the retry can go to any worker.
+        """
+        worker = worker or LEGACY_WORKER
         new_state = "failed" if error_code else "answered"
         payload = ""
         if conversation is not None:
@@ -874,11 +1023,19 @@ class AutoReviewStore:
             cur.execute(
                 "UPDATE auto_review_work SET state = ?, text = ?, actual_model = ?, "
                 "error_code = ?, conversation_json = ? WHERE id = ? AND state = 'pending' "
-                "AND deadline_at >= ? AND EXISTS (SELECT 1 FROM auto_review_requests r "
+                "AND deadline_at >= ? AND (claim_owner = '' OR claim_owner = ?) "
+                "AND EXISTS (SELECT 1 FROM auto_review_requests r "
                 "WHERE r.id = auto_review_work.request_id AND r.state = 'running')",
-                (new_state, text, actual_model, error_code, payload, work_id, now_ok),
+                (new_state, text, actual_model, error_code, payload, work_id, now_ok, worker),
             )
-            return cur.rowcount == 1
+            accepted = cur.rowcount == 1
+            if accepted and error_code:
+                cur.execute(
+                    "DELETE FROM auto_review_seat_owners WHERE worker = ? AND request_id = "
+                    "(SELECT request_id FROM auto_review_work WHERE id = ?)",
+                    (worker, work_id),
+                )
+            return accepted
 
     def time_out_work(self, work_id: str) -> bool:
         with self._cursor() as cur:

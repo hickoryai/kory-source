@@ -22,6 +22,18 @@ from mira.models import (
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _no_host_router_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch) -> None:
+    """Keep the host's own router configuration out of every test.
+
+    A machine that runs the suite may hold real router accounts. A test that
+    turns the reviewer on would otherwise start a local reviewer on them.
+    """
+    monkeypatch.setenv(
+        "KORY_SOURCE_ROUTER_CONFIG_DIR", str(tmp_path_factory.getbasetemp() / "no-router-config")
+    )
+
+
 @pytest.fixture
 def sample_diff_text() -> str:
     return (FIXTURES_DIR / "sample.diff").read_text()

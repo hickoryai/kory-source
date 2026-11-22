@@ -54,17 +54,78 @@ UPSTREAM_FINDINGS = {
         "9c200ec975ff24c0a259d4f6cf0d0fc1736d0c86da30fff3d499ad3d9a368b65",
         frozenset({"credential"}),
     ),
-    # npm @openai/codex-linux-x64 0.145.0 includes the unrelated Hickory DNS
-    # library and concatenated token-prefix literals.
-    "usr/local/lib/node_modules/@openai/codex/node_modules/@openai/"
-    "codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex": (
-        "a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14",
-        frozenset({"organization-reference", "credential"}),
-    ),
 }
 
 
-def scan(data: bytes) -> set[str]:
+# Reviewed upstream strings. In the file at exactly this path, exactly these
+# byte strings may match a pattern: the names of an unrelated DNS library and
+# its crates, the address the agent CLI's updater downloads from, a run of
+# environment-variable names that follows a token prefix, and three runs of
+# base64 in the Node runtime's embedded modules. These files are rebuilt or
+# re-downloaded at their newest version for every release, so their hashes
+# cannot be pinned the way UPSTREAM_FINDINGS pins a package file. Any other
+# match in these files still fails, and so does the same string anywhere else.
+_DNS_LIBRARY = (b"hickory-dns",)
+# Codex stores a token prefix followed by environment-variable names. The
+# credential match runs on into whatever token bytes the linker places next,
+# so each reviewed suffix is listed. A Codex release that changes these bytes
+# fails the audit by design, and the new suffix needs a reviewed addition here.
+CODEX_TOKEN_PREFIX = b"github_pat_GITHUB_TOKENGH_ENTERPRISE_TOKENGITHUB_ENTERPRISE_TOKEN"
+CODEX_TOKEN_SUFFIXES = (b"event", b"sk")
+_CODEX = (
+    *_DNS_LIBRARY,
+    b"hickory-proto-0.",
+    b"hickory-resolver-0.",
+    b"hickory_proto",
+    b"hickory_resolver",
+    b"HickoryDns",
+    b"rama_dns::hickory",
+    b"/src/hickory.rs",
+    *(CODEX_TOKEN_PREFIX + suffix for suffix in CODEX_TOKEN_SUFFIXES),
+)
+_CODEX_BIN = "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/"
+_CODEX_HOMES = (
+    "usr/local/lib/node_modules/@openai/codex/",
+    "usr/local/lib/node_modules/@agentclientprotocol/codex-acp/",
+)
+UPSTREAM_STRINGS = {
+    "usr/local/bin/kory": (
+        *_DNS_LIBRARY,
+        b"api.github.com/repos/hickoryai/goose",
+        b"github.com/hickoryai/goose",
+    ),
+    "usr/local/bin/router-acp": _DNS_LIBRARY,
+    "usr/local/bin/node": (
+        b"AKIA1JDQACQCATIAFGDQ",
+        b"AKIASACKAKUARCSDCAAI",
+        b"AKIASACKAKUARCSDCABI",
+    ),
+    **{home + _CODEX_BIN + "codex": _CODEX for home in _CODEX_HOMES},
+    **{home + _CODEX_BIN + "codex-code-mode-host": _DNS_LIBRARY for home in _CODEX_HOMES},
+    "usr/local/lib/node_modules/@xai-official/grok/bin/grok-native": _DNS_LIBRARY,
+}
+
+
+def _outside_allowed(data: bytes, pattern: re.Pattern, allowed: tuple[bytes, ...]) -> bool:
+    """True when a match is not entirely inside one of the allowed strings."""
+    for match in pattern.finditer(data):
+        covered = False
+        for literal in allowed:
+            # Every place the match could sit inside this literal.
+            for inner in pattern.finditer(literal):
+                start = match.start() - inner.start()
+                end = start + len(literal)
+                if start >= 0 and match.end() <= end and data[start:end] == literal:
+                    covered = True
+                    break
+            if covered:
+                break
+        if not covered:
+            return True
+    return False
+
+
+def scan(data: bytes, allowed: tuple[bytes, ...] = ()) -> set[str]:
     for example in AWS_DOCUMENTATION_KEYS:
         data = data.replace(example, b"AWS_DOCUMENTATION_EXAMPLE")
     # Preserve legal attribution, but never exempt credentials on those lines.
@@ -74,14 +135,19 @@ def scan(data: bytes) -> set[str]:
         b"Copyright attribution",
         data,
     )
-    return {
-        name
-        for name, pattern in PATTERNS.items()
-        if pattern.search(nonlegal if name == "organization-reference" else data)
-    }
+    found = set()
+    for name, pattern in PATTERNS.items():
+        subject = nonlegal if name == "organization-reference" else data
+        if _outside_allowed(subject, pattern, allowed) if allowed else pattern.search(subject):
+            found.add(name)
+    return found
 
 
 def scan_stream(stream, name: str = "") -> set[str]:
+    allowed = UPSTREAM_STRINGS.get(name, ())
+    if allowed:
+        # Read whole, so an allowed string is never split across two windows.
+        return scan(stream.read(), allowed)
     found = set()
     digest = hashlib.sha256()
     tail = b""
@@ -89,9 +155,9 @@ def scan_stream(stream, name: str = "") -> set[str]:
         digest.update(chunk)
         found.update(scan(tail + chunk))
         tail = chunk[-4096:]
-    expected, allowed = UPSTREAM_FINDINGS.get(name, ("", frozenset()))
+    expected, allowed_reasons = UPSTREAM_FINDINGS.get(name, ("", frozenset()))
     if digest.hexdigest() == expected:
-        found.difference_update(allowed)
+        found.difference_update(allowed_reasons)
     return found
 
 

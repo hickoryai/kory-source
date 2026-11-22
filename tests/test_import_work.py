@@ -188,7 +188,7 @@ async def test_worker_outage_detail_reaches_the_waiter(queue, monkeypatch):
 
 
 async def test_complete_item_keeps_http_and_transport_detail():
-    from mira.auto_review.worker import _complete_item
+    from mira.auto_review.worker import _complete_item, relay_completer
 
     async def recorded(fail):
         captured = {}
@@ -201,7 +201,9 @@ async def test_complete_item_keeps_http_and_transport_detail():
 
         item = {"work_id": "iw_detail:1", "body": {"prompt": "classify"}, "timeout_seconds": 10}
         async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
-            await _complete_item(client, "https://source.test", "https://relay.test", item)
+            await _complete_item(
+                client, "https://source.test", relay_completer(client, "https://relay.test"), item
+            )
         return captured["body"]
 
     def connect_error():
@@ -248,7 +250,7 @@ async def test_routes_review_first_opt_in_and_no_unadmitted_answers(queue, monke
         timeout_seconds=10,
         created_at=time.time(),
     )
-    reviews = SimpleNamespace(next_pending=lambda exclude=(): review, get_work=lambda _: None)
+    reviews = SimpleNamespace(claim_work=lambda worker, exclude=(): review, get_work=lambda _: None)
     monkeypatch.setattr(routes, "_store", lambda: reviews)
     monkeypatch.setattr(routes, "_import_store", lambda: store)
     app = FastAPI()
@@ -264,7 +266,7 @@ async def test_routes_review_first_opt_in_and_no_unadmitted_answers(queue, monke
     ) as client:
         response = await client.get("/api/auto-review/work?import_capacity=1")
         assert response.json()["work_id"] == "aw_review"
-        reviews.next_pending = lambda exclude=(): None
+        reviews.claim_work = lambda worker, exclude=(): None
         assert (await client.get("/api/auto-review/work")).status_code == 204
         item = (await client.get("/api/auto-review/work?import_capacity=1")).json()
         assert item["kind"] == "corpus_import"
@@ -283,7 +285,7 @@ async def test_route_keeps_worker_detail_on_an_import_failure(queue, monkeypatch
 
     store, _run = queue
     work_id = enqueue(queue)
-    reviews = SimpleNamespace(next_pending=lambda exclude=(): None, get_work=lambda _: None)
+    reviews = SimpleNamespace(claim_work=lambda worker, exclude=(): None, get_work=lambda _: None)
     monkeypatch.setattr(routes, "_store", lambda: reviews)
     monkeypatch.setattr(routes, "_import_store", lambda: store)
     app = FastAPI()
@@ -323,12 +325,12 @@ async def test_in_flight_review_does_not_block_an_import_claim(queue, monkeypatc
         created_at=time.time(),
     )
 
-    def next_pending(exclude=()):
+    def next_pending(worker, exclude=()):
         if "aw_review" in exclude:
             return None
         return review
 
-    reviews = SimpleNamespace(next_pending=next_pending, get_work=lambda _: None)
+    reviews = SimpleNamespace(claim_work=next_pending, get_work=lambda _: None)
     monkeypatch.setattr(routes, "_store", lambda: reviews)
     monkeypatch.setattr(routes, "_import_store", lambda: store)
     app = FastAPI()

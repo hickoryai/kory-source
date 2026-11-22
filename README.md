@@ -238,8 +238,15 @@ checks known organization markers, internal hostnames, internal ticket IDs, cred
 configuration/history and every layer, including subsequently deleted files.
 It prints categories and hashed locators, never matching contents. It preserves
 copyright attribution and the public repository provenance labels. Known AWS
-documentation keys and a reviewed upstream Codex binary (exact path and SHA-256)
-have narrow exceptions; a changed binary requires a fresh upstream review. This bounded
+documentation keys and two reviewed Debian libraries (exact path and SHA-256)
+have narrow exceptions; a changed library requires a fresh upstream review. The
+router, the agent CLI, the Node runtime and the bundled agents' native binaries
+are rebuilt or downloaded at their newest version for every release, so their
+exception is by content instead: at each exact path, only that file's listed
+reviewed strings may match a pattern, and any other match fails. The strings
+are the names of an unrelated DNS library and its crates, the address the
+agent CLI's updater downloads from, a run of environment-variable names that
+follows a token prefix, and three runs of base64 in the Node runtime. This bounded
 check supplements manual content review; it does not certify arbitrary data safe.
 Audit wheel archives (`--wheel`) and generated UI directories (`--frontend`) too.
 Export the effective context with `docker build --target build-context
@@ -298,13 +305,73 @@ at a time, and a newer push replaces the queued head behind it.
 `KORY_SOURCE_AUTO_REVIEW_CONCURRENCY` and `KORY_SOURCE_AUTO_REVIEW_CALL_CONCURRENCY`
 are no longer read.
 
-Run one service process and one seat worker. The worker polls sequentially with
+Run one service process and one or more seat workers. A worker polls with
 `POST /api/auto-review/work`, sending its in-flight work IDs in the JSON body
 (`{"exclude": [...], "import_capacity": 0|1}`), so the list has no length limit.
-The exclusion list is local to that worker; it is not a distributed work lease.
 `GET /api/auto-review/work` still serves a worker that predates the body form.
 Deploy the service before upgrading/restarting the worker: an upgraded worker
 needs the body form.
+
+Several workers can poll one service without repeating work. Each worker
+names itself in the `X-Kory-Source-Worker` header on every poll and answer.
+The first worker to claim a seat call runs it, and no other worker is offered
+that call. A claim lasts 30 seconds and each poll renews the claims of the
+calls the worker lists in `exclude`, so a worker that stops polling loses its
+calls after 30 seconds and another worker takes them. An answer from a worker
+that does not hold the claim gets `409 work_not_pending`. The first worker to
+claim a call of a head also gets that head's later calls while it keeps
+polling, because a kept conversation lives in that worker's router process. A
+failed call releases its head, so the retry can go to any worker. A worker
+that sends no header shares one identity, `legacy`, with every other such
+worker; run at most one of those.
+
+### Reviewing inside the service
+
+The image built by `scripts/build_reviewer_image.sh` bundles the ACP session
+router, the agent CLI, and the agents the router launches (the Claude and
+Codex ACP adapters, the Codex CLI, and the Grok CLI). When the service finds a
+router configuration with at least one account, it answers seat calls itself,
+beside any outside worker:
+
+- Mount the router configuration read-only at `/root/.config/router-acp`. It
+  must hold `router.yaml` and at least one `accounts/<agent>@<id>` entry.
+- Set `KORY_SOURCE_AUTO_REVIEW=1`, as for any automatic review.
+
+With no mount, no account, or no `router-acp` binary, nothing starts and the
+service behaves as it did before. The local reviewer is one more seat worker:
+it polls the same work routes in process and claims calls under the rules
+above, so an outside worker that claims a call first keeps it. It takes
+review calls only, never history import work. After three outage answers in a
+row it stops claiming for 60 seconds, so another worker takes the calls.
+
+Each call starts `router-acp serve` with a small overlay on top of the mounted
+configuration: automatic routing, no pre-classifier, no ticket context, and
+the `review-opinion`, `review-gate` and `review-grok` routes. The prompt, the
+requested model, the result fields and the failure states are the ones a
+relay returns, so reviews do not depend on which worker ran them.
+`KORY_SOURCE_ROUTER_OVERLAY` names a replacement overlay file. The image sets
+`ROUTER_ACP_CREDENTIAL_REFRESH=off`, so the service never rotates the mounted
+logins, and `IS_SANDBOX=1` for the Claude agent. The agent CLI (`kory`) is
+installed but is not in the path of a review call. The router and the agents
+it starts get an allowlisted environment only: `PATH`, `HOME`, user, locale,
+temporary-directory, XDG and CA-bundle variables, `IS_SANDBOX` and the
+router's own settings, each by exact name. `LC_*` is the only prefix, and a
+secret-looking name is dropped even there. The service's GitHub App key, webhook secret, database address
+and provider keys never reach them.
+
+`docker run --rm --entrypoint python <image> -m mira.auto_review.reviewer_info`
+prints the router and agent CLI commits, the agent package versions and base
+images the image was built from, and what each command answers to
+`--version`. The same values are image labels under `io.kory-source.dep.`.
+
+No bundled version is written in this repository. Every release resolves the
+newest main commit of the router and the agent CLI, the newest published
+version of each agent package, and the current digest of each base image
+(`scripts/resolve_reviewer_deps.py`), and lists them in the release notes. A
+release fails before it is pushed if any of those commands does not answer
+`--version` or the reviewer smoke test fails. Base image major lines are set
+in the `Dockerfile` and change only by review. A plain `docker build .` has no
+router or agent CLI and installs only the Codex CLI.
 A newer push does not cancel a review that is already running. That review
 posts on the head it started, and at most one newer head of the same pull
 request stays queued behind it. A later push replaces that queued head.
