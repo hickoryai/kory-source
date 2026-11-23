@@ -403,6 +403,8 @@ class SessionHistoryImporter:
         self.classifier = classifier
         self.runs = ImportRuns(registry)
         self.store = ProvenanceStore(registry)
+        # (transcript index, pending total, stage) for the failure message.
+        self.failure_position: tuple[int, int, str] | None = None
 
     def _policy(self):
         policy = require_import(self.access)
@@ -571,15 +573,18 @@ class SessionHistoryImporter:
                 )
             if classifier is not None:
                 classifier.import_run_id = run["run_id"]
-            for entry in pending:
+            for index, entry in enumerate(pending, 1):
                 assert classifier is not None
+                self.failure_position = (index, len(pending), "load")
                 with self._lock(namespace):
                     if not self._new_files([entry], namespace):
                         continue
                 file = BundleFile.load(self.bundle, entry, namespace=namespace)
+                self.failure_position = (index, len(pending), "classify")
                 candidates = classifier.classify(file.passages)
                 if getattr(classifier, "skipped", None):
                     raise RegistryError("classification incomplete for a session-history file")
+                self.failure_position = (index, len(pending), "record")
                 with self._lock(namespace):
                     if not self._new_files([entry], namespace):
                         continue
@@ -590,6 +595,7 @@ class SessionHistoryImporter:
                         self._record(run, file, candidates, page_counts)
                         run["next_checkpoint"] = {"evidence_id": file.revision.evidence_id}
                     counts.update(page_counts)
+            self.failure_position = None
             with self._lock(namespace):
                 run = self.runs.get(run["run_id"])
                 for revision in self._new_unavailable(exceptions, namespace).values():
@@ -690,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
     importer.add_argument("--apply", action="store_true")
     importer.add_argument("--mark-cutover", action="store_true")
     args = parser.parse_args(argv)
+    importer = None
     try:
         if args.command == "export":
             sources = []
@@ -728,7 +735,8 @@ def main(argv: list[str] | None = None) -> int:
                 registry = get_registry()
                 if registry is None:
                     raise RegistryError("session history registry is unavailable")
-                out = SessionHistoryImporter(registry, **settings).run(apply=True)
+                importer = SessionHistoryImporter(registry, **settings)
+                out = importer.run(apply=True)
             else:
                 from mira.registry.db import RegistryDB, default_location
                 from mira.registry.service import Registry
@@ -742,9 +750,19 @@ def main(argv: list[str] | None = None) -> int:
         parser.exit(1, "session history import denied by corpus policy\n")
     except DATABASE_ERRORS:
         parser.exit(1, "session history database operation failed\n")
-    except Exception:
+    except Exception as exc:
         # A raw exception can contain private paths, quotes or source content.
-        parser.exit(1, "session history operation failed; check bundle, policy and run state\n")
+        # Name only the exception class and the transcript's position.
+        where = ""
+        position = getattr(importer, "failure_position", None)
+        if position is not None:
+            index, total, stage = position
+            where = f" at transcript {index} of {total} during {stage}"
+        parser.exit(
+            1,
+            f"session history operation failed{where} ({type(exc).__name__}); "
+            "check bundle, policy and run state\n",
+        )
     json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0

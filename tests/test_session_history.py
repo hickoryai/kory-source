@@ -304,7 +304,10 @@ def test_text_identity_ignores_renames_and_tool_changes_after_cutover(setup):
     [
         (sqlite3.OperationalError, "session history database operation failed"),
         ("postgres", "session history database operation failed"),
-        (RuntimeError, "session history operation failed; check bundle, policy and run state"),
+        (
+            RuntimeError,
+            "session history operation failed (RuntimeError); check bundle, policy and run state",
+        ),
         (AccessDenied, "session history import denied by corpus policy"),
     ],
 )
@@ -322,6 +325,36 @@ def test_cli_database_and_access_errors_hide_details(setup, monkeypatch, capsys,
         main(["import", "--user", USER, "--bundle", str(setup[0]), "--apply"])
     assert exit_info.value.code == 1
     assert capsys.readouterr().err == message + "\n"
+
+
+def test_cli_failure_names_transcript_position_without_details(setup, monkeypatch, capsys):
+    tmp_path, _, registry, sources, transcript, _ = setup
+    _write(transcript)
+    _write(sources / "second.jsonl", added=" A second session.")
+    bundle = _bundle(tmp_path / "bundle", sources)
+
+    class FailsOnSecond(Classifier):
+        def classify(self, passages):
+            if self.calls == 1:
+                raise RuntimeError(f"{QUOTE} owner@example.com /private/transcript")
+            return super().classify(passages)
+
+    monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
+    monkeypatch.setattr("mira.registry.get_registry", lambda: registry)
+    monkeypatch.setattr(
+        "mira.registry.decision_llm.default_classifier", lambda *_args, **_kwargs: FailsOnSecond()
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        main(["import", "--user", USER, "--bundle", str(bundle), "--apply"])
+    assert exit_info.value.code == 1
+    err = capsys.readouterr().err
+    assert err == (
+        "session history operation failed at transcript 2 of 2 during classify (RuntimeError); "
+        "check bundle, policy and run state\n"
+    )
+    assert registry.db.execute(
+        "SELECT COUNT(*) FROM registry_source_revisions WHERE availability = 'available'"
+    ) == [(1,)]
 
 
 def test_empty_bundle_cannot_mark_cutover(setup, monkeypatch, capsys):
