@@ -325,7 +325,14 @@ def test_report_writes_nothing(reg):
     assert before == after
 
 
-def test_cli_prints_json_and_exits_by_gate(reg, monkeypatch, capsys):
+@pytest.fixture
+def cli_env(tmp_path, monkeypatch):
+    # The CLI opens the deployment's registry.db itself, read-only.
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setenv("MIRA_INDEX_DIR", str(tmp_path))
+
+
+def test_cli_prints_json_and_exits_by_gate(reg, cli_env, monkeypatch, capsys):
     fresh_corpus(reg)
     monkeypatch.setenv(access.OPERATOR_ENV, rp.OPERATOR)
     monkeypatch.setattr(freshness.time, "time", lambda: NOW)
@@ -334,6 +341,41 @@ def test_cli_prints_json_and_exits_by_gate(reg, monkeypatch, capsys):
     assert code == 3
     assert out["not_in_corpus"] == ["someone/other"]
     assert out["gate"]["ready"] is False
+
+
+def test_cli_reads_without_migrating_or_the_shared_registry(reg, cli_env, monkeypatch, capsys):
+    import mira.registry as registry_pkg
+    from mira.registry import migrations
+
+    fresh_corpus(reg)
+    monkeypatch.setenv(access.OPERATOR_ENV, rp.OPERATOR)
+    monkeypatch.setattr(freshness.time, "time", lambda: NOW)
+
+    def refuse(*_a, **_k):
+        raise AssertionError("the report must not migrate or build the shared registry")
+
+    monkeypatch.setattr(migrations, "migrate", refuse)
+    monkeypatch.setattr(registry_pkg, "get_registry", refuse)
+    freshness.main(["report"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["stale"] is False
+    assert set(out["sources"]["linear"]) == set(freshness.LINEAR_STREAMS)
+
+
+def test_read_only_server_open_never_waits_on_the_migration_lock(monkeypatch):
+    # A writer holding pg_advisory_xact_lock (a long backfill batch) must not
+    # block the report: the read-only open sends only the read-only setting.
+    from mira.db import postgres
+
+    sent: list[str] = []
+
+    class Conn:
+        def execute(self, sql, *_a, **_k):
+            sent.append(sql)
+
+    monkeypatch.setattr(postgres, "connect", lambda _url: Conn())
+    RegistryDB(url="postgresql://reader@db/registry", read_only=True)
+    assert sent == ["SET default_transaction_read_only = on"]
 
 
 def test_cli_refuses_a_non_operator(reg, monkeypatch):
