@@ -288,13 +288,20 @@ def main(argv: list[str] | None = None) -> int:
         help="owner/name; listed under not_in_corpus when the policy omits it",
     )
     args = parser.parse_args(argv)
-    from mira.registry import get_registry
     from mira.registry.access import operator_context
+    from mira.registry.db import RegistryDB, default_location
+    from mira.registry.service import Registry
 
     policy = require_import(operator_context())
-    registry = get_registry()
-    assert registry is not None
-    result = report(registry, policy, time.time(), args.expect_repo)
+    # Read-only: no advisory lock, no schema or migrations, no judge. The
+    # report only selects, so it never waits on a startup another process holds.
+    url, path = default_location()
+    result = report(
+        Registry(RegistryDB(url=url, path=path, read_only=True)),
+        policy,
+        time.time(),
+        args.expect_repo,
+    )
     json.dump(result, sys.stdout, sort_keys=True)
     sys.stdout.write("\n")
     return exit_code(result)
