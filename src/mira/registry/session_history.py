@@ -752,15 +752,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.exit(1, "session history database operation failed\n")
     except Exception as exc:
         # A raw exception can contain private paths, quotes or source content.
-        # Name only the exception class and the transcript's position.
+        # Name only a fixed reason or the exception class, and the transcript's position.
         where = ""
         position = getattr(importer, "failure_position", None)
         if position is not None:
             index, total, stage = position
             where = f" at transcript {index} of {total} during {stage}"
+        reason = (
+            "model_mismatch"
+            if isinstance(exc, decision_llm.ClassificationModelMismatch)
+            else type(exc).__name__
+        )
         parser.exit(
             1,
-            f"session history operation failed{where} ({type(exc).__name__}); "
+            f"session history operation failed{where} ({reason}); "
             "check bundle, policy and run state\n",
         )
     json.dump(out, sys.stdout, indent=2)

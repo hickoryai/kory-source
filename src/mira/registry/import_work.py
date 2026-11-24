@@ -288,14 +288,19 @@ class ImportWorkStore:
                     if row["state"] == "answered":
                         return json.loads(row["result_json"])
                     if row["state"] == "failed":
-                        # Queue exhaustion is terminal, not a classifier split/retry.
-                        # workstation_outage stays failed. Only a timeout answer is requeued.
+                        # A terminal queue row can still be retried by the classifier
+                        # under its own budget. Queue timeouts retain their existing behavior.
                         code = row["error_code"] or "router_failed"
+                        kind = (
+                            code
+                            if code in {"workstation_outage", "model_mismatch"}
+                            else "router_failed"
+                        )
                         detail = _worker_detail(row.get("result_json"))
                         message = f"import worker: {code}"
                         if detail:
                             message = f"{message}: {detail}"
-                        raise RouterTransportError(message, kind="router_failed")
+                        raise RouterTransportError(message, kind=kind)
                     await asyncio.sleep(POLL_SECONDS)
             finally:
                 self.db.execute(

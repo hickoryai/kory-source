@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from mira.registry import decision_llm
 from mira.registry.access import AccessDenied
 from mira.registry.db import RegistryDB
 from mira.registry.imports import Candidate
@@ -327,7 +328,16 @@ def test_cli_database_and_access_errors_hide_details(setup, monkeypatch, capsys,
     assert capsys.readouterr().err == message + "\n"
 
 
-def test_cli_failure_names_transcript_position_without_details(setup, monkeypatch, capsys):
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        (RuntimeError, "RuntimeError"),
+        (decision_llm.ClassificationModelMismatch, "model_mismatch"),
+    ],
+)
+def test_cli_failure_names_transcript_position_without_details(
+    setup, monkeypatch, capsys, failure, reason
+):
     tmp_path, _, registry, sources, transcript, _ = setup
     _write(transcript)
     _write(sources / "second.jsonl", added=" A second session.")
@@ -336,7 +346,10 @@ def test_cli_failure_names_transcript_position_without_details(setup, monkeypatc
     class FailsOnSecond(Classifier):
         def classify(self, passages):
             if self.calls == 1:
-                raise RuntimeError(f"{QUOTE} owner@example.com /private/transcript")
+                try:
+                    raise ValueError(f"{QUOTE} owner@example.com /private/transcript")
+                except ValueError as exc:
+                    raise failure(str(exc)) from exc
             return super().classify(passages)
 
     monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
@@ -347,9 +360,10 @@ def test_cli_failure_names_transcript_position_without_details(setup, monkeypatc
     with pytest.raises(SystemExit) as exit_info:
         main(["import", "--user", USER, "--bundle", str(bundle), "--apply"])
     assert exit_info.value.code == 1
-    err = capsys.readouterr().err
-    assert err == (
-        "session history operation failed at transcript 2 of 2 during classify (RuntimeError); "
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == (
+        f"session history operation failed at transcript 2 of 2 during classify ({reason}); "
         "check bundle, policy and run state\n"
     )
     assert registry.db.execute(

@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from mira.auto_review import routes
 from mira.llm.router_acp import RouterTransportError
 from mira.registry.db import RegistryDB
-from mira.registry.decision_llm import EXTRACTOR, DecisionClassifier
+from mira.registry.decision_llm import EXTRACTOR, ClassificationModelMismatch, DecisionClassifier
 from mira.registry.import_work import ImportWorkStore
 from mira.registry.imports import ImportRuns
 from mira.registry.service import Registry
@@ -158,7 +158,15 @@ def test_workstation_outage_is_not_requeued(queue):
     assert store.claim() is None
 
 
-async def test_worker_outage_detail_reaches_the_waiter(queue, monkeypatch):
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        ("workstation_outage", "workstation_outage"),
+        ("model_mismatch", "model_mismatch"),
+        ("seat_exhausted", "router_failed"),
+    ],
+)
+async def test_worker_failure_kind_and_detail_reach_the_waiter(queue, monkeypatch, error, kind):
     monkeypatch.setattr("mira.registry.import_work.POLL_SECONDS", 0.01)
     store, run = queue
     detail = "relay connection reset by peer"
@@ -170,7 +178,7 @@ async def test_worker_outage_detail_reaches_the_waiter(queue, monkeypatch):
             if item:
                 assert store.answer(
                     item["work_id"],
-                    {"error": "workstation_outage", "detail": detail, "actual_model": "unknown"},
+                    {"error": error, "detail": detail, "actual_model": "unknown"},
                 )
                 return
             await asyncio.sleep(0.01)
@@ -182,8 +190,8 @@ async def test_worker_outage_detail_reaches_the_waiter(queue, monkeypatch):
             {"body": {"prompt": "x", "model": "grok-4.7", "timeout_seconds": 10}, "timeout": 10}
         )
     await waiter
-    assert caught.value.kind == "router_failed"
-    assert "import worker: workstation_outage" in str(caught.value)
+    assert caught.value.kind == kind
+    assert f"import worker: {error}" in str(caught.value)
     assert detail in str(caught.value)
 
 
@@ -422,8 +430,13 @@ async def test_worker_reserves_review_capacity_during_import(monkeypatch):
             await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest.mark.parametrize("supplied", [False, True])
-async def test_classifier_worker_transport_keeps_required_tracing(queue, monkeypatch, supplied):
+@pytest.mark.parametrize(
+    ("supplied", "first_error"),
+    [(False, ""), (True, ""), (False, "workstation_outage"), (False, "model_mismatch")],
+)
+async def test_classifier_worker_transport_keeps_required_tracing(
+    queue, monkeypatch, supplied, first_error
+):
     from mira.registry.decision_passages import Passage
 
     store, run = queue
@@ -453,12 +466,25 @@ async def test_classifier_worker_transport_keeps_required_tracing(queue, monkeyp
     classifier.import_run_id = run["run_id"]
     classifier.deadline = time.monotonic() + 10
     classifier.validate_configuration()
+    sleep = asyncio.sleep
+
+    async def skip_backoff(delay):
+        await sleep(0 if delay == 5 else delay)
+
+    monkeypatch.setattr("mira.registry.decision_llm.asyncio.sleep", skip_backoff)
 
     async def answer():
+        error = first_error
         for _ in range(100):
             item = store.claim()
             if item:
                 assert item["body"]["model"] == "grok-4.7"
+                if error:
+                    assert store.answer(item["work_id"], {"error": error})
+                    if error == "model_mismatch":
+                        return
+                    error = ""
+                    continue
                 text = json.dumps(
                     {
                         "results": [
@@ -478,12 +504,15 @@ async def test_classifier_worker_transport_keeps_required_tracing(queue, monkeyp
             await asyncio.sleep(0.01)
         pytest.fail("classifier did not enqueue")
 
-    result, _ = await asyncio.gather(
-        classifier._classify_batch([Passage(0, 30, "Use one pool because capacity.")]), answer()
-    )
-    assert len(result) == 1
+    classification = classifier._classify_batch([Passage(0, 30, "Use one pool because capacity.")])
+    if first_error == "model_mismatch":
+        with pytest.raises(ClassificationModelMismatch):
+            await asyncio.gather(classification, answer())
+    else:
+        result, _ = await asyncio.gather(classification, answer())
+        assert len(result) == 1
     assert traces
-    assert classifier.stats["llm_calls"] == 1
+    assert classifier.stats["llm_calls"] == (2 if first_error == "workstation_outage" else 1)
 
 
 def test_slack_work_admission_checks_current_channel(queue):

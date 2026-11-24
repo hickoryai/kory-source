@@ -65,6 +65,10 @@ class ClassificationTimeout(RuntimeError):
     """An intrinsic call timeout, distinct from an import execution deadline."""
 
 
+class ClassificationModelMismatch(RuntimeError):
+    """The worker did not use the pinned classification model."""
+
+
 def batches(
     passages: Sequence[Passage], *, batch_size: int | None = None, batch_chars: int | None = None
 ) -> list[list[Passage]]:
@@ -312,7 +316,10 @@ class DecisionClassifier:
                     self.stats["router_outage_retries"] += 1
                     await asyncio.sleep(delay)
         except Exception as exc:
-            if getattr(exc, "code", "") == "router_acp_timeout" or isinstance(exc, TimeoutError):
+            code = getattr(exc, "code", "")
+            if code == "router_acp_model_mismatch":
+                raise ClassificationModelMismatch("classification model mismatch") from exc
+            if code == "router_acp_timeout" or isinstance(exc, TimeoutError):
                 self.stats["llm_timeouts"] += 1
                 supplied = self._supplied_provider
                 configured = (
