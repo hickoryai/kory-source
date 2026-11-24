@@ -65,6 +65,14 @@ class ClassificationTimeout(RuntimeError):
     """An intrinsic call timeout, distinct from an import execution deadline."""
 
 
+class InvalidClassificationResponse(RuntimeError):
+    """A completed call returned an invalid classification batch."""
+
+
+class ClassificationProviderError(RuntimeError):
+    """The traced classifier could not obtain a response."""
+
+
 def batches(
     passages: Sequence[Passage], *, batch_size: int | None = None, batch_chars: int | None = None
 ) -> list[list[Passage]]:
@@ -361,7 +369,8 @@ class DecisionClassifier:
                     self.stats["router_outage_retries"] += 1
                     await asyncio.sleep(delay)
         except Exception as exc:
-            if getattr(exc, "code", "") == "router_acp_timeout" or isinstance(exc, TimeoutError):
+            code = getattr(exc, "code", "")
+            if code == "router_acp_timeout" or isinstance(exc, TimeoutError):
                 self.stats["llm_timeouts"] += 1
                 supplied = self._supplied_provider
                 configured = (
@@ -378,7 +387,11 @@ class DecisionClassifier:
                         "classification time budget reached; resume reuses completed batches"
                     ) from exc
                 raise ClassificationTimeout(str(exc)) from exc
-            raise RuntimeError(
+            if code in {"router_acp_bad_response", "router_acp_empty_response"}:
+                raise InvalidClassificationResponse(
+                    "decision classification did not return a JSON object"
+                ) from exc
+            raise ClassificationProviderError(
                 f"traced decision classification failed: {type(exc).__name__}: {exc}"
             ) from exc
         served_model = getattr(provider, "served_model", None) or "unknown"
@@ -406,7 +419,9 @@ class DecisionClassifier:
                 }
             return validated
         except (ValueError, KeyError, TypeError) as exc:
-            raise RuntimeError(f"invalid decision classification response: {exc}") from exc
+            raise InvalidClassificationResponse(
+                f"invalid decision classification response: {exc}"
+            ) from exc
 
     def _commit(self, validated: dict[str, dict]) -> None:
         """Commit one finished batch on the single caller/database thread."""
@@ -447,13 +462,16 @@ class DecisionClassifier:
                 batch = active.pop(task)
                 try:
                     self._commit(task.result())
-                except ClassificationTimeout:
-                    if len(batch) > 1:
+                except (ClassificationTimeout, InvalidClassificationResponse) as exc:
+                    timed_out = isinstance(exc, ClassificationTimeout)
+                    # Session history allows model fallback and requires every passage
+                    # to be classified before it can record a transcript.
+                    if len(batch) > 1 and (timed_out or self.allow_model_fallback):
                         self.stats["llm_splits"] += 1
                         midpoint = len(batch) // 2
                         queue.appendleft(batch[midpoint:])
                         queue.appendleft(batch[:midpoint])
-                    else:
+                    elif timed_out and not self.allow_model_fallback:
                         self.stats["llm_single_timeouts"] += 1
                         self._commit(
                             {
@@ -468,6 +486,8 @@ class DecisionClassifier:
                                 }
                             }
                         )
+                    elif first_error is None:
+                        first_error = exc
                 except Exception as exc:
                     if first_error is None:
                         first_error = exc

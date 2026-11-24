@@ -303,7 +303,7 @@ class ImportWorkStore:
                         kind = "router_failed"
                         if code == "workstation_outage" or (
                             request["body"].get("allow_model_fallback") is True
-                            and code in {"seat_exhausted", "model_mismatch"}
+                            and code in {"seat_exhausted", "model_mismatch", "timeout"}
                         ):
                             kind = code
                         detail = _worker_detail(row.get("result_json"))

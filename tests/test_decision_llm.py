@@ -7,7 +7,7 @@ import json
 import pytest
 
 from mira.config import LLMConfig
-from mira.llm.router_acp import RouterAcpProvider
+from mira.llm.router_acp import RouterAcpProvider, RouterTransportError
 from mira.registry import decision_llm
 from mira.registry.db import RegistryDB
 from mira.registry.decision_llm import DecisionClassifier
@@ -181,6 +181,48 @@ def test_malformed_output_is_not_cached_and_fails_closed(tmp_path):
     with pytest.raises(RuntimeError, match="every passage"):
         classifier.classify([Passage(0, 10, "We use X.")])
     assert reg.db.execute("SELECT COUNT(*) FROM registry_decision_classifications") == [(0,)]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "invalid_json", "invalid_results"])
+def test_session_classifier_splits_and_retries_uncached_passage(tmp_path, failure):
+    class FailingProvider(FakeProvider):
+        fail = True
+
+        async def respond(self, request):
+            if self.fail and "Use the second key." in request["body"]["prompt"]:
+                if failure == "timeout":
+                    raise RouterTransportError("synthetic timeout", kind="timeout")
+                text = "not JSON" if failure == "invalid_json" else '{"results": []}'
+                return {"actual_model": "test/pinned", "text": text}
+            return await super().respond(request)
+
+    provider = FailingProvider()
+    classifier = DecisionClassifier(
+        registry(tmp_path),
+        corpus_id="sample",
+        model="test/pinned",
+        provider=provider,
+        allow_model_fallback=True,
+        max_concurrency=1,
+    )
+    texts = ["Use the first key.", "Use the second key."]
+    passages = [Passage(0, len(text), text) for text in texts]
+    error = (
+        decision_llm.ClassificationTimeout
+        if failure == "timeout"
+        else decision_llm.InvalidClassificationResponse
+    )
+    with pytest.raises(error):
+        classifier.classify(passages)
+    assert classifier.stats["llm_splits"] == 1
+    assert classifier.pending(passages) == [passages[1]]
+
+    provider.fail = False
+    assert [candidate.quote for candidate in classifier.classify(passages)] == texts
+    assert [[passage["text"] for passage in call] for call in provider.calls] == [
+        [texts[0]],
+        [texts[1]],
+    ]
 
 
 def test_batch_bounds_and_content_deduplication(tmp_path):
