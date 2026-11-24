@@ -243,6 +243,15 @@ class DecisionClassifier:
                 # Deliberately ignore MIRA_ROUTER_ACP_ALLOW_UNTRACED.
                 return self._tracer if self._tracer is not None else _shared_tracer()
 
+            async def _complete_raw(self, prompt: str, requested: str) -> dict[str, Any]:
+                # Each call builds its own provider, so this records the model
+                # that served this completion, not a sibling's.
+                payload = await super()._complete_raw(prompt, requested)
+                self.served_model = str(
+                    payload.get("model") or payload.get("actual_model") or "unknown"
+                )
+                return payload
+
         supplied = self._supplied_provider
         base = supplied.config if supplied is not None else load_config().llm
         updates: dict[str, Any] = {"model": self.model, "provider": "router-acp"}
@@ -306,13 +315,17 @@ class DecisionClassifier:
         try:
             # Keep one retry budget. When fallback is allowed, use the final
             # attempt to try any available model instead of the pinned seat.
+            # A deadline too short for the next backoff makes the next attempt
+            # that final one rather than skipping it.
             last_attempt = 6
+            deadline_final = False
             for attempt in range(last_attempt + 1):
+                final = attempt == last_attempt or deadline_final
                 timeout, _ = self._deadline_timeout()
                 provider = self._provider(
                     timeout=timeout,
                     retries=0,
-                    use_unpinned_model=self.allow_model_fallback and attempt == last_attempt,
+                    use_unpinned_model=self.allow_model_fallback and final,
                 )
                 self.stats["llm_calls"] += 1
                 try:
@@ -330,13 +343,21 @@ class DecisionClassifier:
                         self.allow_model_fallback
                         and code in {"router_acp_seat_exhausted", "router_acp_model_mismatch"}
                     )
-                    if not retryable or attempt == last_attempt:
-                        raise
-                    delay = min(5 * 2**attempt, 30)
-                    if self.deadline is not None and time.monotonic() + delay >= self.deadline:
+                    if retryable and deadline_final:
                         raise RuntimeError(
                             "classification time budget reached; resume reuses completed batches"
                         ) from exc
+                    if not retryable or final:
+                        raise
+                    delay = min(5 * 2**attempt, 30)
+                    if self.deadline is not None and time.monotonic() + delay >= self.deadline:
+                        if not self.allow_model_fallback:
+                            raise RuntimeError(
+                                "classification time budget reached; resume reuses completed batches"
+                            ) from exc
+                        # Go straight to the unpinned attempt without a backoff.
+                        deadline_final = True
+                        delay = 0
                     self.stats["router_outage_retries"] += 1
                     await asyncio.sleep(delay)
         except Exception as exc:
@@ -360,6 +381,7 @@ class DecisionClassifier:
             raise RuntimeError(
                 f"traced decision classification failed: {type(exc).__name__}: {exc}"
             ) from exc
+        served_model = getattr(provider, "served_model", None) or "unknown"
         try:
             parsed = json.loads(raw)
             results = parsed["results"]
@@ -376,9 +398,12 @@ class DecisionClassifier:
                     raise ValueError("unknown or repeated classification id")
                 ident = result["id"]
                 seen_ids.add(ident)
-                validated[passage_hash(by_id[ident].text)] = self._validate(
-                    result, by_id[ident].text
-                )
+                # The cache key stays on the requested model; the row records
+                # the model that actually answered.
+                validated[passage_hash(by_id[ident].text)] = {
+                    **self._validate(result, by_id[ident].text),
+                    "actual_model": served_model,
+                }
             return validated
         except (ValueError, KeyError, TypeError) as exc:
             raise RuntimeError(f"invalid decision classification response: {exc}") from exc

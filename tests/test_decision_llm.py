@@ -21,8 +21,9 @@ from tests.test_extra_repository_decisions import git
 
 
 class FakeProvider(RouterAcpProvider):
-    def __init__(self, *, invalid_quote=False, malformed=False):
+    def __init__(self, *, invalid_quote=False, malformed=False, served_model=None):
         self.calls = []
+        self.served_model = served_model
         self.invalid_quote = invalid_quote
         self.malformed = malformed
         self.traces = 0
@@ -64,7 +65,7 @@ class FakeProvider(RouterAcpProvider):
             }
         )
 
-        return {"actual_model": request["body"]["model"], "text": response}
+        return {"actual_model": self.served_model or request["body"]["model"], "text": response}
 
 
 def registry(tmp_path):
@@ -115,6 +116,48 @@ def test_classification_cache_batches_replay_negatives_and_model_version(tmp_pat
     fallback.classify(passages)
     assert len(provider.calls) == 5
     assert classifier.estimate(passages)["uncached_passages"] == 0
+
+
+def test_fallback_rows_record_the_serving_model_and_keep_the_requested_key(tmp_path):
+    reg = registry(tmp_path)
+    provider = FakeProvider(served_model="test/fallback")
+    classifier = DecisionClassifier(
+        reg, corpus_id="sample", model="test/pinned", provider=provider, allow_model_fallback=True
+    )
+    passages = [Passage(0, 28, "We use X because Y is slow.")]
+    result = classifier.classify(passages)
+    rows = reg.db.execute("SELECT model, result_json FROM registry_decision_classifications")
+    assert [(model, json.loads(raw)["actual_model"]) for model, raw in rows] == [
+        ("test/pinned", "test/fallback")
+    ]
+    # The lookup stays on the requested model: a replay spends no seat.
+    assert classifier.classify(passages) == result
+    assert len(provider.calls) == 1
+
+    # Rows written before the served model was recorded still serve the cache.
+    legacy = Passage(0, 22, "We use Z because of W.")
+    reg.db.execute(
+        "INSERT INTO registry_decision_classifications (corpus_id, passage_sha256, "
+        "extractor_version, model, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "sample",
+            decision_llm.passage_hash(legacy.text),
+            classifier._cache_version,
+            "test/pinned",
+            json.dumps(
+                {
+                    "is_decision": True,
+                    "statement": "Use Z.",
+                    "quote": legacy.text,
+                    "rationale": "Adopted choice.",
+                    "confidence": 0.9,
+                }
+            ),
+            reg.clock(),
+        ),
+    )
+    assert [c.statement for c in classifier.classify([legacy])] == ["Use Z."]
+    assert len(provider.calls) == 1
 
 
 def test_invalid_quote_is_rejected_and_rejection_is_cached(tmp_path):
