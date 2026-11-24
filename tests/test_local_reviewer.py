@@ -16,10 +16,12 @@ import uuid
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from mira.auto_review import local_seat, worker
+from mira.auto_review.config import skill_line
 from mira.auto_review.local_seat import LocalSeat
 from mira.auto_review.routes import WORKER_HEADER
 from mira.auto_review.routes import router as auto_review_router
@@ -401,14 +403,15 @@ async def test_routes_give_a_call_to_one_worker_and_refuse_the_other(db: AppData
 
 async def test_one_shot_call_returns_the_relay_payload(stub_router: Path) -> None:
     seat = LocalSeat()
+    prompt = f"{skill_line('gate', prefer=('opus', 'sol', 'grok'))}\nreview"
     status, payload = await seat.complete(
-        {"prompt": "[router: skill=review-gate]\nreview", "model": "auto", "timeout_seconds": 30},
+        {"prompt": prompt, "model": "auto", "timeout_seconds": 30},
         60,
     )
     assert status == 200
     assert payload["state"] == "ok"
     # The routing notice is not model output. It names the model that ran.
-    assert payload["text"] == "turn 1: [router: skill=review-gate]\nreview"
+    assert payload["text"] == f"turn 1: {prompt}"
     assert payload["actual_model"] == STUB_MODEL
     assert payload["requested_model"] == "auto"
     assert payload["seat"] == {"candidate": STUB_MODEL, "pinned": False}
@@ -418,28 +421,31 @@ async def test_one_shot_call_returns_the_relay_payload(stub_router: Path) -> Non
     assert seat.open_conversations == 0
 
 
-def test_the_overlay_is_the_relay_overlay() -> None:
-    # Copied from the relay's completion overlay. A change to either is a
-    # routing change and has to be made in both.
-    assert local_seat.COMPLETION_OVERLAY == (
-        "router: auto\n"
-        "disclosure: meta\n"
-        "pre_classifier:\n"
-        "  enabled: false\n"
-        "ticket_context: null\n"
-        "skill_routing:\n"
-        "  - pattern: review-opinion\n"
-        "    selection: first-match\n"
-        '    candidates: ["*grok*", "*opus*", "*sol*"]\n'
-        "  - pattern: review-gate\n"
-        "    selection: first-match\n"
-        '    candidates: ["*opus*", "*sol*", "*grok*"]\n'
-        "  - pattern: review-grok\n"
-        "    selection: first-match\n"
-        '    candidates: ["*grok*"]\n'
-        "delegation:\n"
-        "  inject_prompt: false"
-    )
+def test_default_overlay_resolves_review_routes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(local_seat.ENV_OVERLAY, raising=False)
+    store_path = str(tmp_path / "completion.db")
+    overlay = yaml.safe_load(local_seat.overlay_text(store_path))
+    # Keep the review routes aligned with the relay's completion overlay.
+    candidates_by_skill = {
+        "review-pr": ["*grok*", "*opus*", "*sol*", "*"],
+        "review-opinion": ["*grok*", "*opus*", "*sol*", "*"],
+        "review-gate": ["*opus*", "*sol*", "*grok*", "*"],
+        "review-grok": ["*grok*", "*"],
+    }
+    assert overlay == {
+        "router": "auto",
+        "disclosure": "meta",
+        "pre_classifier": {"enabled": False},
+        "ticket_context": None,
+        "skill_routing": [
+            {"pattern": skill, "selection": "first-match", "candidates": candidates}
+            for skill, candidates in candidates_by_skill.items()
+        ],
+        "delegation": {"inject_prompt": False},
+        "state_file": store_path,
+    }
 
 
 async def test_an_overlay_file_replaces_the_default(

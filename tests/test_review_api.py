@@ -425,7 +425,7 @@ def test_local_snapshot_reviews_without_github(env):
     assert env["github"].requests == []
     assert env["github"].writes == []
     assert env["seat"].prompts
-    assert all(prompt.startswith("[router: skill=review-gate]\n") for prompt in env["seat"].prompts)
+    assert all(prompt.startswith("[router: skill=review-pr]\n") for prompt in env["seat"].prompts)
 
 
 def test_dashboard_model_pin_is_requested_as_auto(env):
@@ -438,9 +438,7 @@ def test_dashboard_model_pin_is_requested_as_auto(env):
     assert done["role"] == "opinion"
     assert done["local"] is False
     assert done["models"]["requested"] == ["auto"]
-    assert all(
-        prompt.startswith("[router: skill=review-opinion]\n") for prompt in env["seat"].prompts
-    )
+    assert all(prompt.startswith("[router: skill=review-pr]\n") for prompt in env["seat"].prompts)
 
 
 def test_zero_findings_is_an_empty_list(env):

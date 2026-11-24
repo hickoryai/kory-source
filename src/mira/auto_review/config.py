@@ -26,10 +26,8 @@ GENERIC_WORKER_HOST = "the workstation with the logged-in router account pool"
 # The request stays unpinned. The router selects the seat from the skill line.
 DEFAULT_ROLE = "opinion"
 ROLE_SKILL = {"opinion": "review-opinion", "gate": "review-gate"}
-# Later-version extra opinion. Candidates are Grok only, so a full gate is
-# not duplicated when Grok has no capacity.
-GROK_ONLY_SKILL = "review-grok"
-ALLOWED_SKILLS = frozenset({*ROLE_SKILL.values(), GROK_ONLY_SKILL})
+# Stored pass ID for the later extra opinion.
+GROK_OPINION_PASS = "review-grok"
 CALL_TIMEOUT_SECONDS = 1800
 REVIEW_EVENT = "COMMENT"
 SECONDARY_LABEL = "Kory Source (secondary reviewer)"
@@ -151,26 +149,28 @@ def ownership(db: Any, owner: str, repo: str, installation_id: int) -> str | Non
 
 
 def jobs_for(has_posted: bool) -> list[tuple[str, str]]:
-    """Role and router skill for each review of one head.
-
-    The first reviewed head gets a full opinion that prefers Grok and a full
-    gate that prefers Opus or Sol. A later head reviews the new changes: the
-    gate prefers Opus or Sol, and the extra opinion runs only on Grok.
-    """
+    """Role and stored pass ID for each review of one head."""
+    gate = ("gate", ROLE_SKILL["gate"])
     if has_posted:
-        return [("gate", "review-gate"), ("opinion", GROK_ONLY_SKILL)]
-    return [("opinion", "review-opinion"), ("gate", "review-gate")]
+        return [gate, ("opinion", GROK_OPINION_PASS)]
+    return [("opinion", ROLE_SKILL["opinion"]), gate]
 
 
-def skill_line(role: str, skill: str = "") -> str:
-    """One stripped router directive. The model does not see it.
-
-    An allowed skill wins. Otherwise the role's default skill is used.
-    """
-    chosen = skill if skill in ALLOWED_SKILLS else ROLE_SKILL.get(role)
-    if chosen not in ALLOWED_SKILLS:
+def skill_line(
+    role: str,
+    *,
+    prefer: tuple[str, ...] = (),
+    exclude: tuple[str, ...] = (),
+) -> str:
+    """One stripped router directive. The model does not see it."""
+    if role not in ROLE_SKILL:
         raise ValueError(f"unknown review role {role!r}")
-    return f"[router: skill={chosen}]"
+    directives = ["skill=review-pr"]
+    if prefer:
+        directives.append(f"prefer={'|'.join(prefer)}")
+    if exclude:
+        directives.append(f"exclude={'|'.join(exclude)}")
+    return f"[router: {', '.join(directives)}]"
 
 
 def review_preamble(head_sha: str, role: str = DEFAULT_ROLE) -> str:

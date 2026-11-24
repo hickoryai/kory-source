@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 import uuid
@@ -19,12 +20,16 @@ from typing import Any
 
 from mira.auto_review.config import (
     CALL_TIMEOUT_SECONDS,
+    DEFAULT_ROLE,
+    ROLE_SKILL,
     flag_on,
     paused,
+    skill_line,
     trial_mira_config,
 )
 from mira.auto_review.incremental import carry_findings
-from mira.auto_review.poster import post_if_current
+from mira.auto_review.poster import post_if_current, review_routing_context
+from mira.auto_review.reviewer_routing import commit_companies, legacy_company, review_routing
 from mira.auto_review.store import AutoReviewRequest, AutoReviewStore, AutoReviewWork
 from mira.review_api.snapshot import (
     FrozenSnapshot,
@@ -168,6 +173,25 @@ async def _close_seats(engine: Any) -> None:
         await close()
 
 
+async def _previous_company(
+    reader: SnapshotReader, req: AutoReviewRequest, posted: list[tuple[str, str]]
+) -> str:
+    for review_id, audit in posted:
+        if audit:
+            with contextlib.suppress(ValueError, AttributeError):
+                if company := json.loads(audit).get("served_company"):
+                    return company
+            continue
+        try:
+            body = await reader.posted_review_body(req.pr_number, review_id)
+        except Exception:
+            logger.info("auto review previous footer unavailable request=%s", req.id)
+            continue
+        if company := legacy_company(body):
+            return company
+    return ""
+
+
 async def execute_request(
     store: AutoReviewStore,
     req: AutoReviewRequest,
@@ -188,12 +212,11 @@ async def execute_request(
         req.id,
         max(0, time.time() - req.created_at),
     )
-    from mira.auto_review.config import ALLOWED_SKILLS, DEFAULT_ROLE, ROLE_SKILL, skill_line
     from mira.llm.router_acp import review_skill_line
 
     role = req.role if req.role in ROLE_SKILL else DEFAULT_ROLE
-    named = req.skill if req.skill in ALLOWED_SKILLS else ""
-    skill_token = review_skill_line.set(skill_line(role, named))
+    skill_token = review_skill_line.set(None)
+    routing_token = review_routing_context.set(None)
     try:
         reader = await reader_factory(req.owner, req.repo, req.installation_id)
         fetch_started = time.monotonic()
@@ -223,6 +246,22 @@ async def execute_request(
             except SnapshotError as exc:
                 logger.info("auto review full fallback request=%s reason=%s", req.id, exc.code)
         while True:
+            posted_reviews = store.posted_reviews(req)
+            history_unavailable = False
+            try:
+                detected = commit_companies(await reader.pull_commits(snapshot.meta))
+            except Exception:
+                logger.info("auto review commit history unavailable request=%s", req.id)
+                detected = set()
+                history_unavailable = True
+            previous = await _previous_company(reader, req, posted_reviews)
+            routing = review_routing(
+                role, req.skill, detected, previous, history_unavailable=history_unavailable
+            )
+            review_routing_context.set(routing)
+            review_skill_line.set(
+                skill_line(role, prefer=routing.preference, exclude=routing.exclude)
+            )
             provider = ReadOnlySnapshotProvider(reader, snapshot)
             engine = engine_factory(provider, seat_transport(store, req.id))
             kwargs: dict[str, Any] = (
@@ -281,7 +320,7 @@ async def execute_request(
                         installation_id=req.installation_id,
                         title=meta.title,
                         role=role,
-                        skill=named,
+                        skill=req.skill,
                     )
                     carried = None
                     diff_text = latest.diff_text
@@ -354,6 +393,7 @@ async def execute_request(
         logger.exception("auto review %s failed", req.id)
         store.mark_skipped(req.id, "review_failed", "review_failed")
     finally:
+        review_routing_context.reset(routing_token)
         review_skill_line.reset(skill_token)
         if engine is not None:
             await _close_seats(engine)

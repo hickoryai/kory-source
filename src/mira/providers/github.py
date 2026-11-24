@@ -512,6 +512,7 @@ class GitHubProvider(BaseProvider):
         review_body: str | None = None,
         comment_prefix: str | None = None,
         require_current_head: bool = False,
+        review_footer_suffix: str = "",
     ) -> list[int]:
         """Post one COMMENT review.
 
@@ -554,6 +555,8 @@ class GitHubProvider(BaseProvider):
             if result.key_issues:
                 review_body += _format_key_issues(result.key_issues)
         review_body = append_model_footer(review_body, result.actual_models)
+        if review_footer_suffix:
+            review_body += f"  \n{review_footer_suffix}"
 
         token = await self._resolve_token()
         gh = self._make_client(token)

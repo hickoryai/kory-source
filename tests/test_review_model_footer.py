@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mira.auto_review.poster import actual_models_from_work, post_if_current
+from mira.auto_review.poster import actual_models_from_work, post_if_current, post_secondary_review
 from mira.auto_review.store import AutoReviewStore
 from mira.config import MiraConfig
 from mira.core.engine import ReviewEngine
@@ -149,7 +149,8 @@ async def test_posted_review_uses_work_item_models(db: AppDatabase) -> None:
     assert "grok-4.6" not in seen.actual_models
 
 
-async def test_github_review_body_ends_with_the_model_footer() -> None:
+@pytest.mark.parametrize("with_routing", [False, True])
+async def test_github_review_body_ends_with_the_model_footer(with_routing: bool) -> None:
     provider = GitHubProvider.__new__(GitHubProvider)
 
     async def _token() -> str:
@@ -190,6 +191,7 @@ async def test_github_review_body_ends_with_the_model_footer() -> None:
     review.get_comments.return_value = []
     pull = MagicMock()
     pull.create_review.return_value = review
+    pull.head.sha = HEAD
     repo = MagicMock()
     repo.get_commit.return_value = frozen
     repo.get_pull.return_value = pull
@@ -197,16 +199,33 @@ async def test_github_review_body_ends_with_the_model_footer() -> None:
     github.get_repo.return_value = repo
 
     with patch("mira.providers.github.Github", return_value=github):
-        await provider.post_review(
-            pr,
-            result,
-            bot_name="kory-source",
-            commit_sha=HEAD,
-            review_body="**Kory Source (secondary reviewer)**\n\nfrozen summary",
-        )
+        if with_routing:
+            result.actual_models = ["codex/gpt-6.1-sol"]
+            await post_secondary_review(
+                provider,
+                pr,
+                result,
+                HEAD,
+                "gate",
+                {"detected_companies": ["codex"], "preference": ["sol"], "fallback": "none"},
+            )
+        else:
+            await provider.post_review(
+                pr,
+                result,
+                bot_name="kory-source",
+                commit_sha=HEAD,
+                review_body="**Kory Source (secondary reviewer)**\n\nfrozen summary",
+            )
 
     body = pull.create_review.call_args.kwargs["body"]
-    assert body.endswith("Models: Sol 6.1, claude@acct/opus")
+    if with_routing:
+        assert body.endswith(
+            "---\nModel: Sol 6.1  \nCode families: codex  \n"
+            "Requested preference: sol  \nFallback: none"
+        )
+    else:
+        assert body.endswith("Models: Sol 6.1, claude@acct/opus")
     assert "frozen summary" in body
     assert "grok-4.6" not in body
     assert pull.create_review.call_args.kwargs["event"] == "COMMENT"

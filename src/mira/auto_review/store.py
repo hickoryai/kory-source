@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS auto_review_requests (
     interrupt_count INTEGER NOT NULL DEFAULT 0,
     role TEXT NOT NULL DEFAULT 'opinion',
     skill TEXT NOT NULL DEFAULT '',
+    reviewer_routing_json TEXT NOT NULL DEFAULT '',
     UNIQUE (platform, owner, repo, pr_number, head_sha, role)
 );
 CREATE INDEX IF NOT EXISTS auto_review_requests_state_idx
@@ -107,7 +108,7 @@ _CLAIM_ATTEMPTS = 8
 _REQUEST_COLUMNS = (
     "id, platform, owner, repo, pr_number, head_sha, base_sha, title, installation_id, "
     "state, posted_review_id, error_code, error_message, lease_owner, lease_expires_at, "
-    "created_at, updated_at, started_at, finished_at, interrupt_count, role, skill"
+    "created_at, updated_at, started_at, finished_at, interrupt_count, role, skill, reviewer_routing_json"
 )
 _REQUEST_COLUMN_NAMES = tuple(part.strip() for part in _REQUEST_COLUMNS.split(","))
 
@@ -143,6 +144,7 @@ class AutoReviewRequest:
     interrupt_count: int
     role: str
     skill: str
+    reviewer_routing_json: str = ""
 
 
 @dataclass
@@ -222,6 +224,7 @@ class AutoReviewStore:
             self._ensure_interrupt_count(cur)
             self._ensure_role(cur)
             self._ensure_skill(cur)
+            self._ensure_reviewer_routing(cur)
             self._ensure_head_role_unique(cur)
             self._ensure_work_claim(cur)
 
@@ -294,6 +297,17 @@ class AutoReviewStore:
             )
             rows = cur.fetchall()
         return [AutoReviewRequest(*row) for row in rows]
+
+    def posted_reviews(self, req: AutoReviewRequest) -> list[tuple[str, str]]:
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT posted_review_id, reviewer_routing_json FROM auto_review_requests "
+                "WHERE platform = ? AND owner = ? AND repo = ? AND pr_number = ? "
+                "AND state = 'posted' AND posted_review_id NOT IN ('', 'pending', '0') "
+                "ORDER BY finished_at DESC, id DESC",
+                (req.platform, req.owner, req.repo, req.pr_number),
+            )
+            return [(str(review_id), str(routing)) for review_id, routing in cur.fetchall()]
 
     def latest_posted_head(
         self,
@@ -501,6 +515,18 @@ class AutoReviewStore:
             "ALTER TABLE auto_review_requests ADD COLUMN IF NOT EXISTS " + column  # noqa: S608
         )
 
+    def _ensure_reviewer_routing(self, cur: Any) -> None:
+        column = "reviewer_routing_json TEXT NOT NULL DEFAULT ''"
+        if self._db._backend == "sqlite":
+            cur.execute("PRAGMA table_info(auto_review_requests)")
+            if any(row[1] == "reviewer_routing_json" for row in cur.fetchall()):
+                return
+            cur.execute("ALTER TABLE auto_review_requests ADD COLUMN " + column)  # noqa: S608
+            return
+        cur.execute(
+            "ALTER TABLE auto_review_requests ADD COLUMN IF NOT EXISTS " + column  # noqa: S608
+        )
+
     def _ensure_head_role_unique(self, cur: Any) -> None:
         """Let one head store both roles.
 
@@ -568,6 +594,7 @@ class AutoReviewStore:
             "finished_at DOUBLE PRECISION NOT NULL DEFAULT 0, "
             "interrupt_count INTEGER NOT NULL DEFAULT 0, "
             "role TEXT NOT NULL DEFAULT 'opinion', skill TEXT NOT NULL DEFAULT '', "
+            "reviewer_routing_json TEXT NOT NULL DEFAULT '', "
             "UNIQUE (platform, owner, repo, pr_number, head_sha, role))"
         )
         cur.execute("PRAGMA table_info(auto_review_requests_old)")
@@ -796,14 +823,17 @@ class AutoReviewStore:
             )
             return cur.rowcount == 1
 
-    def mark_posted(self, request_id: str, review_id: int) -> bool:
+    def mark_posted(
+        self, request_id: str, review_id: int, routing: dict[str, Any] | None = None
+    ) -> bool:
         now = time.time()
         with self._cursor() as cur:
             cur.execute(
                 "UPDATE auto_review_requests SET state = 'posted', posted_review_id = ?, "
                 "error_code = '', error_message = '', lease_owner = '', lease_expires_at = 0, "
-                "finished_at = ?, updated_at = ? WHERE id = ? AND posted_review_id = 'pending'",
-                (str(review_id), now, now, request_id),
+                "finished_at = ?, updated_at = ?, reviewer_routing_json = ? "
+                "WHERE id = ? AND posted_review_id = 'pending'",
+                (str(review_id), now, now, json.dumps(routing) if routing else "", request_id),
             )
             return cur.rowcount == 1
 
