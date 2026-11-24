@@ -224,6 +224,7 @@ class _Engine:
         self.pr_calls = 0
         self.skill_line = None
         self.last_diff = ""
+        self.actual_models: list[str] = []
         self.llm = SimpleNamespace(close_conversations=AsyncMock())
 
     async def review_snapshot(self, pr_info: PRInfo, diff_text: str, **kwargs) -> ReviewResult:
@@ -234,7 +235,9 @@ class _Engine:
         self.snapshot_calls += 1
         if self.write and self.provider is not None:
             self.provider.write_attempts.append(self.write)  # type: ignore[attr-defined]
-        return ReviewResult(summary="reviewed " + pr_info.head_sha)
+        return ReviewResult(
+            summary="reviewed " + pr_info.head_sha, actual_models=self.actual_models
+        )
 
     async def review_pr(self, *_args: object, **_kwargs: object) -> ReviewResult:
         self.pr_calls += 1
@@ -271,12 +274,15 @@ async def _run(
     monkeypatch: pytest.MonkeyPatch,
     *,
     write: str | None = None,
+    actual_model: str = "",
 ) -> tuple[_Engine, _Poster]:
     async def _capture(_reader: object, req) -> FrozenSnapshot:
         return _frozen(req.head_sha)
 
     monkeypatch.setattr("mira.auto_review.runner.capture", _capture)
     engine = _Engine(write=write)
+    if actual_model:
+        engine.actual_models.append(actual_model)
     seen: dict[str, object] = {}
 
     def factory(provider: object, transport: object) -> _Engine:
@@ -297,6 +303,7 @@ async def _run(
             get_pull=AsyncMock(return_value=snapshot.meta),
             freeze=AsyncMock(return_value=snapshot),
             incremental=AsyncMock(return_value=snapshot),
+            pull_commits=AsyncMock(return_value=[]),
         )
 
     await execute_request(store, job, _reader, engine_factory=factory, poster=_post)
@@ -524,7 +531,7 @@ async def test_later_head_reviews_the_delta_and_names_its_skill(
         poster=_post,
     )
     assert engine.last_diff == full.diff_text
-    assert engine.skill_line == "[router: skill=review-opinion]"
+    assert engine.skill_line == "[router: skill=review-opinion, prefer=grok|opus|sol]"
     incremental.assert_not_called()
 
     later, _ = store.enqueue(
@@ -566,7 +573,7 @@ async def test_later_head_reviews_the_delta_and_names_its_skill(
     )
     assert seen == [HEAD]
     assert later_engine.last_diff == delta_text
-    assert later_engine.skill_line == "[router: skill=review-gate]"
+    assert later_engine.skill_line == "[router: skill=review-gate, prefer=opus|sol|grok]"
     assert poster.calls == [HEAD, HEAD_NEXT]
 
 
@@ -1305,6 +1312,25 @@ async def test_registry_context_skips_registry_hooks(
     assert calls["wrap"] >= 1
 
 
+async def test_execute_records_served_fallback(
+    db: AppDatabase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(db)
+    job = _running(store)
+    model = "codex@seat/gpt-6.1-sol"
+    _, poster = await _run(store, job, monkeypatch, actual_model=model)
+    posted = store.get(job.id)
+    assert posted is not None
+    assert posted.state == "posted"
+    audit = json.loads(posted.reviewer_routing_json)
+    assert audit["served_model"] == model
+    assert audit["served_company"] == "codex"
+    assert audit["fallback"] == "preferred_unavailable"
+    assert "Code families: unknown" in poster.review_body
+    assert "Requested preference: grok then opus then sol" in poster.review_body
+    assert "Fallback: preferred_unavailable" in poster.review_body
+
+
 async def test_execute_posts_frozen_sha_once(
     db: AppDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1321,7 +1347,7 @@ async def test_execute_posts_frozen_sha_once(
     assert "Role: opinion" in poster.review_body
     assert SECONDARY_LABEL in poster.review_body
     assert poster.comment_prefix.startswith(f"**{SECONDARY_LABEL}**")
-    assert engine.skill_line == "[router: skill=review-opinion]"
+    assert engine.skill_line == "[router: skill=review-opinion, prefer=grok|opus|sol]"
     from mira.llm.router_acp import review_skill_line
 
     assert review_skill_line.get() is None

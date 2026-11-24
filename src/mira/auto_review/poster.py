@@ -8,17 +8,25 @@ call for a head that already posted returns the existing review id.
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
+from typing import Any
 
 from mira.auto_review.config import REVIEW_EVENT, review_preamble
+from mira.auto_review.reviewer_routing import ReviewerRouting
 from mira.auto_review.store import AutoReviewStore
 from mira.exceptions import StaleReviewError
 from mira.models import PRInfo, ReviewResult
 from mira.providers.formatting import format_key_issues
 
 logger = logging.getLogger(__name__)
+review_routing_context: ContextVar[ReviewerRouting | None] = ContextVar(
+    "auto_review_routing", default=None
+)
 
 
-def _review_body(result: ReviewResult, head_sha: str, role: str) -> str:
+def _review_body(
+    result: ReviewResult, head_sha: str, role: str, routing: dict[str, Any] | None
+) -> str:
     parts = [review_preamble(head_sha, role)]
     if result.summary:
         parts.append(result.summary)
@@ -29,6 +37,14 @@ def _review_body(result: ReviewResult, head_sha: str, role: str) -> str:
             parts.append(result.walkthrough.to_markdown(bot_name="kory-source"))
         except Exception:
             logger.warning("auto review: walkthrough markdown skipped", exc_info=True)
+    if routing is not None:
+        detected = ", ".join(routing["detected_companies"]) or "unknown"
+        preference = " then ".join(routing["preference"])
+        parts.append(
+            f"Code families: {detected}  \n"
+            f"Requested preference: {preference}  \n"
+            f"Fallback: {routing['fallback']}"
+        )
     return "\n\n".join(part for part in parts if part)
 
 
@@ -38,6 +54,7 @@ async def post_secondary_review(
     result: ReviewResult,
     head_sha: str,
     role: str = "opinion",
+    routing: dict[str, Any] | None = None,
 ) -> int:
     """Post the frozen review. The provider must accept ``commit_sha``."""
     if REVIEW_EVENT != "COMMENT":
@@ -48,7 +65,7 @@ async def post_secondary_review(
         result,
         bot_name="kory-source",
         commit_sha=head_sha,
-        review_body=_review_body(result, head_sha, role),
+        review_body=_review_body(result, head_sha, role, routing),
         comment_prefix=preamble,
         require_current_head=True,
     )
@@ -95,9 +112,11 @@ async def post_if_current(
     result.actual_models = list(
         dict.fromkeys(result.actual_models + actual_models_from_work(store, request_id))
     )
+    preference = review_routing_context.get()
+    routing = preference.audit(result.actual_models) if preference else None
     try:
         review_id = await post_secondary_review(
-            provider, pr_info, result, head_sha, existing.role or "opinion"
+            provider, pr_info, result, head_sha, existing.role or "opinion", routing
         )
     except StaleReviewError:
         store.cancel_post(request_id)
@@ -105,5 +124,5 @@ async def post_if_current(
     except Exception as exc:
         store.mark_skipped(request_id, "post_failed", str(exc))
         raise
-    store.mark_posted(request_id, review_id)
+    store.mark_posted(request_id, review_id, routing)
     return review_id

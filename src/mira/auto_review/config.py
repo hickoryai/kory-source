@@ -162,7 +162,13 @@ def jobs_for(has_posted: bool) -> list[tuple[str, str]]:
     return [("opinion", "review-opinion"), ("gate", "review-gate")]
 
 
-def skill_line(role: str, skill: str = "") -> str:
+def skill_line(
+    role: str,
+    skill: str = "",
+    *,
+    prefer: tuple[str, ...] = (),
+    exclude: tuple[str, ...] = (),
+) -> str:
     """One stripped router directive. The model does not see it.
 
     An allowed skill wins. Otherwise the role's default skill is used.
@@ -170,7 +176,12 @@ def skill_line(role: str, skill: str = "") -> str:
     chosen = skill if skill in ALLOWED_SKILLS else ROLE_SKILL.get(role)
     if chosen not in ALLOWED_SKILLS:
         raise ValueError(f"unknown review role {role!r}")
-    return f"[router: skill={chosen}]"
+    directives = [f"skill={chosen}"]
+    if prefer:
+        directives.append(f"prefer={'|'.join(prefer)}")
+    if exclude:
+        directives.append(f"exclude={'|'.join(exclude)}")
+    return f"[router: {', '.join(directives)}]"
 
 
 def review_preamble(head_sha: str, role: str = DEFAULT_ROLE) -> str:

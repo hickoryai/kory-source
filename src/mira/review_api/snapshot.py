@@ -210,6 +210,26 @@ class SnapshotReader:
             )
         return delta
 
+    async def pull_commits(self, meta: PullMeta) -> list[dict[str, Any]]:
+        """Read full commit messages in the frozen PR's base-to-head range."""
+        commits: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            response = await self._get(
+                f"/compare/{meta.base_sha}...{meta.head_sha}",
+                params={"per_page": _COMPARE_PAGE_SIZE, "page": page},
+            )
+            response.raise_for_status()
+            commits.extend(response.json()["commits"])
+            if "next" not in response.links:
+                return commits
+            page += 1
+
+    async def posted_review_body(self, number: int, review_id: str) -> str:
+        response = await self._get(f"/pulls/{number}/reviews/{review_id}")
+        response.raise_for_status()
+        return response.json().get("body") or ""
+
     async def file_content(self, path: str, ref: str) -> str:
         resp = await self._get(f"/contents/{path}", params={"ref": ref})
         if resp.status_code >= 400:
