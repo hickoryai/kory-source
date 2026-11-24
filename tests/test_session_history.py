@@ -336,7 +336,10 @@ def test_cli_failure_names_transcript_position_without_details(setup, monkeypatc
     class FailsOnSecond(Classifier):
         def classify(self, passages):
             if self.calls == 1:
-                raise RuntimeError(f"{QUOTE} owner@example.com /private/transcript")
+                try:
+                    raise ValueError(f"{QUOTE} owner@example.com /private/transcript")
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from exc
             return super().classify(passages)
 
     monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
@@ -347,8 +350,9 @@ def test_cli_failure_names_transcript_position_without_details(setup, monkeypatc
     with pytest.raises(SystemExit) as exit_info:
         main(["import", "--user", USER, "--bundle", str(bundle), "--apply"])
     assert exit_info.value.code == 1
-    err = capsys.readouterr().err
-    assert err == (
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == (
         "session history operation failed at transcript 2 of 2 during classify (RuntimeError); "
         "check bundle, policy and run state\n"
     )

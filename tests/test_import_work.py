@@ -158,7 +158,15 @@ def test_workstation_outage_is_not_requeued(queue):
     assert store.claim() is None
 
 
-async def test_worker_outage_detail_reaches_the_waiter(queue, monkeypatch):
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        ("workstation_outage", "workstation_outage"),
+        ("model_mismatch", "router_failed"),
+        ("seat_exhausted", "router_failed"),
+    ],
+)
+async def test_worker_failure_kind_and_detail_reach_the_waiter(queue, monkeypatch, error, kind):
     monkeypatch.setattr("mira.registry.import_work.POLL_SECONDS", 0.01)
     store, run = queue
     detail = "relay connection reset by peer"
@@ -170,7 +178,7 @@ async def test_worker_outage_detail_reaches_the_waiter(queue, monkeypatch):
             if item:
                 assert store.answer(
                     item["work_id"],
-                    {"error": "workstation_outage", "detail": detail, "actual_model": "unknown"},
+                    {"error": error, "detail": detail, "actual_model": "unknown"},
                 )
                 return
             await asyncio.sleep(0.01)
@@ -182,8 +190,8 @@ async def test_worker_outage_detail_reaches_the_waiter(queue, monkeypatch):
             {"body": {"prompt": "x", "model": "grok-4.7", "timeout_seconds": 10}, "timeout": 10}
         )
     await waiter
-    assert caught.value.kind == "router_failed"
-    assert "import worker: workstation_outage" in str(caught.value)
+    assert caught.value.kind == kind
+    assert f"import worker: {error}" in str(caught.value)
     assert detail in str(caught.value)
 
 
@@ -422,18 +430,41 @@ async def test_worker_reserves_review_capacity_during_import(monkeypatch):
             await asyncio.gather(task, return_exceptions=True)
 
 
-@pytest.mark.parametrize("supplied", [False, True])
-async def test_classifier_worker_transport_keeps_required_tracing(queue, monkeypatch, supplied):
+@pytest.mark.parametrize(
+    ("supplied", "scenario", "expected_calls"),
+    [
+        (False, "pinned", 1),
+        (True, "pinned", 1),
+        (False, "workstation_outage", 2),
+        (False, "other_model", 1),
+        (False, "seat_exhausted", 7),
+        (False, "persistent_outage", 7),
+    ],
+)
+async def test_classifier_worker_transport_keeps_required_tracing(
+    queue, monkeypatch, supplied, scenario, expected_calls
+):
     from mira.registry.decision_passages import Passage
 
     store, run = queue
+    fallback = scenario in {"other_model", "seat_exhausted", "persistent_outage"}
+    if fallback:
+        subject = "owner@example.com"
+        rp.install(rp.manifest(session_subjects=[subject]))
+        store.db.execute(
+            "UPDATE registry_import_runs SET source_system = 'session_history', stream = ? WHERE run_id = ?",
+            (f"session:{subject}", run["run_id"]),
+        )
     monkeypatch.setenv("REGISTRY_EXTRACTION_TRANSPORT", "worker")
     monkeypatch.delenv("MIRA_ROUTER_ACP_URL", raising=False)
-    traces = []
+    monkeypatch.setattr("mira.registry.import_work.POLL_SECONDS", 0.01)
+    traced_models = []
 
     async def trace(call, **kwargs):
-        traces.append(kwargs)
-        return await call()
+        assert kwargs["metadata"]["requested_model"] == "grok-4.7"
+        result = await call()
+        traced_models.append(result["model"])
+        return result
 
     monkeypatch.setattr("mira.llm.router_acp._shared_tracer", lambda: trace)
     from mira.config import LLMConfig
@@ -448,42 +479,64 @@ async def test_classifier_worker_transport_keeps_required_tracing(queue, monkeyp
         else None
     )
     classifier = DecisionClassifier(
-        store.registry, corpus_id=rp.CORPUS, model="grok-4.7", provider=provider
+        store.registry,
+        corpus_id=rp.CORPUS,
+        model="grok-4.7",
+        provider=provider,
+        allow_model_fallback=fallback,
     )
     classifier.import_run_id = run["run_id"]
-    classifier.deadline = time.monotonic() + 10
+    classifier.deadline = time.monotonic() + 180
     classifier.validate_configuration()
+    sleep = asyncio.sleep
+
+    async def skip_backoff(delay):
+        await sleep(0 if delay >= 5 else delay)
+
+    monkeypatch.setattr("mira.registry.decision_llm.asyncio.sleep", skip_backoff)
+
+    actual_model = "grok-4.6" if fallback else "grok-4.7"
 
     async def answer():
-        for _ in range(100):
+        attempts = 0
+        for _ in range(300):
             item = store.claim()
-            if item:
+            if not item:
+                await asyncio.sleep(0.01)
+                continue
+            attempts += 1
+            if expected_calls == 7 and attempts == expected_calls:
+                assert item["body"]["model"] == "auto"
+                assert item["body"]["requested_model"] == "grok-4.7"
+            else:
                 assert item["body"]["model"] == "grok-4.7"
-                text = json.dumps(
-                    {
-                        "results": [
-                            {
-                                "id": "0",
-                                "is_decision": False,
-                                "statement": "",
-                                "quote": "",
-                                "rationale": "",
-                                "confidence": 0.8,
-                            }
-                        ]
-                    }
-                )
-                assert store.answer(item["work_id"], {"text": text, "actual_model": "grok-4.7"})
-                return
-            await asyncio.sleep(0.01)
+            if attempts < expected_calls:
+                error = "seat_exhausted" if scenario == "seat_exhausted" else "workstation_outage"
+                assert store.answer(item["work_id"], {"error": error})
+                continue
+            text = json.dumps(
+                {
+                    "results": [
+                        {
+                            "id": "0",
+                            "is_decision": False,
+                            "statement": "",
+                            "quote": "",
+                            "rationale": "",
+                            "confidence": 0.8,
+                        }
+                    ]
+                }
+            )
+            assert store.answer(item["work_id"], {"text": text, "actual_model": actual_model})
+            return
         pytest.fail("classifier did not enqueue")
 
-    result, _ = await asyncio.gather(
-        classifier._classify_batch([Passage(0, 30, "Use one pool because capacity.")]), answer()
-    )
+    classification = classifier._classify_batch([Passage(0, 30, "Use one pool because capacity.")])
+    result, _ = await asyncio.gather(classification, answer())
     assert len(result) == 1
-    assert traces
-    assert classifier.stats["llm_calls"] == 1
+    assert traced_models == [actual_model]
+    assert classifier.stats["llm_calls"] == expected_calls
 
 
 def test_slack_work_admission_checks_current_channel(queue):

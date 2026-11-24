@@ -272,8 +272,12 @@ class RouterAcpProvider:
         tracer: Callable[..., Awaitable[Any]] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
         relay: bool = True,
+        allow_model_fallback: bool = False,
+        use_unpinned_model: bool = False,
     ) -> None:
         self.config = config
+        self._allow_model_fallback = allow_model_fallback
+        self._use_unpinned_model = use_unpinned_model
         self._relay = relay
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -485,6 +489,11 @@ class RouterAcpProvider:
         conversation = _conversation.get()
         if conversation is not None:
             body["conversation_id"] = conversation[0]
+        elif self._allow_model_fallback:
+            body["allow_model_fallback"] = True
+            if self._use_unpinned_model:
+                body["model"] = "auto"
+                body["requested_model"] = requested
         request: dict[str, Any] = {
             "body": body,
             "timeout": self.config.router_acp_timeout_seconds,
@@ -533,7 +542,10 @@ class RouterAcpProvider:
             actual = str(payload.get("actual_model") or "unknown")
             text = str(payload.get("text") or "")
             pinned = requested not in UNPINNED_MODELS
-            if pinned and actual != requested:
+            fallback_allowed = (
+                self._allow_model_fallback and conversation is None and actual != "unknown"
+            )
+            if pinned and actual != requested and not fallback_allowed:
                 raise self._fail(
                     "model_mismatch",
                     requested=requested,

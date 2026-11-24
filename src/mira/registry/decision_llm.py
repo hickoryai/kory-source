@@ -121,6 +121,7 @@ class DecisionClassifier:
         max_concurrency: int | None = None,
         batch_size: int | None = None,
         batch_chars: int | None = None,
+        allow_model_fallback: bool = False,
     ):
         from mira.llm.router_acp import UNPINNED_MODELS, RouterAcpProvider
 
@@ -134,6 +135,7 @@ class DecisionClassifier:
         self.registry = registry
         self.corpus_id = corpus_id
         self.model = model
+        self.allow_model_fallback = allow_model_fallback
         self.max_concurrency = _max_concurrency(max_concurrency)
         self.batch_size = positive_limit(batch_size, "REGISTRY_EXTRACTION_BATCH_SIZE", BATCH_SIZE)
         self.batch_chars = positive_limit(
@@ -177,11 +179,17 @@ class DecisionClassifier:
         ):
             raise RuntimeError("Decision classification router authentication is not configured")
 
+    @property
+    def _cache_version(self) -> str:
+        if self.allow_model_fallback:
+            return f"{EXTRACTOR_VERSION}+model-fallback"
+        return EXTRACTOR_VERSION
+
     def _cached(self, text: str) -> dict | None:
         rows = self.registry.db.execute(
             "SELECT result_json FROM registry_decision_classifications WHERE corpus_id = ? "
             "AND passage_sha256 = ? AND extractor_version = ? AND model = ?",
-            (self.corpus_id, passage_hash(text), EXTRACTOR_VERSION, self.model),
+            (self.corpus_id, passage_hash(text), self._cache_version, self.model),
         )
         result = json.loads(rows[0][0]) if rows else None
         if result is not None:
@@ -215,7 +223,13 @@ class DecisionClassifier:
             "extractor_version": EXTRACTOR_VERSION,
         }
 
-    def _provider(self, *, timeout: int | None = None, retries: int | None = None):
+    def _provider(
+        self,
+        *,
+        timeout: int | None = None,
+        retries: int | None = None,
+        use_unpinned_model: bool = False,
+    ):
         """Build a fresh strictly-traced provider for one concurrent call.
 
         In particular, do not adjust a shared provider's config for a deadline:
@@ -259,7 +273,12 @@ class DecisionClassifier:
                     "relay": False,
                 }
             )
-        provider = RequiredTracingProvider(config, **kwargs)
+        provider = RequiredTracingProvider(
+            config,
+            allow_model_fallback=self.allow_model_fallback,
+            use_unpinned_model=use_unpinned_model,
+            **kwargs,
+        )
         # Retain this inspection hook for existing callers, but never reuse it
         # for a later completion.
         self.provider = provider
@@ -285,12 +304,16 @@ class DecisionClassifier:
             {"passages": [{"id": ident, "text": p.text} for ident, p in by_id.items()]}
         )
         try:
-            # Import retries must survive a short workstation outage, while
-            # checking the deadline before every sleep and every new attempt.
-            # Disable the provider's shorter retry loop to keep one budget.
-            for attempt in range(7):
+            # Keep one retry budget. When fallback is allowed, use the final
+            # attempt to try any available model instead of the pinned seat.
+            last_attempt = 6
+            for attempt in range(last_attempt + 1):
                 timeout, _ = self._deadline_timeout()
-                provider = self._provider(timeout=timeout, retries=0)
+                provider = self._provider(
+                    timeout=timeout,
+                    retries=0,
+                    use_unpinned_model=self.allow_model_fallback and attempt == last_attempt,
+                )
                 self.stats["llm_calls"] += 1
                 try:
                     raw = await provider.complete(
@@ -302,7 +325,12 @@ class DecisionClassifier:
                     )
                     break
                 except Exception as exc:
-                    if getattr(exc, "code", "") != "router_acp_workstation_outage" or attempt == 6:
+                    code = getattr(exc, "code", "")
+                    retryable = code == "router_acp_workstation_outage" or (
+                        self.allow_model_fallback
+                        and code in {"router_acp_seat_exhausted", "router_acp_model_mismatch"}
+                    )
+                    if not retryable or attempt == last_attempt:
                         raise
                     delay = min(5 * 2**attempt, 30)
                     if self.deadline is not None and time.monotonic() + delay >= self.deadline:
@@ -366,7 +394,7 @@ class DecisionClassifier:
                     (
                         self.corpus_id,
                         digest,
-                        EXTRACTOR_VERSION,
+                        self._cache_version,
                         self.model,
                         json.dumps(result, sort_keys=True),
                         self.registry.clock(),
@@ -490,7 +518,9 @@ class DecisionClassifier:
         }
 
 
-def default_classifier(registry: Any, *, corpus_id: str) -> DecisionClassifier:
+def default_classifier(
+    registry: Any, *, corpus_id: str, allow_model_fallback: bool = False
+) -> DecisionClassifier:
     from mira.config import load_config
 
     config = load_config().llm
@@ -500,4 +530,5 @@ def default_classifier(registry: Any, *, corpus_id: str) -> DecisionClassifier:
         corpus_id=corpus_id,
         model=model,
         max_concurrency=_max_concurrency(),
+        allow_model_fallback=allow_model_fallback,
     )

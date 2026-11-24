@@ -108,6 +108,14 @@ def test_classification_cache_batches_replay_negatives_and_model_version(tmp_pat
     classifier.classify(passages)
     assert len(provider.calls) == 4
 
+    fallback = DecisionClassifier(
+        reg, corpus_id="sample", model="test/pinned", provider=provider, allow_model_fallback=True
+    )
+    assert fallback.estimate(passages)["uncached_passages"] == 3
+    fallback.classify(passages)
+    assert len(provider.calls) == 5
+    assert classifier.estimate(passages)["uncached_passages"] == 0
+
 
 def test_invalid_quote_is_rejected_and_rejection_is_cached(tmp_path):
     reg = registry(tmp_path)

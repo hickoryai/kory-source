@@ -548,7 +548,7 @@ class SessionHistoryImporter:
                 classifier = None
                 if pending:
                     classifier = self.classifier or decision_llm.default_classifier(
-                        self.registry, corpus_id=policy.corpus_id
+                        self.registry, corpus_id=policy.corpus_id, allow_model_fallback=True
                     )
                     if classifier.corpus_id != policy.corpus_id:
                         raise AccessDenied("classifier cache belongs to another corpus")
