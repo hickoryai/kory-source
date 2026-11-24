@@ -1,12 +1,12 @@
 """The review prompt block and the ``search_decisions`` agentic tool.
 
-Only approved objects reach a review: the block and the tool both filter on
-``status = 'approved'``. Proposals stay out of review context entirely.
+Only approved objects reach a review. Proposals stay out.
 
-Review output is posted on the PR, so both paths read with no corpus access
-context: imported history from GitHub and Linear never enters a
-review prompt, a tool result, or a PR comment. ``REVIEW_ACCESS`` is that
-context; tests assert it stays empty.
+``REVIEW_ACCESS`` stays empty. An unscoped word search therefore does not
+return an imported corpus row. An approved claim that matches a path, a
+symbol, or a concept does enter the review block and the contradiction
+check, including a claim imported from a session. Tests assert
+``REVIEW_ACCESS`` stays empty.
 """
 
 from __future__ import annotations

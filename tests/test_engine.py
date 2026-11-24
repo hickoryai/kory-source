@@ -163,7 +163,7 @@ class TestReviewEngine:
         mock_provider.post_review.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_no_post_when_no_comments(self, mock_provider: AsyncMock):
+    async def test_missing_registry_posts_the_decision_check_note(self, mock_provider: AsyncMock):
         llm = MagicMock(spec=LLMProvider)
         no_comments = json.dumps(
             {
@@ -181,7 +181,11 @@ class TestReviewEngine:
         engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=mock_provider)
         await engine.review_pr("https://github.com/test/repo/pull/1")
 
-        mock_provider.post_review.assert_not_called()
+        mock_provider.post_review.assert_awaited_once()
+        posted = mock_provider.post_review.await_args.args[1]
+        assert [c.title for c in posted.comments] == ["Decision check did not run"]
+        assert posted.comments[0].severity is Severity.SUGGESTION
+        assert posted.comments[0].body == "The decision check did not run. This is not a pass."
 
     @pytest.mark.asyncio
     async def test_empty_diff(self, mock_llm: LLMProvider):
@@ -2374,6 +2378,7 @@ class TestAgenticToolsOnIndexedRepos:
         mock_provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
         mock_provider.find_bot_comment = AsyncMock(return_value=None)
         mock_provider.post_comment = AsyncMock()
+        mock_provider.post_review = AsyncMock(return_value=[])
         mock_provider.update_comment = AsyncMock()
         mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
         return mock_provider

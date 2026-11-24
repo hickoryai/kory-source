@@ -339,18 +339,28 @@ async def test_legacy_classification_assigns_manifest_teams_only(reg):
 # ── reviewer and prompt paths ───────────────────────────────────────────
 
 
-async def test_review_paths_never_carry_corpus_data(reg, corpus):
+async def test_review_paths_show_an_approved_import_and_hide_word_search(reg, corpus):
+    """A path match of an approved import is visible. An unscoped search is not."""
     from mira.registry import set_registry
 
     assert REVIEW_ACCESS is None
-    reg.approve(corpus["decision"], HUMAN, rp.reader())
     set_registry(reg)
     try:
         pr = SimpleNamespace(owner="hickoryai", repo="kory-source")
-        block = registry_rule(pr, ["src/secret.py"])
-        assert block is None or "secrets private" not in block["content"]
-        assert "secrets private" not in search_approved(reg, REPO, {"query": "secrets"})
+        hidden = registry_rule(pr, ["src/secret.py"])
+        assert hidden is None or "secrets private" not in hidden["content"]
         assert reg._review_candidates(REPO, {"src/secret.py": {"text": "x", "line": 1}}) == []
+
+        reg.approve(corpus["decision"], HUMAN, rp.reader())
+        block = registry_rule(pr, ["src/secret.py"])
+        assert block is not None
+        assert "secrets private" in block["content"]
+        other = registry_rule(pr, ["src/other.py"])
+        assert other is None or "secrets private" not in other["content"]
+        assert "secrets private" not in search_approved(reg, REPO, {"query": "secrets"})
+        matched = reg._review_candidates(REPO, {"src/secret.py": {"text": "x", "line": 1}})
+        assert [row["id"] for row in matched] == [corpus["decision"]]
+        assert reg._review_candidates(REPO, {"src/other.py": {"text": "x", "line": 1}}) == []
     finally:
         set_registry(None)
 

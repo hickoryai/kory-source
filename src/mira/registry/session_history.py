@@ -746,6 +746,7 @@ class SessionHistoryImporter:
             if file.spans and span is None:
                 raise QuoteMismatch("quote must lie within one transcript event")
             author = file.author(span)
+            touch = rev.original_text[span.start : span.end] if span is not None else ""
             ids = materialize(
                 self.registry,
                 run=run,
@@ -761,6 +762,7 @@ class SessionHistoryImporter:
                 occurred_at=span.timestamp if span else 0,
                 ticket=file.meta.get("ticket", ""),
                 session_history=True,
+                touch_text=touch,
             )
             if not ids:
                 raise RegistryError("could not materialize a session decision")

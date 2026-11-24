@@ -1258,19 +1258,22 @@ def test_advisory_sits_beside_a_contradiction_blocker(env, monkeypatch):
 
     registry = Registry(RegistryDB(path=str(env["tmp"] / "registry.db")))
 
-    async def contradiction(**_kwargs: Any) -> list[dict[str, Any]]:
-        return [
-            {
-                "relation": "narrows",
-                "approved_id": "reg_aaaaaaaaaaaa",
-                "existing_clause": "handlers stay sync",
-                "new_clause": "divide before returning",
-                "path": "app/handler.py",
-                "line": 2,
-            }
-        ]
+    async def contradiction(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "status": "ran",
+            "hits": [
+                {
+                    "relation": "narrows",
+                    "approved_id": "reg_aaaaaaaaaaaa",
+                    "existing_clause": "handlers stay sync",
+                    "new_clause": "divide before returning",
+                    "path": "app/handler.py",
+                    "line": 2,
+                }
+            ],
+        }
 
-    monkeypatch.setattr(registry, "review_findings", contradiction)
+    monkeypatch.setattr(registry, "decision_check", contradiction)
     set_registry(registry)
     env["seat"].findings = []
     env["github"].pulls[7]["body"] = ADVISORY_BODY
