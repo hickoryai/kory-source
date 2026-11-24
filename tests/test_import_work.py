@@ -161,6 +161,7 @@ def test_workstation_outage_is_not_requeued(queue):
 @pytest.mark.parametrize(
     ("error", "kind"),
     [
+        ("timeout", "timeout"),
         ("workstation_outage", "workstation_outage"),
         ("model_mismatch", "router_failed"),
         ("seat_exhausted", "router_failed"),
@@ -169,6 +170,15 @@ def test_workstation_outage_is_not_requeued(queue):
 async def test_worker_failure_kind_and_detail_reach_the_waiter(queue, monkeypatch, error, kind):
     monkeypatch.setattr("mira.registry.import_work.POLL_SECONDS", 0.01)
     store, run = queue
+    body = {"prompt": "x", "model": "grok-4.7", "timeout_seconds": 10}
+    if error == "timeout":
+        subject = "owner@example.com"
+        rp.install(rp.manifest(session_subjects=[subject]))
+        store.db.execute(
+            "UPDATE registry_import_runs SET source_system = 'session_history', stream = ? WHERE run_id = ?",
+            (f"session:{subject}", run["run_id"]),
+        )
+        body["allow_model_fallback"] = True
     detail = "relay connection reset by peer"
     transport = store.transport(run["run_id"], rp.CORPUS, lambda: time.monotonic() + 30)
 
@@ -180,15 +190,14 @@ async def test_worker_failure_kind_and_detail_reach_the_waiter(queue, monkeypatc
                     item["work_id"],
                     {"error": error, "detail": detail, "actual_model": "unknown"},
                 )
-                return
+                if error != "timeout" or item["work_id"].endswith(":2"):
+                    return
             await asyncio.sleep(0.01)
         pytest.fail("import work was not enqueued")
 
     waiter = asyncio.create_task(answer())
     with pytest.raises(RouterTransportError) as caught:
-        await transport(
-            {"body": {"prompt": "x", "model": "grok-4.7", "timeout_seconds": 10}, "timeout": 10}
-        )
+        await transport({"body": body, "timeout": 10})
     await waiter
     assert caught.value.kind == kind
     assert f"import worker: {error}" in str(caught.value)
@@ -437,7 +446,7 @@ async def test_worker_reserves_review_capacity_during_import(monkeypatch):
         (True, "pinned", 1),
         (False, "workstation_outage", 2),
         (False, "other_model", 1),
-        (False, "seat_exhausted", 7),
+        (False, "seat_exhausted", 2),
         (False, "persistent_outage", 7),
         (False, "short_deadline", 2),
     ],
@@ -507,7 +516,7 @@ async def test_classifier_worker_transport_keeps_required_tracing(
                 await asyncio.sleep(0.01)
                 continue
             attempts += 1
-            if (expected_calls == 7 or scenario == "short_deadline") and attempts == expected_calls:
+            if fallback and attempts > 1:
                 assert item["body"]["model"] == "auto"
                 assert item["body"]["requested_model"] == "grok-4.7"
             else:

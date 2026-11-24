@@ -7,7 +7,7 @@ import json
 import pytest
 
 from mira.config import LLMConfig
-from mira.llm.router_acp import RouterAcpProvider
+from mira.llm.router_acp import RouterAcpProvider, RouterTransportError
 from mira.registry import decision_llm
 from mira.registry.db import RegistryDB
 from mira.registry.decision_llm import DecisionClassifier
@@ -181,6 +181,131 @@ def test_malformed_output_is_not_cached_and_fails_closed(tmp_path):
     with pytest.raises(RuntimeError, match="every passage"):
         classifier.classify([Passage(0, 10, "We use X.")])
     assert reg.db.execute("SELECT COUNT(*) FROM registry_decision_classifications") == [(0,)]
+
+
+@pytest.mark.parametrize("failure", ["timeout", "invalid_json", "invalid_results"])
+def test_session_classifier_splits_and_retries_uncached_passage(tmp_path, failure):
+    class FailingProvider(FakeProvider):
+        fail = True
+
+        async def respond(self, request):
+            if self.fail and "Use the second key." in request["body"]["prompt"]:
+                if failure == "timeout":
+                    raise RouterTransportError("synthetic timeout", kind="timeout")
+                text = "not JSON" if failure == "invalid_json" else '{"results": []}'
+                return {"actual_model": "test/pinned", "text": text}
+            return await super().respond(request)
+
+    provider = FailingProvider()
+    classifier = DecisionClassifier(
+        registry(tmp_path),
+        corpus_id="sample",
+        model="test/pinned",
+        provider=provider,
+        allow_model_fallback=True,
+        max_concurrency=1,
+    )
+    texts = ["Use the first key.", "Use the second key."]
+    passages = [Passage(0, len(text), text) for text in texts]
+    error = (
+        decision_llm.ClassificationTimeout
+        if failure == "timeout"
+        else decision_llm.InvalidClassificationResponse
+    )
+    assert [candidate.quote for candidate in classifier.classify(passages)] == [texts[0]]
+    assert isinstance(classifier.unresolved[decision_llm.passage_hash(texts[1])], error)
+    assert classifier.stats["llm_splits"] == 1
+    assert classifier.pending(passages) == [passages[1]]
+
+    provider.fail = False
+    assert [candidate.quote for candidate in classifier.classify(passages)] == texts
+    assert classifier.unresolved == {}
+    assert [[passage["text"] for passage in call] for call in provider.calls] == [
+        [texts[0]],
+        [texts[1]],
+    ]
+
+
+def test_session_classifier_keeps_working_after_account_retries(tmp_path, monkeypatch):
+    class ExhaustedProvider(FakeProvider):
+        attempts = []
+
+        async def respond(self, request):
+            body = request["body"]
+            if "first key" in body["prompt"]:
+                self.attempts.append(body["model"])
+                raise RouterTransportError("seat exhausted", kind="seat_exhausted")
+            return await super().respond(request)
+
+    async def no_backoff(_delay):
+        return None
+
+    monkeypatch.setattr(decision_llm.asyncio, "sleep", no_backoff)
+    provider = ExhaustedProvider(served_model="test/available")
+    classifier = DecisionClassifier(
+        registry(tmp_path),
+        corpus_id="sample",
+        model="test/pinned",
+        provider=provider,
+        allow_model_fallback=True,
+        batch_size=1,
+        max_concurrency=1,
+    )
+    texts = ["Use the first key.", "Use the second key."]
+    passages = [Passage(0, len(text), text) for text in texts]
+    [candidate] = classifier.classify(passages)
+    assert candidate.quote == texts[1]
+    assert candidate.extractor_model == "test/available"
+    assert provider.attempts == ["test/pinned", *(["auto"] * 6)]
+    assert classifier.pending(passages) == [passages[0]]
+    problem = classifier.unresolved[decision_llm.passage_hash(texts[0])]
+    assert isinstance(problem, decision_llm.ClassificationProviderError)
+    assert problem.code == "router_acp_seat_exhausted"
+
+
+def test_session_account_outage_reduces_retry_budget_across_transcripts(tmp_path, monkeypatch):
+    class ExhaustedProvider(FakeProvider):
+        attempts = []
+        available = False
+
+        async def respond(self, request):
+            self.attempts.append(request["body"]["model"])
+            if not self.available:
+                raise RouterTransportError("seat exhausted", kind="seat_exhausted")
+            return await super().respond(request)
+
+    async def no_backoff(_delay):
+        return None
+
+    monkeypatch.setattr(decision_llm.asyncio, "sleep", no_backoff)
+    provider = ExhaustedProvider(served_model="test/available")
+    classifier = DecisionClassifier(
+        registry(tmp_path),
+        corpus_id="sample",
+        model="test/pinned",
+        provider=provider,
+        allow_model_fallback=True,
+        batch_size=1,
+        max_concurrency=1,
+    )
+    passages = [Passage(0, len(text), text) for text in ("First.", "Second.", "Third.")]
+    classifier.import_run_id = "run"
+    assert classifier.classify(passages[:2]) == []
+    assert len(classifier.unresolved) == 2
+    assert provider.attempts == ["test/pinned", *(["auto"] * 7)]
+    assert classifier.classify([passages[2]]) == []
+    assert len(classifier.unresolved) == 1
+    assert provider.attempts[-1:] == ["auto"]
+    assert len(provider.attempts) == 9
+
+    provider.available = True
+    assert len(classifier.classify(passages[:2])) == 2
+    assert provider.attempts[-2:] == ["auto", "test/pinned"]
+
+    classifier.import_run_id = "run"  # A resumed invocation gets a fresh budget.
+    provider.available = False
+    assert classifier.classify([passages[2]]) == []
+    assert provider.attempts[-7:] == ["test/pinned", *(["auto"] * 6)]
 
 
 def test_batch_bounds_and_content_deduplication(tmp_path):

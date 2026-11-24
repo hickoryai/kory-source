@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -61,6 +62,66 @@ SYSTEMS = ("kory_code_session", "agent_memory", "offbox_session")
 EVENT_TYPES = ("user", "text")
 FILE_DIGEST = re.compile(r"[0-9a-f]{64}")
 EMPTY_TEXT_SHA256 = sha256_text("")
+_CREDENTIAL_NAME = (
+    r"api[-_ ]?key|authorization|cookie|credential|password|passwd|secret|session[-_ ]?id|token"
+)
+_CREDENTIAL = re.compile(
+    rf"(?i)\b(?:[\w-]+[_-])?(?:{_CREDENTIAL_NAME})\b[\"']?\s*[:=]\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_PRIVATE_DETAIL = re.compile(
+    r"(?i)\b(?:bearer|basic)\s+[\w.+/=-]+|\b\w[\w+.-]*://[^\s<>]+|"
+    r"\b[\w.+-]+@[\w.-]+\b|(?<![\w:/])(?:[a-z]:[\\/]|/)[^\s<>]+|"
+    r"\b(?:sk-[\w-]{12,}|gh[pousr]_[\w]{16,}|github_pat_[\w]{16,}|eyJ[\w-]+\.[\w-]+\.[\w-]+)\b|"
+    r"-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----"
+)
+
+
+def _error_message(exc: BaseException) -> str:
+    # The router's invalid JSON error can include the entire model reply.
+    if getattr(exc, "code", "") == "router_acp_bad_response":
+        return "router_acp_bad_response: invalid JSON response [response redacted]"
+    message = str(exc)
+    for name, value in os.environ.items():
+        if len(value) >= 4 and re.search(_CREDENTIAL_NAME, name, re.I):
+            message = message.replace(value, "[redacted]")
+    message = _PRIVATE_DETAIL.sub("[redacted]", message)
+    message = _CREDENTIAL.sub("[redacted]", message)
+    message = "".join(char for char in message if char.isprintable() or char.isspace())
+    return " ".join(message.split())[:800]
+
+
+def _failure(exc: BaseException, position: tuple[int, int, str] | None) -> dict:
+    failure: dict[str, Any] = {"class": type(exc).__name__, "message": _error_message(exc)}
+    detail = failure
+    # The classifier and the router both wrap errors before they reach the CLI.
+    for _ in range(4):
+        cause = exc.__cause__
+        if cause is None and not exc.__suppress_context__:
+            cause = exc.__context__
+        if cause is None:
+            break
+        detail["cause"] = {"class": type(cause).__name__, "message": _error_message(cause)}
+        detail = detail["cause"]
+        exc = cause
+    if position is not None:
+        failure["transcript"], failure["transcript_total"], failure["stage"] = position
+    return failure
+
+
+def _failure_line(failure: dict, *, outcome: str) -> str:
+    line = f"session history operation {outcome}"
+    if "transcript" in failure:
+        line += (
+            f" at transcript {failure['transcript']} of {failure['transcript_total']}"
+            f" during {failure['stage']}"
+        )
+    line += f" ({failure['class']}): {failure['message']}"
+    cause = failure.get("cause")
+    while cause:
+        line += f". Caused by {cause['class']}: {cause['message']}"
+        cause = cause.get("cause")
+    return line
 
 
 def digest(data: bytes) -> str:
@@ -405,6 +466,7 @@ class SessionHistoryImporter:
         self.store = ProvenanceStore(registry)
         # (transcript index, pending total, stage) for the failure message.
         self.failure_position: tuple[int, int, str] | None = None
+        self.report: dict | None = None
 
     def _policy(self):
         policy = require_import(self.access)
@@ -490,6 +552,8 @@ class SessionHistoryImporter:
         return files, unavailable, exceptions, digest(raw)
 
     def run(self, *, apply: bool = False) -> dict:
+        self.failure_position = None
+        self.report = None
         policy = self._policy()
         if self.mark_cutover and not apply:
             raise RegistryError("marking cutover requires apply")
@@ -512,8 +576,11 @@ class SessionHistoryImporter:
             stored_evidence=0,
             unavailable_stored=0,
             proposed=0,
+            passages_unresolved=0,
+            transcripts_deferred=0,
         )
         out = {"apply": apply, "unavailable": unavailable, "counts": counts}
+        self.report = out
         if not apply:
             pending = self._new_files(importable, namespace)
             self._new_unavailable(exceptions, namespace)
@@ -581,9 +648,19 @@ class SessionHistoryImporter:
                         continue
                 file = BundleFile.load(self.bundle, entry, namespace=namespace)
                 self.failure_position = (index, len(pending), "classify")
+                classify_position = self.failure_position
                 candidates = classifier.classify(file.passages)
                 if getattr(classifier, "skipped", None):
                     raise RegistryError("classification incomplete for a session-history file")
+                unresolved = getattr(classifier, "unresolved", {})
+                unresolved_count = (
+                    sum(
+                        decision_llm.passage_hash(passage.text) in unresolved
+                        for passage in file.passages
+                    )
+                    if unresolved
+                    else 0
+                )
                 self.failure_position = (index, len(pending), "record")
                 with self._lock(namespace):
                     if not self._new_files([entry], namespace):
@@ -592,9 +669,17 @@ class SessionHistoryImporter:
                     with self.runs.page(run, self.access) as page_counts:
                         page_counts["files_read"] += 1
                         page_counts["excluded_events"] += file.excluded
-                        self._record(run, file, candidates, page_counts)
-                        run["next_checkpoint"] = {"evidence_id": file.revision.evidence_id}
+                        if unresolved_count:
+                            page_counts["passages_unresolved"] += unresolved_count
+                            page_counts["transcripts_deferred"] += 1
+                        else:
+                            self._record(run, file, candidates, page_counts)
+                            run["next_checkpoint"] = {"evidence_id": file.revision.evidence_id}
                     counts.update(page_counts)
+                    if unresolved_count and "failure" not in out:
+                        out["failure"] = _failure(
+                            next(iter(unresolved.values())), classify_position
+                        )
             self.failure_position = None
             with self._lock(namespace):
                 run = self.runs.get(run["run_id"])
@@ -609,8 +694,9 @@ class SessionHistoryImporter:
                             page_counts["unavailable_stored"] += 1
                             run["next_checkpoint"] = {"evidence_id": revision.evidence_id}
                     counts.update(page_counts)
-                self.runs.finish(run, complete=True)
-                if self.mark_cutover and not self._cutover(namespace):
+                complete = not counts["transcripts_deferred"]
+                self.runs.finish(run, complete=complete)
+                if complete and self.mark_cutover and not self._cutover(namespace):
                     record_cursor(
                         self.registry,
                         IMPORTER,
@@ -751,18 +837,14 @@ def main(argv: list[str] | None = None) -> int:
     except DATABASE_ERRORS:
         parser.exit(1, "session history database operation failed\n")
     except Exception as exc:
-        # A raw exception can contain private paths, quotes or source content.
-        # Name only the exception class and the transcript's position.
-        where = ""
-        position = getattr(importer, "failure_position", None)
-        if position is not None:
-            index, total, stage = position
-            where = f" at transcript {index} of {total} during {stage}"
-        parser.exit(
-            1,
-            f"session history operation failed{where} ({type(exc).__name__}); "
-            "check bundle, policy and run state\n",
-        )
+        failure = _failure(exc, getattr(importer, "failure_position", None))
+        report = getattr(importer, "report", None)
+        if report is not None:
+            sys.stdout.write(json.dumps({**report, "failure": failure}) + "\n")
+            sys.stdout.flush()
+        parser.exit(1, _failure_line(failure, outcome="failed") + "\n")
+    if "failure" in out:
+        sys.stderr.write(_failure_line(out["failure"], outcome="deferred") + "\n")
     json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")
     return 0

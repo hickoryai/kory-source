@@ -6,15 +6,18 @@ from pathlib import Path
 
 import pytest
 
+from mira.llm.router_acp import RouterTransportError
 from mira.registry.access import AccessDenied
 from mira.registry.db import RegistryDB
-from mira.registry.imports import Candidate
+from mira.registry.decision_llm import ClassificationTimeout, DecisionClassifier
+from mira.registry.imports import Candidate, ImportRuns
 from mira.registry.model import RegistryError
 from mira.registry.provenance import ProvenanceStore, QuoteMismatch
 from mira.registry.service import Registry
 from mira.registry.session_history import export_bundle, main
 from mira.registry.source_importers import default_source_importers
 from tests import registry_policy as rp
+from tests.test_decision_llm import FakeProvider
 
 USER = "owner@example.com"
 QUOTE = "We decided to keep the existing API."
@@ -127,6 +130,8 @@ def test_dry_run_does_not_write_or_classify(setup):
         "stored_evidence": 0,
         "unavailable_stored": 0,
         "proposed": 0,
+        "passages_unresolved": 0,
+        "transcripts_deferred": 0,
     }
     assert report["unavailable"] == UNAVAILABLE
     assert classifier.calls == 0
@@ -299,6 +304,68 @@ def test_text_identity_ignores_renames_and_tool_changes_after_cutover(setup):
     ) == [(1,)]
 
 
+@pytest.mark.parametrize("failure", ["timeout", "invalid_json"])
+def test_apply_defers_only_unresolved_transcript_and_resumes(setup, monkeypatch, capsys, failure):
+    tmp_path, _, registry, sources, transcript, _ = setup
+    _write(transcript, added=" We use the pending layout because it fits.")
+    _write(sources / "second.jsonl", added=" We use the ready layout because it fits.")
+    bundle = _bundle(tmp_path / "bundle", sources)
+
+    class SlowProvider(FakeProvider):
+        slow = True
+
+        async def respond(self, request):
+            if self.slow and "pending layout" in request["body"]["prompt"]:
+                if failure == "timeout":
+                    raise RouterTransportError("worker timed out", kind="timeout")
+                return {"actual_model": "test/available", "text": "private model reply"}
+            return await super().respond(request)
+
+    provider = SlowProvider(served_model="test/available")
+    classifier = DecisionClassifier(
+        registry,
+        corpus_id=rp.CORPUS,
+        model="test/pinned",
+        provider=provider,
+        allow_model_fallback=True,
+    )
+    monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
+    monkeypatch.setattr("mira.registry.get_registry", lambda: registry)
+    monkeypatch.setattr(
+        "mira.registry.decision_llm.default_classifier", lambda *_args, **_kwargs: classifier
+    )
+    args = ["import", "--user", USER, "--bundle", str(bundle), "--apply", "--mark-cutover"]
+    assert main(args) == 0
+    output = capsys.readouterr()
+    report = json.loads(output.out)
+    assert report["counts"]["passages_unresolved"] == 1
+    assert report["counts"]["transcripts_deferred"] == 1
+    assert report["counts"]["stored_evidence"] == 1
+    assert report["cutover"] is False
+    if failure == "timeout":
+        assert report["failure"]["class"] == ClassificationTimeout.__name__
+        assert "worker timed out" in output.err
+    else:
+        assert report["failure"]["class"] == "InvalidClassificationResponse"
+        assert "invalid JSON response [response redacted]" in output.err
+        assert "private model reply" not in output.out + output.err
+    [decision] = registry._select("source_system = 'kory_code_session'")
+    assert decision["model"] == "test/available"
+    run_id = classifier.import_run_id
+    run = ImportRuns(registry).get(run_id)
+    assert run["status"] == "incomplete"
+    assert run["coverage"]["transcripts_deferred"] == 1
+
+    provider.slow = False
+    assert main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["counts"]["transcripts_deferred"] == 0
+    assert report["counts"]["stored_evidence"] == 1
+    assert report["cutover"] is True
+    assert classifier.import_run_id == run_id
+    assert ImportRuns(registry).get(run_id)["status"] == "complete"
+
+
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
@@ -306,7 +373,7 @@ def test_text_identity_ignores_renames_and_tool_changes_after_cutover(setup):
         ("postgres", "session history database operation failed"),
         (
             RuntimeError,
-            "session history operation failed (RuntimeError); check bundle, policy and run state",
+            "session history operation failed (RuntimeError): SELECT secret FROM [redacted]",
         ),
         (AccessDenied, "session history import denied by corpus policy"),
     ],
@@ -327,7 +394,7 @@ def test_cli_database_and_access_errors_hide_details(setup, monkeypatch, capsys,
     assert capsys.readouterr().err == message + "\n"
 
 
-def test_cli_failure_names_transcript_position_without_details(setup, monkeypatch, capsys):
+def test_cli_failure_names_transcript_and_cause_with_secrets_redacted(setup, monkeypatch, capsys):
     tmp_path, _, registry, sources, transcript, _ = setup
     _write(transcript)
     _write(sources / "second.jsonl", added=" A second session.")
@@ -337,9 +404,13 @@ def test_cli_failure_names_transcript_position_without_details(setup, monkeypatc
         def classify(self, passages):
             if self.calls == 1:
                 try:
-                    raise ValueError(f"{QUOTE} owner@example.com /private/transcript")
+                    raise ValueError(
+                        "worker rejected HTTP 403 Authorization: Bearer example-private-token"
+                    )
                 except ValueError as exc:
-                    raise RuntimeError(str(exc)) from exc
+                    raise RuntimeError(
+                        "classifier transport failed with POSTGRES_PASSWORD=another-private-token"
+                    ) from exc
             return super().classify(passages)
 
     monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
@@ -351,10 +422,20 @@ def test_cli_failure_names_transcript_position_without_details(setup, monkeypatc
         main(["import", "--user", USER, "--bundle", str(bundle), "--apply"])
     assert exit_info.value.code == 1
     output = capsys.readouterr()
-    assert output.out == ""
+    assert "private-token" not in output.out + output.err
+    report = json.loads(output.out)
+    assert report["counts"]["stored_evidence"] == 1
+    assert report["failure"] == {
+        "class": "RuntimeError",
+        "message": "classifier transport failed with [redacted]",
+        "cause": {"class": "ValueError", "message": "worker rejected HTTP 403 [redacted]"},
+        "transcript": 2,
+        "transcript_total": 2,
+        "stage": "classify",
+    }
     assert output.err == (
-        "session history operation failed at transcript 2 of 2 during classify (RuntimeError); "
-        "check bundle, policy and run state\n"
+        "session history operation failed at transcript 2 of 2 during classify (RuntimeError): "
+        "classifier transport failed with [redacted]. Caused by ValueError: worker rejected HTTP 403 [redacted]\n"
     )
     assert registry.db.execute(
         "SELECT COUNT(*) FROM registry_source_revisions WHERE availability = 'available'"
