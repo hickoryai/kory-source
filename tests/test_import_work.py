@@ -446,7 +446,7 @@ async def test_worker_reserves_review_capacity_during_import(monkeypatch):
         (True, "pinned", 1),
         (False, "workstation_outage", 2),
         (False, "other_model", 1),
-        (False, "seat_exhausted", 7),
+        (False, "seat_exhausted", 2),
         (False, "persistent_outage", 7),
         (False, "short_deadline", 2),
     ],
@@ -516,7 +516,7 @@ async def test_classifier_worker_transport_keeps_required_tracing(
                 await asyncio.sleep(0.01)
                 continue
             attempts += 1
-            if (expected_calls == 7 or scenario == "short_deadline") and attempts == expected_calls:
+            if fallback and attempts > 1:
                 assert item["body"]["model"] == "auto"
                 assert item["body"]["requested_model"] == "grok-4.7"
             else:
