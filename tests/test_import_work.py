@@ -439,6 +439,7 @@ async def test_worker_reserves_review_capacity_during_import(monkeypatch):
         (False, "other_model", 1),
         (False, "seat_exhausted", 7),
         (False, "persistent_outage", 7),
+        (False, "short_deadline", 2),
     ],
 )
 async def test_classifier_worker_transport_keeps_required_tracing(
@@ -447,7 +448,7 @@ async def test_classifier_worker_transport_keeps_required_tracing(
     from mira.registry.decision_passages import Passage
 
     store, run = queue
-    fallback = scenario in {"other_model", "seat_exhausted", "persistent_outage"}
+    fallback = scenario in {"other_model", "seat_exhausted", "persistent_outage", "short_deadline"}
     if fallback:
         subject = "owner@example.com"
         rp.install(rp.manifest(session_subjects=[subject]))
@@ -486,7 +487,8 @@ async def test_classifier_worker_transport_keeps_required_tracing(
         allow_model_fallback=fallback,
     )
     classifier.import_run_id = run["run_id"]
-    classifier.deadline = time.monotonic() + 180
+    # A deadline shorter than the first backoff still reaches the unpinned attempt.
+    classifier.deadline = time.monotonic() + (3 if scenario == "short_deadline" else 180)
     classifier.validate_configuration()
     sleep = asyncio.sleep
 
@@ -505,13 +507,17 @@ async def test_classifier_worker_transport_keeps_required_tracing(
                 await asyncio.sleep(0.01)
                 continue
             attempts += 1
-            if expected_calls == 7 and attempts == expected_calls:
+            if (expected_calls == 7 or scenario == "short_deadline") and attempts == expected_calls:
                 assert item["body"]["model"] == "auto"
                 assert item["body"]["requested_model"] == "grok-4.7"
             else:
                 assert item["body"]["model"] == "grok-4.7"
             if attempts < expected_calls:
-                error = "seat_exhausted" if scenario == "seat_exhausted" else "workstation_outage"
+                error = (
+                    "seat_exhausted"
+                    if scenario in {"seat_exhausted", "short_deadline"}
+                    else "workstation_outage"
+                )
                 assert store.answer(item["work_id"], {"error": error})
                 continue
             text = json.dumps(
@@ -537,6 +543,7 @@ async def test_classifier_worker_transport_keeps_required_tracing(
     assert len(result) == 1
     assert traced_models == [actual_model]
     assert classifier.stats["llm_calls"] == expected_calls
+    assert next(iter(result.values()))["actual_model"] == actual_model
 
 
 def test_slack_work_admission_checks_current_channel(queue):
