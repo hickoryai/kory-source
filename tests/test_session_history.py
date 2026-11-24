@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from mira.registry import decision_llm
 from mira.registry.access import AccessDenied
 from mira.registry.db import RegistryDB
 from mira.registry.imports import Candidate
@@ -328,16 +327,7 @@ def test_cli_database_and_access_errors_hide_details(setup, monkeypatch, capsys,
     assert capsys.readouterr().err == message + "\n"
 
 
-@pytest.mark.parametrize(
-    ("failure", "reason"),
-    [
-        (RuntimeError, "RuntimeError"),
-        (decision_llm.ClassificationModelMismatch, "model_mismatch"),
-    ],
-)
-def test_cli_failure_names_transcript_position_without_details(
-    setup, monkeypatch, capsys, failure, reason
-):
+def test_cli_failure_names_transcript_position_without_details(setup, monkeypatch, capsys):
     tmp_path, _, registry, sources, transcript, _ = setup
     _write(transcript)
     _write(sources / "second.jsonl", added=" A second session.")
@@ -349,7 +339,7 @@ def test_cli_failure_names_transcript_position_without_details(
                 try:
                     raise ValueError(f"{QUOTE} owner@example.com /private/transcript")
                 except ValueError as exc:
-                    raise failure(str(exc)) from exc
+                    raise RuntimeError(str(exc)) from exc
             return super().classify(passages)
 
     monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
@@ -363,7 +353,7 @@ def test_cli_failure_names_transcript_position_without_details(
     output = capsys.readouterr()
     assert output.out == ""
     assert output.err == (
-        f"session history operation failed at transcript 2 of 2 during classify ({reason}); "
+        "session history operation failed at transcript 2 of 2 during classify (RuntimeError); "
         "check bundle, policy and run state\n"
     )
     assert registry.db.execute(

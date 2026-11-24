@@ -548,7 +548,7 @@ class SessionHistoryImporter:
                 classifier = None
                 if pending:
                     classifier = self.classifier or decision_llm.default_classifier(
-                        self.registry, corpus_id=policy.corpus_id
+                        self.registry, corpus_id=policy.corpus_id, allow_model_fallback=True
                     )
                     if classifier.corpus_id != policy.corpus_id:
                         raise AccessDenied("classifier cache belongs to another corpus")
@@ -752,20 +752,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.exit(1, "session history database operation failed\n")
     except Exception as exc:
         # A raw exception can contain private paths, quotes or source content.
-        # Name only a fixed reason or the exception class, and the transcript's position.
+        # Name only the exception class and the transcript's position.
         where = ""
         position = getattr(importer, "failure_position", None)
         if position is not None:
             index, total, stage = position
             where = f" at transcript {index} of {total} during {stage}"
-        reason = (
-            "model_mismatch"
-            if isinstance(exc, decision_llm.ClassificationModelMismatch)
-            else type(exc).__name__
-        )
         parser.exit(
             1,
-            f"session history operation failed{where} ({reason}); "
+            f"session history operation failed{where} ({type(exc).__name__}); "
             "check bundle, policy and run state\n",
         )
     json.dump(out, sys.stdout, indent=2)

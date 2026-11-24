@@ -92,6 +92,12 @@ class ImportWorkStore:
                 stream.removeprefix("repository:")
             )
         body = json.loads(row["body_json"])
+        allow_model_fallback = body.get("allow_model_fallback") is True
+        model_matches = body.get("model") == model or (
+            allow_model_fallback
+            and body.get("model") == "auto"
+            and body.get("requested_model") == model
+        )
         return (
             corpus == policy.corpus_id
             and version == policy.policy_version
@@ -102,7 +108,8 @@ class ImportWorkStore:
                 for m in policy.import_operators
             )
             and extractor == "kory-source.decision-llm"
-            and body.get("model") == model
+            and (not allow_model_fallback or source == "session_history")
+            and model_matches
         )
 
     def enqueue(self, run_id: str, corpus_id: str, body: dict, deadline_at: float) -> str:
@@ -117,6 +124,10 @@ class ImportWorkStore:
         # Only completion fields produced by the classifier cross this boundary.
         envelope = {key: body[key] for key in ("prompt", "model", "timeout_seconds")}
         envelope["priority"] = "review"
+        if body.get("allow_model_fallback") is True:
+            envelope["allow_model_fallback"] = True
+            if body.get("model") == "auto":
+                envelope["requested_model"] = body.get("requested_model")
         row = {
             "run_id": run_id,
             "corpus_id": corpus_id,
@@ -288,14 +299,13 @@ class ImportWorkStore:
                     if row["state"] == "answered":
                         return json.loads(row["result_json"])
                     if row["state"] == "failed":
-                        # A terminal queue row can still be retried by the classifier
-                        # under its own budget. Queue timeouts retain their existing behavior.
                         code = row["error_code"] or "router_failed"
-                        kind = (
-                            code
-                            if code in {"workstation_outage", "model_mismatch"}
-                            else "router_failed"
-                        )
+                        kind = "router_failed"
+                        if code == "workstation_outage" or (
+                            request["body"].get("allow_model_fallback") is True
+                            and code in {"seat_exhausted", "model_mismatch"}
+                        ):
+                            kind = code
                         detail = _worker_detail(row.get("result_json"))
                         message = f"import worker: {code}"
                         if detail:
