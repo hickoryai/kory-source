@@ -6,7 +6,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from mira.auto_review.config import GROK_ONLY_SKILL
+from mira.auto_review.config import GROK_OPINION_PASS
 
 _COMPANIES = {
     "claude": ("claude", "opus", "sonnet", "haiku", "fable", "anthropic.com"),
@@ -30,7 +30,9 @@ _COAUTHOR = re.compile(r"^Co-authored-by:\s*(.*?)\s*<([^<>]+)>$", re.IGNORECASE)
 _KORY_CODE = re.compile(r"Kory Code\s*\(([^()]*)\)", re.IGNORECASE)
 _BOT_DOMAIN = {"anthropic.com": "claude", "openai.com": "codex", "x.ai": "grok"}
 _LEGACY_MODEL = re.compile(
-    r"(?:^|\n)---\nModel: ((?:Grok|Opus|Sol) \d+(?:\.\d+)*)\s*\Z", re.IGNORECASE
+    r"(?:^|\n)---\nModel: ((?:Grok|Opus|Sol) \d+(?:\.\d+)*)"
+    r"(?:[ \t]*\nCode families: [^\n]+\nRequested preference: [^\n]+\nFallback: [^\n]+)?\s*\Z",
+    re.IGNORECASE,
 )
 
 
@@ -103,7 +105,7 @@ class ReviewerRouting:
 
 def review_routing(
     role: str,
-    skill: str,
+    pass_id: str,
     detected: set[str],
     previous: str,
     *,
@@ -112,14 +114,10 @@ def review_routing(
     avoided = detected | {previous}
     exclude: tuple[str, ...] = ()
     if role == "gate":
-        available = {"claude", "codex"} - avoided
-        # Keep the other gate model ahead of Grok even when variety steers the first pick.
-        order = (
-            ("sol", "opus", "grok")
-            if available == {"codex"} or (not available and previous == "claude")
-            else ("opus", "sol", "grok")
-        )
-    elif skill == GROK_ONLY_SKILL:
+        # Keep both gate models ahead of Grok even when variety steers the first pick.
+        sol_first = previous == "claude" or ("claude" in detected and "codex" not in detected)
+        order = ("sol", "opus", "grok") if sol_first else ("opus", "sol", "grok")
+    elif pass_id == GROK_OPINION_PASS:
         order = ("grok",)
     else:
         order = ("grok", "opus", "sol")

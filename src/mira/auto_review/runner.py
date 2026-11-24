@@ -19,7 +19,6 @@ from dataclasses import replace
 from typing import Any
 
 from mira.auto_review.config import (
-    ALLOWED_SKILLS,
     CALL_TIMEOUT_SECONDS,
     DEFAULT_ROLE,
     ROLE_SKILL,
@@ -216,7 +215,6 @@ async def execute_request(
     from mira.llm.router_acp import review_skill_line
 
     role = req.role if req.role in ROLE_SKILL else DEFAULT_ROLE
-    named = req.skill if req.skill in ALLOWED_SKILLS else ""
     skill_token = review_skill_line.set(None)
     routing_token = review_routing_context.set(None)
     try:
@@ -258,11 +256,11 @@ async def execute_request(
                 history_unavailable = True
             previous = await _previous_company(reader, req, posted_reviews)
             routing = review_routing(
-                role, named, detected, previous, history_unavailable=history_unavailable
+                role, req.skill, detected, previous, history_unavailable=history_unavailable
             )
             review_routing_context.set(routing)
             review_skill_line.set(
-                skill_line(role, named, prefer=routing.preference, exclude=routing.exclude)
+                skill_line(role, prefer=routing.preference, exclude=routing.exclude)
             )
             provider = ReadOnlySnapshotProvider(reader, snapshot)
             engine = engine_factory(provider, seat_transport(store, req.id))
@@ -322,7 +320,7 @@ async def execute_request(
                         installation_id=req.installation_id,
                         title=meta.title,
                         role=role,
-                        skill=named,
+                        skill=req.skill,
                     )
                     carried = None
                     diff_text = latest.diff_text

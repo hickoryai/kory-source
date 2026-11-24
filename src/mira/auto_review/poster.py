@@ -24,9 +24,7 @@ review_routing_context: ContextVar[ReviewerRouting | None] = ContextVar(
 )
 
 
-def _review_body(
-    result: ReviewResult, head_sha: str, role: str, routing: dict[str, Any] | None
-) -> str:
+def _review_body(result: ReviewResult, head_sha: str, role: str) -> str:
     parts = [review_preamble(head_sha, role)]
     if result.summary:
         parts.append(result.summary)
@@ -37,15 +35,19 @@ def _review_body(
             parts.append(result.walkthrough.to_markdown(bot_name="kory-source"))
         except Exception:
             logger.warning("auto review: walkthrough markdown skipped", exc_info=True)
-    if routing is not None:
-        detected = ", ".join(routing["detected_companies"]) or "unknown"
-        preference = " then ".join(routing["preference"])
-        parts.append(
-            f"Code families: {detected}  \n"
-            f"Requested preference: {preference}  \n"
-            f"Fallback: {routing['fallback']}"
-        )
     return "\n\n".join(part for part in parts if part)
+
+
+def _routing_footer(routing: dict[str, Any] | None) -> str:
+    if routing is None:
+        return ""
+    detected = ", ".join(routing["detected_companies"]) or "unknown"
+    preference = " then ".join(routing["preference"])
+    return (
+        f"Code families: {detected}  \n"
+        f"Requested preference: {preference}  \n"
+        f"Fallback: {routing['fallback']}"
+    )
 
 
 async def post_secondary_review(
@@ -65,7 +67,8 @@ async def post_secondary_review(
         result,
         bot_name="kory-source",
         commit_sha=head_sha,
-        review_body=_review_body(result, head_sha, role, routing),
+        review_body=_review_body(result, head_sha, role),
+        review_footer_suffix=_routing_footer(routing),
         comment_prefix=preamble,
         require_current_head=True,
     )

@@ -91,14 +91,14 @@ async def test_review_skill_line_prefixes_unpinned_prompts_only():
         review_skill_line.reset(token)
     assert provider._requested_model() == "auto"
     assert sent[0]["model"] == "auto"
-    assert sent[0]["prompt"] == "[router: skill=review-opinion]\nreview the diff"
+    assert sent[0]["prompt"] == "[router: skill=review-pr]\nreview the diff"
     assert payload["text"] == "ok"
     token = review_skill_line.set(skill_line("gate"))
     try:
         await provider._post_once("review the diff", "auto")
     finally:
         review_skill_line.reset(token)
-    assert sent[1]["prompt"] == "[router: skill=review-gate]\nreview the diff"
+    assert sent[1]["prompt"] == "[router: skill=review-pr]\nreview the diff"
     token = review_skill_line.set(skill_line("opinion"))
     try:
         await provider._post_once(sent[0]["prompt"], "auto")

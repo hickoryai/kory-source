@@ -1,3 +1,6 @@
+import pytest
+
+from mira.auto_review.config import skill_line
 from mira.auto_review.reviewer_routing import commit_companies, legacy_company, review_routing
 
 
@@ -25,15 +28,25 @@ def test_commit_companies_reads_trailers_and_bot_accounts():
     )
 
 
-def test_review_variety_keeps_both_gate_models_ahead_of_grok():
-    opinion = review_routing("opinion", "", {"codex"}, "")
-    assert opinion.preference[0] == "grok"
-    assert opinion.exclude == ("codex*",)
-    opinion = review_routing("opinion", "", {"codex", "claude"}, "")
-    assert opinion.preference == ("grok",)
-    assert review_routing("gate", "", {"codex", "claude"}, "").preference == ("opus", "sol", "grok")
-    assert review_routing("gate", "", {"codex"}, "claude").preference == ("sol", "opus", "grok")
-    assert review_routing("opinion", "review-grok", {"grok"}, "grok").preference == ("grok",)
+@pytest.mark.parametrize(
+    ("role", "pass_id", "detected", "previous", "directives"),
+    [
+        ("opinion", "", set(), "", "prefer=grok|opus|sol"),
+        ("opinion", "", {"codex"}, "", "prefer=grok|opus, exclude=codex*"),
+        ("opinion", "", {"claude", "codex"}, "", "prefer=grok, exclude=claude*|codex*"),
+        ("opinion", "", {"codex"}, "claude", "prefer=grok, exclude=claude*|codex*"),
+        ("gate", "", {"claude"}, "", "prefer=sol|opus|grok"),
+        ("gate", "", {"claude"}, "codex", "prefer=sol|opus|grok"),
+        ("gate", "", {"codex"}, "claude", "prefer=sol|opus|grok"),
+        ("gate", "", {"codex"}, "", "prefer=opus|sol|grok"),
+        ("gate", "", {"claude", "codex"}, "", "prefer=opus|sol|grok"),
+        ("opinion", "review-grok", {"grok"}, "grok", "prefer=grok"),
+    ],
+)
+def test_review_variety_directives(role, pass_id, detected, previous, directives):
+    routing = review_routing(role, pass_id, detected, previous)
+    line = skill_line(role, prefer=routing.preference, exclude=routing.exclude)
+    assert line == f"[router: skill=review-pr, {directives}]"
 
 
 def test_fallback_records_the_reported_model_and_only_reads_legacy_footer():
@@ -49,3 +62,9 @@ def test_fallback_records_the_reported_model_and_only_reads_legacy_footer():
     assert legacy_company("Summary\n\n---\nModel: Opus 5.5") == "claude"
     assert legacy_company("Model: Grok 4.7\n\nSummary") == ""
     assert legacy_company("Summary\n\n---\nModels: Grok 4.7, Opus 5.5") == ""
+
+    audit_footer = (
+        "\nCode families: codex  \nRequested preference: opus then sol then grok  \nFallback: none"
+    )
+    assert legacy_company("Summary\n\n---\nModel: Sol 6.1  " + audit_footer) == "codex"
+    assert legacy_company("Summary\n\n---\nModels: Grok 4.7, Opus 5.5  " + audit_footer) == ""
