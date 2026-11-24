@@ -410,8 +410,8 @@ _ANY_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
 _ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(?P<text>\S.*)$")
 _SENT = re.compile(r"[^.!?\n]+(?:[.!?]+|$)")
 # These labels occur in source prose as well as under a ``Decisions`` heading.
-# They are deliberately signals only: materialization still creates proposals,
-# never approvals.
+# They are signals only. A human session quote is stored approved in
+# ``materialize``. Every other import stays proposed.
 _EXPLICIT_DECISION = re.compile(
     r"\b(?:the\s+)?(?:owner|case)\s+decision\s*:\s*"
     r"|\bdecided\s+(?:on\s+)?\d{4}-\d{2}-\d{2}\b"
@@ -515,6 +515,69 @@ def extract_decisions(text: str) -> list[Candidate]:
 
 IMPORT_ACTOR_SUB = "history-import"
 
+_BACKTICK_PATH = re.compile(r"`([^`\n]+)`")
+_BARE_PATH = re.compile(r"(?<![\w`@/])(\.?[\w.+-]+(?:/\*\*|(?:/[\w.+-]+)+(?:/\*\*)?))(?![\w./])")
+_REPO_TOKEN = re.compile(r"(?<![\w./])([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?![\w./])")
+
+
+def _inside_url(source: str, start: int) -> bool:
+    """True when ``start`` sits inside a token that already contains ``://``."""
+    head = source[:start]
+    gap = max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"))
+    return "://" in head[gap + 1 :]
+
+
+def _clean_path(token: str) -> str:
+    """A repo-relative path, or ``""`` when the token is a URL or an owner/name."""
+    token = token.strip().strip("`").strip().rstrip(".,:;)")
+    if token.startswith("./"):
+        token = token[2:]
+    if not token or "://" in token or token.lower().startswith(("http://", "https://")):
+        return ""
+    if " " in token or token.count("/") < 1:
+        return ""
+    if token.endswith("/**"):
+        prefix = token[: -len("**")]
+        return prefix if prefix.endswith("/") else ""
+    # owner/name has one slash and no dot. A file path keeps its dot or its extra slash.
+    if token.count("/") == 1 and "." not in token:
+        return ""
+    return token
+
+
+def named_paths(text: str) -> list[str]:
+    """Paths named in ``text``. A trailing ``/**`` is stored as a directory prefix."""
+    found: list[str] = []
+    source = text or ""
+
+    def add(path: str) -> None:
+        if path and path not in found:
+            found.append(path)
+
+    for match in _BACKTICK_PATH.finditer(source):
+        if _inside_url(source, match.start()):
+            continue
+        add(_clean_path(match.group(1)))
+    for match in _BARE_PATH.finditer(source):
+        if _inside_url(source, match.start()):
+            continue
+        add(_clean_path(match.group(1)))
+    return found
+
+
+def named_repo(text: str) -> str:
+    """The first owner/name in ``text`` that is not a file path. Empty when none."""
+    source = text or ""
+    for match in _REPO_TOKEN.finditer(source):
+        if _inside_url(source, match.start()):
+            continue
+        token = match.group(1)
+        left, _, right = token.partition("/")
+        if "." in left or "." in right:
+            continue
+        return token
+    return ""
+
 
 def materialize(
     registry: Any,
@@ -533,17 +596,22 @@ def materialize(
     identity: str = "",
     ticket: str = "",
     session_history: bool = False,
+    touch_text: str = "",
 ) -> list[str]:
-    """Turn extracted candidates into proposed decisions with cited evidence.
+    """Turn extracted candidates into cited decisions.
 
     Each decision's legacy ``author`` columns come from the source's
-    decision_author attribution, never from the importer. Status is always
-    ``proposed``: extraction and import never approve.
+    decision_author attribution, never from the importer. A person's own
+    session quote is stored approved, and the body is that quote. Every other
+    import stays proposed. When an agent summary differs from the quote, the
+    summary is a second proposed object linked to the quote.
 
     ``identity`` keys a passage across revisions of one document (a Markdown
     file): the same quote in a later revision adds supporting evidence to the
     existing decision instead of a duplicate. Session history takes time from
     event metadata and keeps the first occurrence on the decision row.
+    ``touch_text`` names paths and concepts to attach. It does not replace
+    the stored quote.
     """
     from mira.registry.attribution import tool_attribution
     from mira.registry.authority import classify
@@ -620,18 +688,27 @@ def materialize(
                 decision_time = (
                     datetime.strptime(stated_date[1], "%Y-%m-%d").replace(tzinfo=UTC).timestamp()
                 )
+        human_statement = session_history and values.get("actor_kind") == "human"
+        body = cand.quote if human_statement else (cand.statement or cand.quote)
+        item_repo = repo
+        if session_history and not item_repo:
+            item_repo = named_repo(touch_text or cand.quote) or named_repo(cand.quote)
+        link = source_url
+        if human_statement and not link:
+            session_id = str(values.get("source_session_id") or "")
+            link = f"session:{session_id}#{evidence_id}:{cand.start}-{cand.end}"
         key = hashlib.sha256(cand.quote.encode()).hexdigest()[:16]
         sid = f"{identity}:{key}" if identity else f"{evidence_id}:{cand.start}:{key}"
         item = {
             "source_id": sid,
             "source_version": 1,
             "kind": "decision",
-            "title": " ".join((cand.statement or cand.quote).split())[:120],
-            "body": cand.statement or cand.quote,
+            "title": " ".join(body.split())[:120],
+            "body": body,
             "rationale": cand.rationale,
-            "repo": repo,
-            "scope": "repo" if repo else "org",
-            "source_url": source_url,
+            "repo": item_repo,
+            "scope": "repo" if item_repo else "org",
+            "source_url": link,
         }
         if ticket:
             item["ticket"] = ticket
@@ -645,7 +722,13 @@ def materialize(
             else "medium"
         )
         actor = Actor("agent", IMPORT_ACTOR_SUB, f"{extractor}/{extractor_version}")
-        [res] = registry.import_items(source_system, [item], actor, corpus=corpus)
+        [res] = registry.import_items(
+            source_system,
+            [item],
+            actor,
+            status="approved" if human_statement else None,
+            corpus=corpus,
+        )
         if res.get("outcome") == "error":
             counts["extraction_errors"] += 1
             continue
@@ -703,10 +786,25 @@ def materialize(
             ids.append(oid)
             continue
         obj = registry.get(oid)
-        retain_source_provenance(obj, decision_time)
-        if cand.extractor_model:
-            obj["model"] = cand.extractor_model
+        if human_statement:
+            who = source_author or str(values.get("source_session_id") or "") or "human"
+            obj.update(
+                author_kind="human",
+                author=who,
+                decided_by=who,
+                authority_tier="explicit_human",
+                basis="statement",
+                model="",
+                decision_revision=1,
+            )
+            if decision_time:
+                obj["decided_at"] = decision_time
             registry._write(obj)
+        else:
+            retain_source_provenance(obj, decision_time)
+            if cand.extractor_model:
+                obj["model"] = cand.extractor_model
+                registry._write(obj)
         store.add_decision_evidence(
             oid,
             evidence_id,
@@ -722,23 +820,79 @@ def materialize(
             + (f"; model confidence={cand.model_confidence}" if cand.extractor_model else ""),
             run_id=run["run_id"],
         )
-        store.add_decision_version(
-            oid,
-            revision=1,
-            claim_text=cand.statement or cand.quote,
-            corpus_id=corpus[0],
-            authority_tier=tier,
-            authority_reasons=reasons,
-            scope=str(item["scope"]),
-            basis="migration",
-            effective_from=decision_time,
-        )
+        if human_statement:
+            store.add_decision_version(
+                oid,
+                revision=1,
+                claim_text=cand.quote,
+                corpus_id=corpus[0],
+                authority_tier="explicit_human",
+                authority_reasons=reasons,
+                approval_status="approved",
+                scope=str(item["scope"]),
+                basis="statement",
+                effective_from=decision_time,
+            )
+        else:
+            store.add_decision_version(
+                oid,
+                revision=1,
+                claim_text=cand.statement or cand.quote,
+                corpus_id=corpus[0],
+                authority_tier=tier,
+                authority_reasons=reasons,
+                scope=str(item["scope"]),
+                basis="migration",
+                effective_from=decision_time,
+            )
         if anchor:
             store.add_anchor_evidence(oid, corpus_id=corpus[0], evidence_id=evidence_id, **anchor)
             counts["linked_anchors"] += 1
         else:
             counts["unlinked_anchors"] += 1
         counts["extracted_candidates"] += 1
-        counts["proposed"] += 1
+        if session_history:
+            registry.attach_touchpoints(
+                oid,
+                touch_text or cand.quote,
+                repo=item_repo,
+                actor=actor,
+                evidence_id=evidence_id,
+                corpus_id=corpus[0],
+            )
+        if human_statement:
+            counts["approved"] += 1
+        else:
+            counts["proposed"] += 1
         ids.append(oid)
+        summary = cand.statement.strip()
+        if human_statement and summary and summary != cand.quote.strip():
+            [summary_res] = registry.import_items(
+                source_system,
+                [
+                    {
+                        "source_id": f"{sid}:agent-summary",
+                        "source_version": 1,
+                        "kind": "decision",
+                        "title": " ".join(summary.split())[:120],
+                        "body": cand.statement,
+                        "rationale": cand.rationale,
+                        "repo": item_repo,
+                        "scope": "repo" if item_repo else "org",
+                        "source_url": link,
+                    }
+                ],
+                actor,
+                corpus=corpus,
+            )
+            if summary_res.get("outcome") == "created":
+                registry._add_rel(
+                    summary_res["object_id"],
+                    oid,
+                    "derived_from",
+                    actor,
+                    corpus_id=corpus[0],
+                )
+                counts["proposed"] += 1
+                ids.append(summary_res["object_id"])
     return ids

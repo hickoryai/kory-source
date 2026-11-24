@@ -318,9 +318,15 @@ class TestReviewPrSummaryPostingGate:
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert result.pr_summary_block == ""
-        indexing_llm.complete.assert_not_awaited()
         provider.get_pr_description.assert_not_awaited()
         provider.update_pr_description.assert_not_awaited()
+        # No registry is configured, so the review files one note. Summary regen
+        # reads that note. The description writer still does not run.
+        assert indexing_llm.complete.await_count == 1
+        prompt = indexing_llm.complete.await_args.kwargs["messages"][0]["content"]
+        assert "Filed issues" in prompt
+        assert "Decision check did not run" in prompt
+        assert "Write release notes" not in prompt
 
     @pytest.mark.asyncio
     async def test_no_walkthrough_content_leaves_description_untouched(self) -> None:
@@ -332,6 +338,10 @@ class TestReviewPrSummaryPostingGate:
         result = await engine.review_pr("https://github.com/test/repo/pull/1")
 
         assert result.pr_summary_block == ""
-        indexing_llm.complete.assert_not_awaited()
         provider.get_pr_description.assert_not_awaited()
         provider.update_pr_description.assert_not_awaited()
+        assert indexing_llm.complete.await_count == 1
+        prompt = indexing_llm.complete.await_args.kwargs["messages"][0]["content"]
+        assert "Filed issues" in prompt
+        assert "Decision check did not run" in prompt
+        assert "Write release notes" not in prompt

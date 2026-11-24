@@ -24,7 +24,13 @@ from typing import Any
 
 from mira.registry import access as _access
 from mira.registry.access import AccessContext
-from mira.registry.authority import CycleError, check_ancestry_edge, check_symmetric, pair_key
+from mira.registry.authority import (
+    TIER_RANK,
+    CycleError,
+    check_ancestry_edge,
+    check_symmetric,
+    pair_key,
+)
 from mira.registry.conflicts import MAX_CANDIDATES, Judge
 from mira.registry.db import RegistryDB, is_unique_violation
 from mira.registry.model import (
@@ -159,6 +165,13 @@ _ANCESTRY_LOCK = 1282_5002
 _LEGACY_ONLY = "corpus_id = '' AND source_system IN ({})".format(
     ", ".join(f"'{s}'" for s in _access.LEGACY_VISIBLE_SOURCES)
 )
+# Touchpoint reads: a legacy row, or an approved human decision, including one
+# imported from a session. Org-wide word overlap stays on ``_LEGACY_ONLY``.
+_TOUCH_APPROVED = (
+    "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement') AND ("
+    + _LEGACY_ONLY
+    + " OR author_kind = 'human' OR authority_tier = 'explicit_human')"
+)
 # ``_linked`` without filtering: internal callers that never return rows.
 _UNFILTERED: Any = object()
 
@@ -189,44 +202,80 @@ _TICKET_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
 _REVIEW_EXCERPT = 6000
 
 
+def _anchor_applies(anchor: dict, repo: str) -> bool:
+    """An anchor with no repo matches the repo under review. A named repo must match."""
+    stored = str(anchor.get("repo") or "")
+    return not stored or stored.lower() == str(repo or "").lower()
+
+
+def _hunk_paths(path: str, hunks: dict[str, dict]) -> list[str]:
+    """Files in ``hunks`` that this anchor path covers.
+
+    A stored path that ends in ``/`` is a directory prefix. ``src/`` matches
+    ``src/apps/perm.py``. Any other path matches that file only.
+    """
+    if not path:
+        return []
+    if path.endswith("/"):
+        return [name for name in hunks if name.startswith(path)]
+    return [path] if path in hunks else []
+
+
 def _anchors_touched(anchors: list[dict], repo: str, hunks: dict[str, dict]) -> bool:
     """True when an anchor's symbol appears in the diff hunk for its file.
 
     A path-only anchor matches the file. A symbol anchor matches only when the
-    qualified name, or its leaf, appears in that file's hunk text.
+    qualified name, or its leaf, appears in that file's hunk text. An anchor
+    stored with no repo matches this review's repo when the path matches.
     """
     for anchor in anchors:
-        if str(anchor.get("repo") or "").lower() != repo.lower():
-            continue
-        hunk = hunks.get(anchor.get("path") or "")
-        if hunk is None:
+        if not _anchor_applies(anchor, repo):
             continue
         name = str(anchor.get("qualified_name") or "")
-        if not name:
-            return True
-        leaf = name.rsplit(".", 1)[-1]
-        text = hunk.get("text") or ""
-        if name in text or (leaf and leaf in text):
-            return True
+        leaf = name.rsplit(".", 1)[-1] if name else ""
+        for path in _hunk_paths(str(anchor.get("path") or ""), hunks):
+            if not name:
+                return True
+            text = hunks[path].get("text") or ""
+            if name in text or (leaf and leaf in text):
+                return True
     return False
 
 
 def _hit_location(obj: dict, hunks: dict[str, dict], repo: str) -> tuple[str, int]:
     for anchor in obj.get("anchors") or []:
-        if str(anchor.get("repo") or "").lower() != repo.lower():
-            continue
-        path = anchor.get("path") or ""
-        hunk = hunks.get(path)
-        if hunk is None:
+        if not _anchor_applies(anchor, repo):
             continue
         name = str(anchor.get("qualified_name") or "")
         leaf = name.rsplit(".", 1)[-1] if name else ""
-        text = hunk.get("text") or ""
-        if not name or name in text or (leaf and leaf in text):
-            return path, int(hunk.get("line") or 1)
+        for path in _hunk_paths(str(anchor.get("path") or ""), hunks):
+            text = (hunks.get(path) or {}).get("text") or ""
+            if not name or name in text or (leaf and leaf in text):
+                return path, int((hunks.get(path) or {}).get("line") or 1)
     path = next(iter(hunks), "")
     hunk = hunks.get(path) or {}
     return path, int(hunk.get("line") or 1)
+
+
+def _candidate_rank(obj: dict) -> tuple:
+    """Sort key: an explicit human decision outranks an agent decision.
+
+    Lower is stronger. ``author_kind == human`` ranks with ``explicit_human``
+    even when the tier column is blank. Confidence breaks remaining ties.
+    """
+    tier = str(obj.get("authority_tier") or "")
+    rank = TIER_RANK.get(tier, len(TIER_RANK))
+    if obj.get("author_kind") == "human":
+        rank = min(rank, TIER_RANK["explicit_human"])
+    return (rank, -float(obj.get("confidence") or 0))
+
+
+def _phrase_in(text: str, phrase: str) -> bool:
+    """True when ``phrase`` occurs as a whole phrase. Short titles do not match."""
+    cleaned = phrase.strip()
+    if len(cleaned) < 4 or not text:
+        return False
+    return re.search(rf"(?<!\w){re.escape(cleaned)}(?!\w)", text, re.IGNORECASE) is not None
 
 
 def _pr_statement(title: str, body: str, hunks: dict[str, dict]) -> str:
@@ -240,6 +289,20 @@ def _pr_statement(title: str, body: str, hunks: dict[str, dict]) -> str:
     if excerpt:
         parts.append(excerpt)
     return "\n\n".join(parts)
+
+
+def _with_review_sources(statement: str, ticket: str, brief: str, plan: str) -> str:
+    """Append a ticket, child brief, or child plan only when that text is non-empty."""
+    extras = []
+    for label, text in (("Ticket", ticket), ("Child brief", brief), ("Child plan", plan)):
+        cleaned = str(text or "").strip()
+        if cleaned:
+            extras.append(f"{label}:\n{cleaned}")
+    if not extras:
+        return statement
+    if statement:
+        return statement + "\n\n" + "\n\n".join(extras)
+    return "\n\n".join(extras)
 
 
 class Registry:
@@ -686,21 +749,80 @@ class Registry:
     def objects_on_paths(
         self, repo: str, paths: Iterable[str], symbols: Iterable[str] = ()
     ) -> list[str]:
-        """Ids of objects anchored to any of ``paths`` or ``symbols`` in ``repo``."""
+        """Ids of objects anchored to any of ``paths`` or ``symbols`` in ``repo``.
+
+        An anchor stored with an empty repo matches ``repo`` when the path or
+        symbol matches. A stored path that ends in ``/`` matches files under it.
+        """
         wanted_paths, wanted_symbols = set(paths), set(symbols)
         rows = self.db.execute(
-            "SELECT repo, path, qualified_name, symbol_kind, anchor_id, object_id "
-            "FROM registry_anchors WHERE LOWER(repo) = ?",
+            "SELECT repo, path, qualified_name, symbol_kind, anchor_id, object_id "  # noqa: S608
+            "FROM registry_anchors WHERE LOWER(repo) = ? OR repo = ''",
             (repo.lower(),),
         )
         ids: list[str] = []
         for row in rows:
             anchor = self._current_anchor(row[:5])
-            hit = anchor["path"] in wanted_paths or row[1] in wanted_paths
+            path = anchor["path"] or row[1]
+            hit = path in wanted_paths or row[1] in wanted_paths
+            if not hit and str(path).endswith("/"):
+                hit = any(wanted.startswith(path) for wanted in wanted_paths)
             hit = hit or (anchor["qualified_name"] and anchor["qualified_name"] in wanted_symbols)
             if hit and row[5] not in ids:
                 ids.append(row[5])
         return ids
+
+    def attach_touchpoints(
+        self,
+        object_id: str,
+        text: str,
+        *,
+        repo: str = "",
+        actor: Actor,
+        evidence_id: str = "",
+        corpus_id: str = "",
+    ) -> None:
+        """Anchor paths named in ``text`` and link concepts that already exist.
+
+        This does not create a concept. An unresolved path stays a pending
+        anchor. ``repo`` may be empty when the text names no owner/name.
+        """
+        from mira.registry.imports import named_paths, named_repo
+        from mira.registry.provenance import ProvenanceStore
+
+        obj = self.get(object_id)
+        corpus_id = corpus_id or obj["corpus_id"]
+        named = named_repo(text)
+        anchor_repo = named if _REPO_RE.match(named or "") else ""
+        if not anchor_repo and _REPO_RE.match(repo or ""):
+            anchor_repo = repo
+        store = ProvenanceStore(self)
+        for path in named_paths(text):
+            self.db.execute(
+                "INSERT INTO registry_anchors "  # noqa: S608
+                "(object_id, repo, path, qualified_name, symbol_kind, anchor_id, created_at, "
+                "corpus_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (object_id, repo, path, qualified_name) DO NOTHING",
+                (object_id, anchor_repo, path, "", "", "", self.clock(), corpus_id),
+            )
+            store.add_anchor_evidence(
+                object_id,
+                corpus_id=corpus_id,
+                repository=anchor_repo,
+                observed_commit="",
+                path=path,
+                evidence_id=evidence_id,
+                resolution_status="pending",
+            )
+        rows = self.db.execute(
+            "SELECT id, title, corpus_id FROM registry_objects WHERE kind = 'concept'"  # noqa: S608
+        )
+        for concept_id, title, concept_corpus in rows:
+            if concept_corpus and concept_corpus != corpus_id:
+                continue
+            if not _phrase_in(text, str(title or "")):
+                continue
+            self._add_rel(object_id, concept_id, "belongs_to", actor, corpus_id=corpus_id)
 
     def concept_members(self, concept: str) -> list[str]:
         rows = self.db.execute(
@@ -710,6 +832,45 @@ class Registry:
             (concept, concept.lower()),
         )
         return [r[0] for r in rows]
+
+    def concepts_touched(
+        self,
+        *,
+        title: str = "",
+        body: str = "",
+        paths: Iterable[str] = (),
+        repo: str = "",
+    ) -> list[str]:
+        """Concept ids this review should read.
+
+        A concept matches when its title is a phrase in the pull request title,
+        body, or a changed path. An approved claim anchored on a touched path
+        also contributes each concept it belongs to.
+        """
+        path_list = [str(path) for path in paths if path]
+        blob = "\n".join([str(title or ""), str(body or ""), *path_list])
+        found: list[str] = []
+        seen: set[str] = set()
+        rows = self.db.execute(
+            "SELECT id, title FROM registry_objects WHERE kind = 'concept'"  # noqa: S608
+        )
+        for concept_id, concept_title in rows:
+            if concept_id in seen:
+                continue
+            if _phrase_in(blob, str(concept_title or "")):
+                seen.add(concept_id)
+                found.append(concept_id)
+        if path_list:
+            for oid in self.objects_on_paths(repo, path_list):
+                if not self._select(f"id = ? AND {_TOUCH_APPROVED}", (oid,)):
+                    continue
+                for concept in self._linked(oid, "belongs_to"):
+                    concept_id = concept["id"]
+                    if concept_id in seen or concept.get("kind") != "concept":
+                        continue
+                    seen.add(concept_id)
+                    found.append(concept_id)
+        return found
 
     # ── writes ────────────────────────────────────────────────────────
 
@@ -896,9 +1057,9 @@ class Registry:
         the cap. Org-scope candidates only fill the remaining slots, ranked by
         word overlap, so a large org rulebook does not cap every check.
         """
-        # Legacy-visible claims only: judgments go back to the caller, so an
-        # imported corpus decision never becomes a candidate here.
-        approved = (
+        # Org-wide word overlap stays on legacy rows. A shared anchor or concept
+        # can surface an approved human decision, including an imported one.
+        legacy_approved = (
             "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement') "
             f"AND {_LEGACY_ONLY}"
         )
@@ -920,14 +1081,18 @@ class Registry:
                 if oid in seen:
                     continue
                 seen.add(oid)
-                cand = self._select(f"id = ? AND {approved}", (oid,))
+                cand = self._select(f"id = ? AND {_TOUCH_APPROVED}", (oid,))
                 batch += cand
-            ranked += sorted(batch, key=lambda c: -c["confidence"])
+            ranked += sorted(batch, key=_candidate_rank)
         remainder = max(0, len(ranked) - MAX_CANDIDATES)
         ranked = ranked[:MAX_CANDIDATES]
         if len(ranked) < MAX_CANDIDATES:
             mine = _words(f"{obj['title']} {obj['summary']} {obj['body']}")
-            org = [c for c in self._select(f"scope = 'org' AND {approved}") if c["id"] not in seen]
+            org = [
+                c
+                for c in self._select(f"scope = 'org' AND {legacy_approved}")
+                if c["id"] not in seen
+            ]
             org.sort(
                 key=lambda c: (
                     -len(mine & _words(f"{c['title']} {c['summary']} {c['body']}")),
@@ -1163,19 +1328,56 @@ class Registry:
         pr_body: str = "",
         branch: str = "",
         pr_number: int = 0,
+        ticket_body: str = "",
+        child_brief: str = "",
+        child_plan: str = "",
     ) -> list[dict]:
-        """Judge a PR's text against approved decisions on the symbols it touches.
+        """Hits from ``decision_check``. Callers that only need the list stay unchanged."""
+        checked = await self.decision_check(
+            repo=repo,
+            hunks=hunks,
+            pr_title=pr_title,
+            pr_body=pr_body,
+            branch=branch,
+            pr_number=pr_number,
+            ticket_body=ticket_body,
+            child_brief=child_brief,
+            child_plan=child_plan,
+        )
+        return checked["hits"]
 
-        Returns one hit per conflicting approved object. This does not write a
-        registry object: the review comment is the whole output of this path.
+    async def decision_check(
+        self,
+        *,
+        repo: str,
+        hunks: dict[str, dict],
+        pr_title: str = "",
+        pr_body: str = "",
+        branch: str = "",
+        pr_number: int = 0,
+        ticket_body: str = "",
+        child_brief: str = "",
+        child_plan: str = "",
+    ) -> dict:
+        """Judge a PR against approved decisions on the symbols it touches.
+
+        ``status`` is ``ran`` or ``not_run``. An empty candidate list is ``ran``.
+        A missing judge, or any judge error, is ``not_run``. This does not write
+        a registry object and it does not report a pass.
         """
-        if self.judge is None or not hunks:
-            return []
-        candidates = self._review_candidates(repo, hunks)
+        try:
+            candidates = self._review_candidates(repo, hunks, title=pr_title, body=pr_body)
+        except Exception as exc:
+            logger.warning("Registry decision check could not list candidates: %s", exc)
+            return {"status": "not_run", "hits": []}
         if not candidates:
-            return []
+            return {"status": "ran", "hits": []}
+        if self.judge is None:
+            return {"status": "not_run", "hits": []}
         session = f"review:{repo}#{pr_number}" if pr_number else f"review:{repo}"
-        statement = _pr_statement(pr_title, pr_body, hunks)
+        statement = _with_review_sources(
+            _pr_statement(pr_title, pr_body, hunks), ticket_body, child_brief, child_plan
+        )
         synthetic = {
             "id": "",
             "kind": "rule",
@@ -1184,13 +1386,13 @@ class Registry:
             "body": statement,
         }
 
-        async def _one(cand: dict) -> dict | None:
+        async def _one(cand: dict) -> dict | None | str:
             self._record_prompt(session, "", cand["id"])
             try:
                 verdict = await self.judge(synthetic, cand)  # type: ignore[misc]
             except Exception as exc:
                 logger.warning("Registry review judge failed on %s: %s", cand["id"], exc)
-                return None
+                return "error"
             if verdict["relation"] == "none":
                 return None
             cand["anchors"] = self.anchors(cand["id"])
@@ -1206,30 +1408,46 @@ class Registry:
             }
 
         results = await asyncio.gather(*(_one(c) for c in candidates))
-        return [r for r in results if r is not None]
+        hits = [r for r in results if isinstance(r, dict)]
+        if any(r == "error" for r in results):
+            return {"status": "not_run", "hits": hits}
+        return {"status": "ran", "hits": hits}
 
-    def _review_candidates(self, repo: str, hunks: dict[str, dict]) -> list[dict]:
-        """Approved legacy-visible claims whose anchored symbol the diff touches.
+    def _review_candidates(
+        self,
+        repo: str,
+        hunks: dict[str, dict],
+        *,
+        title: str = "",
+        body: str = "",
+    ) -> list[dict]:
+        """Approved claims the diff or its topic touches.
 
-        Review output is posted to the PR, so corpus decisions never enter it.
+        A path or symbol anchor qualifies. So does an approved claim that
+        belongs to a concept named in the title, body, or changed paths, or to
+        a concept that an approved claim on a touched path belongs to. An
+        explicit human decision ranks first. An unscoped corpus search does not.
         """
-        approved = (
-            "status = 'approved' AND kind IN ('decision', 'rule', 'constraint', 'requirement') "
-            f"AND {_LEGACY_ONLY}"
-        )
+        paths = list(hunks)
+        path_ids = self.objects_on_paths(repo, paths, [])
+        topic_ids: list[str] = []
+        for concept_id in self.concepts_touched(title=title, body=body, paths=paths, repo=repo):
+            topic_ids += self.concept_members(concept_id)
+        on_topic = set(topic_ids)
         ranked = []
         seen: set[str] = set()
-        for oid in self.objects_on_paths(repo, list(hunks), []):
+        for oid in [*path_ids, *topic_ids]:
             if oid in seen:
                 continue
             seen.add(oid)
-            rows = self._select(f"id = ? AND {approved}", (oid,))
+            rows = self._select(f"id = ? AND {_TOUCH_APPROVED}", (oid,))
             if not rows:
                 continue
             obj = rows[0]
-            if _anchors_touched(self.anchors(obj["id"]), repo, hunks):
-                ranked.append(obj)
-        ranked.sort(key=lambda c: -c["confidence"])
+            if oid not in on_topic and not _anchors_touched(self.anchors(obj["id"]), repo, hunks):
+                continue
+            ranked.append(obj)
+        ranked.sort(key=_candidate_rank)
         return ranked[:MAX_CANDIDATES]
 
     # ── approval lifecycle ────────────────────────────────────────────
@@ -1820,8 +2038,18 @@ class Registry:
         if ids is not None:
             if not ids:
                 return []
-            where.append(f"id IN ({', '.join('?' for _ in ids)})")
-            params += sorted(ids)
+            # A path, symbol, or concept already narrowed the set. An approved
+            # claim in that set is readable even when its corpus is hidden from
+            # an unscoped search.
+            id_list = sorted(ids)
+            marks = ", ".join("?" for _ in id_list)
+            claim_marks = ", ".join("?" for _ in CLAIM_KINDS)
+            where[0] = (
+                f"({pred} OR (status = 'approved' AND kind IN ({claim_marks}) AND id IN ({marks})))"
+            )
+            params = [*pparams, *CLAIM_KINDS, *id_list, *params[len(pparams) :]]
+            where.append(f"id IN ({marks})")
+            params += id_list
         rows = self._select(
             " AND ".join(where) + " ORDER BY confidence DESC, created_at DESC", params
         )
@@ -1883,7 +2111,13 @@ class Registry:
         include_proposals: bool = True,
         access: AccessContext | None = None,
     ) -> list[dict]:
-        """Claims on these files, symbols, or concepts, plus org-scope rules, by confidence."""
+        """Claims on these files, symbols, or concepts, plus org-scope rules, by confidence.
+
+        An approved claim found by path, symbol, or concept is returned even
+        when it belongs to a corpus the caller cannot search by words. A
+        proposed corpus row stays hidden. Org-scope rules stay on the caller's
+        normal visibility.
+        """
         statuses = ("approved", "proposed") if include_proposals else ("approved",)
         ids = list(self.objects_on_paths(repo, paths, symbols)) if repo else []
         for c in concepts:
@@ -1894,10 +2128,11 @@ class Registry:
                 obj = self.get(oid)
             except NotFound:
                 continue
+            touched = obj["status"] == "approved" and obj["kind"] in CLAIM_KINDS
             if (
                 obj["kind"] in CLAIM_KINDS
                 and obj["status"] in statuses
-                and _access.visible(obj, access)
+                and (_access.visible(obj, access) or touched)
             ):
                 found[oid] = obj
         for obj in self._select_visible(

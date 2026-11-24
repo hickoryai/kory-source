@@ -1,12 +1,12 @@
 """The review prompt block and the ``search_decisions`` agentic tool.
 
-Only approved objects reach a review: the block and the tool both filter on
-``status = 'approved'``. Proposals stay out of review context entirely.
+Only approved objects reach a review. Proposals stay out.
 
-Review output is posted on the PR, so both paths read with no corpus access
-context: imported history from GitHub and Linear never enters a
-review prompt, a tool result, or a PR comment. ``REVIEW_ACCESS`` is that
-context; tests assert it stays empty.
+``REVIEW_ACCESS`` stays empty. An unscoped word search therefore does not
+return an imported corpus row. An approved claim that matches a path, a
+symbol, or a concept does enter the review block and the contradiction
+check, including a claim imported from a session. Tests assert
+``REVIEW_ACCESS`` stays empty.
 """
 
 from __future__ import annotations
@@ -91,8 +91,18 @@ def registry_rule(pr_info: Any, paths: Iterable[str]) -> dict[str, str] | None:
     if registry is None:
         return None
     repo = f"{pr_info.owner}/{pr_info.repo}"
+    path_list = list(paths)
+    title = str(getattr(pr_info, "title", "") or "")
+    body = str(getattr(pr_info, "description", "") or getattr(pr_info, "body", "") or "")
+    concepts = registry.concepts_touched(title=title, body=body, paths=path_list, repo=repo)
     return render_block(
-        registry.context_for_paths(repo, list(paths), include_proposals=False, access=REVIEW_ACCESS)
+        registry.context_for_paths(
+            repo,
+            path_list,
+            concepts=concepts,
+            include_proposals=False,
+            access=REVIEW_ACCESS,
+        )
     )
 
 
