@@ -263,6 +263,51 @@ def test_session_classifier_keeps_working_after_account_retries(tmp_path, monkey
     assert problem.code == "router_acp_seat_exhausted"
 
 
+def test_session_account_outage_reduces_retry_budget_across_transcripts(tmp_path, monkeypatch):
+    class ExhaustedProvider(FakeProvider):
+        attempts = []
+        available = False
+
+        async def respond(self, request):
+            self.attempts.append(request["body"]["model"])
+            if not self.available:
+                raise RouterTransportError("seat exhausted", kind="seat_exhausted")
+            return await super().respond(request)
+
+    async def no_backoff(_delay):
+        return None
+
+    monkeypatch.setattr(decision_llm.asyncio, "sleep", no_backoff)
+    provider = ExhaustedProvider(served_model="test/available")
+    classifier = DecisionClassifier(
+        registry(tmp_path),
+        corpus_id="sample",
+        model="test/pinned",
+        provider=provider,
+        allow_model_fallback=True,
+        batch_size=1,
+        max_concurrency=1,
+    )
+    passages = [Passage(0, len(text), text) for text in ("First.", "Second.", "Third.")]
+    classifier.import_run_id = "run"
+    assert classifier.classify(passages[:2]) == []
+    assert len(classifier.unresolved) == 2
+    assert provider.attempts == ["test/pinned", *(["auto"] * 7)]
+    assert classifier.classify([passages[2]]) == []
+    assert len(classifier.unresolved) == 1
+    assert provider.attempts[-1:] == ["auto"]
+    assert len(provider.attempts) == 9
+
+    provider.available = True
+    assert len(classifier.classify(passages[:2])) == 2
+    assert provider.attempts[-2:] == ["auto", "test/pinned"]
+
+    classifier.import_run_id = "run"  # A resumed invocation gets a fresh budget.
+    provider.available = False
+    assert classifier.classify([passages[2]]) == []
+    assert provider.attempts[-7:] == ["test/pinned", *(["auto"] * 6)]
+
+
 def test_batch_bounds_and_content_deduplication(tmp_path):
     reg = registry(tmp_path)
     provider = FakeProvider()

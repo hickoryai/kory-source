@@ -161,11 +161,21 @@ class DecisionClassifier:
         self.unresolved: dict[str, Exception] = {}
         self.provider: Any = None
         self.deadline: float | None = None
-        self.import_run_id: str | None = None
+        self._import_run_id: str | None = None
+        self._account_probe_only = False
         self.worker_transport = (
             os.environ.get("REGISTRY_EXTRACTION_TRANSPORT", "router") == "worker"
         )
         self.classification_outcomes: dict[str, dict] = {}
+
+    @property
+    def import_run_id(self) -> str | None:
+        return self._import_run_id
+
+    @import_run_id.setter
+    def import_run_id(self, run_id: str | None) -> None:
+        self._import_run_id = run_id
+        self._account_probe_only = False
 
     def validate_configuration(self) -> None:
         """Imports never silently dial the provider's local-development fallback."""
@@ -335,7 +345,7 @@ class DecisionClassifier:
             deadline_final = False
             use_unpinned = False
             for attempt in range(last_attempt + 1):
-                final = attempt == last_attempt or deadline_final
+                final = attempt == last_attempt or deadline_final or self._account_probe_only
                 timeout, _ = self._deadline_timeout()
                 provider = self._provider(
                     timeout=timeout,
@@ -351,6 +361,7 @@ class DecisionClassifier:
                         ],
                         json_mode=True,
                     )
+                    self._account_probe_only = False
                     break
                 except Exception as exc:
                     code = getattr(exc, "code", "")
@@ -361,6 +372,9 @@ class DecisionClassifier:
                         raise RuntimeError(
                             "classification time budget reached; resume reuses completed batches"
                         ) from exc
+                    if retryable and final and self.allow_model_fallback:
+                        # Later batches can probe for recovery without repeating the backoff.
+                        self._account_probe_only = True
                     if not retryable or final:
                         raise
                     delay = min(5 * 2**attempt, 30)
@@ -526,6 +540,8 @@ class DecisionClassifier:
         self.skipped = {}
         self.unresolved = {}
         self.classification_outcomes = {}
+        if self.import_run_id is None:
+            self._account_probe_only = False
         pending = self.pending(passages)
         if pending:
             _run(self._classify_batches(pending))
