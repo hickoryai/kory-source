@@ -833,6 +833,45 @@ class Registry:
         )
         return [r[0] for r in rows]
 
+    def concepts_touched(
+        self,
+        *,
+        title: str = "",
+        body: str = "",
+        paths: Iterable[str] = (),
+        repo: str = "",
+    ) -> list[str]:
+        """Concept ids this review should read.
+
+        A concept matches when its title is a phrase in the pull request title,
+        body, or a changed path. An approved claim anchored on a touched path
+        also contributes each concept it belongs to.
+        """
+        path_list = [str(path) for path in paths if path]
+        blob = "\n".join([str(title or ""), str(body or ""), *path_list])
+        found: list[str] = []
+        seen: set[str] = set()
+        rows = self.db.execute(
+            "SELECT id, title FROM registry_objects WHERE kind = 'concept'"  # noqa: S608
+        )
+        for concept_id, concept_title in rows:
+            if concept_id in seen:
+                continue
+            if _phrase_in(blob, str(concept_title or "")):
+                seen.add(concept_id)
+                found.append(concept_id)
+        if path_list:
+            for oid in self.objects_on_paths(repo, path_list):
+                if not self._select(f"id = ? AND {_TOUCH_APPROVED}", (oid,)):
+                    continue
+                for concept in self._linked(oid, "belongs_to"):
+                    concept_id = concept["id"]
+                    if concept_id in seen or concept.get("kind") != "concept":
+                        continue
+                    seen.add(concept_id)
+                    found.append(concept_id)
+        return found
+
     # ── writes ────────────────────────────────────────────────────────
 
     async def put_object(self, fields: dict, actor: Actor) -> dict:
@@ -1327,7 +1366,7 @@ class Registry:
         a registry object and it does not report a pass.
         """
         try:
-            candidates = self._review_candidates(repo, hunks)
+            candidates = self._review_candidates(repo, hunks, title=pr_title, body=pr_body)
         except Exception as exc:
             logger.warning("Registry decision check could not list candidates: %s", exc)
             return {"status": "not_run", "hits": []}
@@ -1374,15 +1413,30 @@ class Registry:
             return {"status": "not_run", "hits": hits}
         return {"status": "ran", "hits": hits}
 
-    def _review_candidates(self, repo: str, hunks: dict[str, dict]) -> list[dict]:
-        """Approved claims whose anchor the diff touches.
+    def _review_candidates(
+        self,
+        repo: str,
+        hunks: dict[str, dict],
+        *,
+        title: str = "",
+        body: str = "",
+    ) -> list[dict]:
+        """Approved claims the diff or its topic touches.
 
-        A legacy row qualifies. So does an approved human decision, including
-        one imported from a session. An unscoped corpus search does not.
+        A path or symbol anchor qualifies. So does an approved claim that
+        belongs to a concept named in the title, body, or changed paths, or to
+        a concept that an approved claim on a touched path belongs to. An
+        explicit human decision ranks first. An unscoped corpus search does not.
         """
+        paths = list(hunks)
+        path_ids = self.objects_on_paths(repo, paths, [])
+        topic_ids: list[str] = []
+        for concept_id in self.concepts_touched(title=title, body=body, paths=paths, repo=repo):
+            topic_ids += self.concept_members(concept_id)
+        on_topic = set(topic_ids)
         ranked = []
         seen: set[str] = set()
-        for oid in self.objects_on_paths(repo, list(hunks), []):
+        for oid in [*path_ids, *topic_ids]:
             if oid in seen:
                 continue
             seen.add(oid)
@@ -1390,8 +1444,9 @@ class Registry:
             if not rows:
                 continue
             obj = rows[0]
-            if _anchors_touched(self.anchors(obj["id"]), repo, hunks):
-                ranked.append(obj)
+            if oid not in on_topic and not _anchors_touched(self.anchors(obj["id"]), repo, hunks):
+                continue
+            ranked.append(obj)
         ranked.sort(key=_candidate_rank)
         return ranked[:MAX_CANDIDATES]
 

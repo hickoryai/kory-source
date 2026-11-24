@@ -91,8 +91,18 @@ def registry_rule(pr_info: Any, paths: Iterable[str]) -> dict[str, str] | None:
     if registry is None:
         return None
     repo = f"{pr_info.owner}/{pr_info.repo}"
+    path_list = list(paths)
+    title = str(getattr(pr_info, "title", "") or "")
+    body = str(getattr(pr_info, "description", "") or getattr(pr_info, "body", "") or "")
+    concepts = registry.concepts_touched(title=title, body=body, paths=path_list, repo=repo)
     return render_block(
-        registry.context_for_paths(repo, list(paths), include_proposals=False, access=REVIEW_ACCESS)
+        registry.context_for_paths(
+            repo,
+            path_list,
+            concepts=concepts,
+            include_proposals=False,
+            access=REVIEW_ACCESS,
+        )
     )
 
 

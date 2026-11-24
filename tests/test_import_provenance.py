@@ -8,8 +8,9 @@ from unittest.mock import patch
 
 import pytest
 
-from mira.models import ReviewComment, Severity
+from mira.models import PRInfo, ReviewComment, Severity
 from mira.registry import attribution as attr
+from mira.registry import set_registry
 from mira.registry.db import RegistryDB
 from mira.registry.imports import (
     Candidate,
@@ -20,7 +21,7 @@ from mira.registry.imports import (
     named_repo,
 )
 from mira.registry.model import Actor, Forbidden
-from mira.registry.prompt import search_approved
+from mira.registry.prompt import registry_rule, search_approved
 from mira.registry.provenance import ProvenanceStore, SourceRevision
 from mira.registry.review_gate import attach, finish
 from mira.registry.service import Registry, _candidate_rank
@@ -622,3 +623,55 @@ index 1111111..2222222 100644
         await attach(engine, pr, [], [], diff, "Touch another file", "No skill change.")
     assert engine._registry_decision_check["status"] == "ran"
     assert await finish(engine, []) == []
+
+
+async def test_review_title_names_the_concept_without_a_touched_anchor(tmp_path):
+    registry = _fixed_registry(tmp_path)
+    registry.concept(CONCEPT, Actor("human", PERSON))
+    run = _session_run(registry)
+    for identity, quote, url in (
+        ("q4", Q4, "https://example.test/messages/q4"),
+        ("q8", Q8, "https://example.test/messages/q8"),
+        ("naming", NAMING, "https://example.test/messages/naming"),
+    ):
+        _store_quote(registry, run, quote, source_url=url, identity=identity)
+
+    pr = PRInfo(
+        title=CONCEPT,
+        description="The diff does not name the skill file.",
+        base_branch="main",
+        head_branch="feature",
+        url="https://example.test/reviews/topic",
+        number=1,
+        owner="example",
+        repo="widget",
+    )
+    set_registry(registry)
+    try:
+        block = registry_rule(pr, ["src/other.py"])
+    finally:
+        set_registry(None)
+    assert block is not None
+    decision_lines = [
+        line for line in block["content"].splitlines() if line.startswith("- (registry:")
+    ]
+    assert len(decision_lines) == 3
+    assert "one skill" in block["content"]
+    assert "should be called `review-pr`" in block["content"]
+    assert "only valid name" in block["content"]
+
+    seen: list[str] = []
+
+    async def judge(synthetic: dict, cand: dict) -> dict:
+        seen.append(cand["body"])
+        return {"relation": "none", "new_clause": "", "existing_clause": cand["body"]}
+
+    registry.judge = judge
+    checked = await registry.decision_check(
+        repo="example/widget",
+        hunks={"src/other.py": {"text": "x = 1\n", "line": 1}},
+        pr_title=CONCEPT,
+        pr_body="The diff does not name the skill file.",
+    )
+    assert checked == {"status": "ran", "hits": []}
+    assert set(seen) == {Q4, Q8, NAMING}
