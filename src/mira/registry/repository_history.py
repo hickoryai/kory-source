@@ -96,8 +96,10 @@ def _error_preview(errors: list[str]) -> dict[str, Any]:
     }
 
 
-# A group that failed for one of these reasons failed in transport, not on its
-# content. A later batch retries it, so it never enters checkpoint.failed.
+# A group that failed for one of these reasons failed in transport, or the
+# completion served a different model than the pin. A later batch retries it,
+# so it never enters checkpoint.failed. The pin sentence is the catalog text.
+# The exception code is not in that text, so the router_acp_ marker misses it.
 _RETRYABLE_MARKERS = (
     "workstation_outage",
     "Router workstation outage",
@@ -111,6 +113,7 @@ _RETRYABLE_MARKERS = (
     "OperationalError",
     "connection is lost",
     "server closed the connection",
+    "Pinned model was not used",
 )
 # Consecutive retryable group failures that end a batch early, so an outage
 # cannot spend the whole time budget re-failing groups.

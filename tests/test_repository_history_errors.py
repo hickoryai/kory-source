@@ -378,6 +378,8 @@ def _fail_for(provider, names):
         "classification group: import worker: no_worker_before_deadline",
         "classification group: NonRetriableLLMError: router_acp_failed",
         "classification group: OperationalError: the connection is lost",
+        "classification group: traced decision classification failed: NonRetriableLLMError: "
+        "Pinned model was not used: requested pinned-model, actual other-model",
     ],
 )
 def test_transport_failures_are_retryable(message):
