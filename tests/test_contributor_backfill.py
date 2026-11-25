@@ -95,7 +95,9 @@ def test_backfill_skips_an_author_self_review(db: AppDatabase) -> None:
     ordinary = _review(5, "bob")
     posted = _review(6, "carol")
     posted.body = format_author_self_review("d" * 40, "The cache key drops the tenant id.")
-    pr = _pr(1, "alice", reviews=[ordinary, posted])
+    quoted = _review(7, "dave")
+    quoted.body = "The cache key is still wrong.\n\n" + posted.body
+    pr = _pr(1, "alice", reviews=[ordinary, posted, quoted])
     pr.get_review_comments.return_value = []
     gh = MagicMock()
     repo = MagicMock()
@@ -115,8 +117,9 @@ def test_backfill_skips_an_author_self_review(db: AppDatabase) -> None:
     finally:
         mod.Github = orig_github
 
-    assert counts["reviews"] == 1
+    assert counts["reviews"] == 2
     assert db.get_contributor_by_login("github", "bob") is not None
+    assert db.get_contributor_by_login("github", "dave") is not None
     assert db.get_contributor_by_login("github", "carol") is None
 
 

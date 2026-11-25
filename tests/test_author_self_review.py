@@ -76,6 +76,16 @@ def test_posted_shape_matches_only_its_recorded_head() -> None:
     assert section_for_head(description, OTHER) is None
     assert section_for_head(description, HEAD[:39]) is None
     assert not is_author_self_review(review_preamble(HEAD))
+    fenced = format_author_self_review(
+        HEAD,
+        "See this.\n\n```python\n# tenant id\n```\n\nThe sentence after the fence.",
+    )
+    fenced += "\n\n## Summary by Kory Source\n\n- cache change\n"
+    fenced_section = section_for_head(fenced, HEAD)
+    assert fenced_section is not None
+    assert "# tenant id" in fenced_section.text
+    assert "The sentence after the fence." in fenced_section.text
+    assert "Summary by Kory Source" not in fenced_section.text
     prompt = _prompt(description, HEAD)
     assert "## Author self-review (not authoritative)" in prompt
     assert "Do not trust them" in prompt
@@ -110,6 +120,10 @@ def test_author_self_review_never_counts_as_a_kory_source_review() -> None:
     assert is_author_self_review(posted)
     assert is_prior_kory_source_review(posted, "kory-source[bot]") is False
     assert is_prior_kory_source_review(posted, "octocat") is False
+    quoted_review = "The cache key is still wrong.\n\n" + posted
+    assert is_author_self_review(quoted_review) is False
+    quoted_kory = review_preamble(HEAD, "gate") + "\n\n" + posted
+    assert is_prior_kory_source_review(quoted_kory, "kory-source[bot]") is True
 
     preamble = review_preamble(HEAD, "gate")
     assert "Reviewed head" in preamble
@@ -381,6 +395,8 @@ async def test_issue_comments_lists_bodies_without_retrying() -> None:
         nonlocal calls
         calls += 1
         assert request.url.path.endswith("/issues/7/comments")
+        assert request.url.params["sort"] == "created"
+        assert request.url.params["direction"] == "desc"
         if calls == 1:
             return httpx.Response(
                 200,
@@ -396,6 +412,38 @@ async def test_issue_comments_lists_bodies_without_retrying() -> None:
     assert calls == 2
     assert comments[0] == {"login": "octocat", "body": "one"}
     assert comments[-1] == {"login": "octocat", "body": "two"}
+
+
+@pytest.mark.asyncio
+async def test_load_keeps_the_newest_matching_author_comment() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        assert request.url.params["direction"] == "desc"
+        if calls == 1:
+            newer = {"user": {"login": "octocat"}, "body": _section(HEAD, FINDING)}
+            filler = [{"user": {"login": "octocat"}, "body": "note"}] * 99
+            return httpx.Response(200, json=[newer, *filler])
+        return httpx.Response(
+            200, json=[{"user": {"login": "octocat"}, "body": _section(HEAD, STALE)}]
+        )
+
+    async def token() -> str:
+        return "token"
+
+    reader = SnapshotReader("acme", "widgets", token, transport=httpx.MockTransport(handler))
+    snapshot = FrozenSnapshot(
+        meta=_pull("Fixes the widget."),
+        merge_base_sha=BASE,
+        diff_text="",
+        changed_paths=["a.py"],
+    )
+    text = await load_author_self_review(reader, snapshot)
+    assert calls == 2
+    assert FINDING in text
+    assert STALE not in text
 
 
 @pytest.mark.asyncio

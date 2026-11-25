@@ -237,7 +237,7 @@ class SnapshotReader:
         while page <= 10:
             resp = await self._get(
                 f"/issues/{number}/comments",
-                params={"per_page": 100, "page": page},
+                params={"per_page": 100, "page": page, "sort": "created", "direction": "desc"},
             )
             if resp.status_code >= 400:
                 raise SnapshotError(

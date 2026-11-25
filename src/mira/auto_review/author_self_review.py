@@ -27,6 +27,7 @@ HEADING = "**Author self-review**"
 _HEAD_LINE = re.compile(r"^Head\s+`?([0-9a-fA-F]{40})`?\s*$")
 _ROLE_LINE = re.compile(r"^Role: self-review\s*$")
 _ATX_HEADING = re.compile(r"^#{1,6}\s+\S")
+_FENCE = re.compile(r"^(`{3,}|~{3,})")
 _SHA40 = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 _SECONDARY_LABEL = "Kory Source (secondary reviewer)"
 
@@ -70,8 +71,13 @@ def author_self_reviews(text: str) -> list[AuthorSelfReview]:
 
 
 def is_author_self_review(text: str) -> bool:
-    """True when ``text`` contains one posted author self-review section."""
-    return bool(author_self_reviews(text))
+    """True when ``text`` is only an author self-review section.
+
+    A review that quotes a section and also says something else is not one.
+    """
+    if not author_self_reviews(text):
+        return False
+    return strip_author_self_reviews(text) == ""
 
 
 def section_for_head(text: str, head_sha: str) -> AuthorSelfReview | None:
@@ -138,13 +144,15 @@ def prepare_author_self_review(
 def is_prior_kory_source_review(body: str, author: str = "") -> bool:
     """Whether a posted body counts as a prior Kory Source review.
 
-    A review counts when its body contains ``Reviewed head`` and a
+    Markers are read after every author self-review section is removed. A
+    review counts when that remainder contains ``Reviewed head`` and a
     40-character sha and the author is ``kory-source`` or ``kory-source[bot]``,
-    or when the body contains ``Kory Source (secondary reviewer)``. An author
-    self-review never counts, including when it quotes those markers.
+    or when it contains ``Kory Source (secondary reviewer)``. A body that is
+    only an author self-review never counts, including when its findings
+    quote those markers.
     """
-    text = body or ""
-    if is_author_self_review(text):
+    text = strip_author_self_reviews(body or "")
+    if not text:
         return False
     if _SECONDARY_LABEL in text:
         return True
@@ -159,8 +167,9 @@ async def load_author_self_review(reader: Any, snapshot: Any) -> str:
     """Section for this snapshot's head, from the description or one comment read.
 
     The description wins when its recorded head matches. Otherwise one listing
-    of issue comments is read, and the last comment by the pull request author
-    whose recorded head matches is used. A missing method, a failed read, or
+    of issue comments is read newest first, and the first comment by the pull
+    request author whose recorded head matches is used. A missing method, a
+    failed read, or
     no match returns an empty string. The review still runs.
     """
     meta = snapshot.meta
@@ -184,15 +193,14 @@ async def load_author_self_review(reader: Any, snapshot: Any) -> str:
     author = (meta.author or "").casefold()
     if not author:
         return ""
-    found = ""
     for comment in comments or []:
         login = str(comment.get("login") or "").casefold()
         if login != author:
             continue
         section = section_for_head(str(comment.get("body") or ""), head)
         if section is not None:
-            found = section.text
-    return found
+            return section.text
+    return ""
 
 
 def _parse_at(lines: list[str], start: int) -> tuple[AuthorSelfReview, int] | None:
@@ -207,9 +215,14 @@ def _parse_at(lines: list[str], start: int) -> tuple[AuthorSelfReview, int] | No
     if cursor >= len(lines) or _ROLE_LINE.match(lines[cursor].strip()) is None:
         return None
     end = cursor + 1
+    in_fence = False
     while end < len(lines):
         stripped = lines[end].strip()
-        if stripped == HEADING or _ATX_HEADING.match(lines[end]):
+        if _FENCE.match(stripped):
+            in_fence = not in_fence
+            end += 1
+            continue
+        if not in_fence and (stripped == HEADING or _ATX_HEADING.match(lines[end])):
             break
         end += 1
     body = lines[start:end]
