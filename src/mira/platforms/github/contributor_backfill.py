@@ -189,6 +189,7 @@ def _record_pr_insights(db: Any, owner: str, repo: str, pr: Any) -> None:
 
 
 def _record_reviews(db: Any, owner: str, repo: str, pr: Any, counts: dict[str, int]) -> None:
+    from mira.auto_review.author_self_review import is_author_self_review
     from mira.platforms.github.review_signals import is_bare_approval
 
     author_login = pr.user.login if pr.user else ""
@@ -212,6 +213,8 @@ def _record_reviews(db: Any, owner: str, repo: str, pr: Any, counts: dict[str, i
         r_login = r_user.login if r_user else ""
         # Skip self-reviews, authorless events, and bots (e.g. Mira).
         if not r_login or r_login == author_login or _is_bot(r_user):
+            continue
+        if is_author_self_review(review.body or ""):
             continue
         submitted = _dt_to_epoch(review.submitted_at)
         state = (review.state or "").lower()

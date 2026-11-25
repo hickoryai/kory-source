@@ -721,8 +721,14 @@ def _diff_lines(path: str) -> int | None:
 # HAI-14442 changes one upstream line in server.py (+1/-1) so the health check
 # also probes a MySQL DATABASE_URL: server.py measures 26, and its cap moves by
 # exactly those 2, to 27.
+# Model attribution, HAI-14053, and HAI-14384 edited engine.py without moving
+# this cap. At b6e2dc3 the file measures 131 (122 insertions, 9 deletions).
+# HAI-14718 adds 7 lines so the review reads an author self-review for the
+# snapshot head and passes that section into the review prompt: 138
+# (129 insertions, 9 deletions). The cap moves to 139, one past that
+# measurement, so the next edit still fails.
 @pytest.mark.parametrize(
-    ("path", "cap"), [("src/mira/core/engine.py", 48), ("src/mira/platforms/server.py", 27)]
+    ("path", "cap"), [("src/mira/core/engine.py", 139), ("src/mira/platforms/server.py", 27)]
 )
 def test_upstream_edit_stays_under_cap(path, cap):
     changed = _diff_lines(path)
