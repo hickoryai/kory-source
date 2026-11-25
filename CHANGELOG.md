@@ -31,6 +31,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A rejected model pin is retried.** A repository history group whose error contains `Pinned model was not used` stays off `checkpoint.failed`. The next batch tries those files again, including entries an older batch already stored there. Three consecutive failures of this kind still stop the batch. A content failure stays permanent.
 - **A synchronous classification failure no longer reports a missing event loop.** The importer checks for a running loop, then starts the classifier. A router or worker error stays the reported cause.
 - **The freshness report no longer waits on registry startup.** `python -m mira.registry.freshness report` opens the registry read-only. It takes no schema lock, runs no schema or migrations, and loads no conflict judge. It prints the same JSON. Before this, a report run could hang before it printed anything.
 
