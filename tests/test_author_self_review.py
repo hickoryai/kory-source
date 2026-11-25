@@ -420,7 +420,7 @@ async def test_load_keeps_the_newest_matching_author_comment() -> None:
         nonlocal calls
         calls += 1
         assert request.url.path.endswith("/issues/7/comments")
-        if calls == 1:
+        if calls <= 10:
             stale = {"user": {"login": "octocat"}, "body": _section(HEAD, STALE)}
             filler = [{"user": {"login": "octocat"}, "body": "note"}] * 99
             return httpx.Response(200, json=[stale, *filler])
@@ -439,7 +439,7 @@ async def test_load_keeps_the_newest_matching_author_comment() -> None:
         changed_paths=["a.py"],
     )
     text = await load_author_self_review(reader, snapshot)
-    assert calls == 2
+    assert calls == 11
     assert FINDING in text
     assert STALE not in text
 

@@ -234,7 +234,7 @@ class SnapshotReader:
         """Issue comments already on the pull request. One listing, no wait."""
         comments: list[dict[str, str]] = []
         page = 1
-        while page <= 10:
+        while True:
             resp = await self._get(
                 f"/issues/{number}/comments",
                 params={"per_page": 100, "page": page},
