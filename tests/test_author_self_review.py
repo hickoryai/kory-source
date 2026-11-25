@@ -395,8 +395,6 @@ async def test_issue_comments_lists_bodies_without_retrying() -> None:
         nonlocal calls
         calls += 1
         assert request.url.path.endswith("/issues/7/comments")
-        assert request.url.params["sort"] == "created"
-        assert request.url.params["direction"] == "desc"
         if calls == 1:
             return httpx.Response(
                 200,
@@ -421,13 +419,13 @@ async def test_load_keeps_the_newest_matching_author_comment() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        assert request.url.params["direction"] == "desc"
+        assert request.url.path.endswith("/issues/7/comments")
         if calls == 1:
-            newer = {"user": {"login": "octocat"}, "body": _section(HEAD, FINDING)}
+            stale = {"user": {"login": "octocat"}, "body": _section(HEAD, STALE)}
             filler = [{"user": {"login": "octocat"}, "body": "note"}] * 99
-            return httpx.Response(200, json=[newer, *filler])
+            return httpx.Response(200, json=[stale, *filler])
         return httpx.Response(
-            200, json=[{"user": {"login": "octocat"}, "body": _section(HEAD, STALE)}]
+            200, json=[{"user": {"login": "octocat"}, "body": _section(HEAD, FINDING)}]
         )
 
     async def token() -> str:

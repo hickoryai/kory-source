@@ -167,10 +167,10 @@ async def load_author_self_review(reader: Any, snapshot: Any) -> str:
     """Section for this snapshot's head, from the description or one comment read.
 
     The description wins when its recorded head matches. Otherwise one listing
-    of issue comments is read newest first, and the first comment by the pull
-    request author whose recorded head matches is used. A missing method, a
-    failed read, or
-    no match returns an empty string. The review still runs.
+    of issue comments is read. That route returns comments oldest first, so the
+    last comment by the pull request author whose recorded head matches is the
+    newest. A missing method, a failed read, or no match returns an empty
+    string. The review still runs.
     """
     meta = snapshot.meta
     head = meta.head_sha or ""
@@ -193,14 +193,15 @@ async def load_author_self_review(reader: Any, snapshot: Any) -> str:
     author = (meta.author or "").casefold()
     if not author:
         return ""
+    found = ""
     for comment in comments or []:
         login = str(comment.get("login") or "").casefold()
         if login != author:
             continue
         section = section_for_head(str(comment.get("body") or ""), head)
         if section is not None:
-            return section.text
-    return ""
+            found = section.text
+    return found
 
 
 def _parse_at(lines: list[str], start: int) -> tuple[AuthorSelfReview, int] | None:
