@@ -234,6 +234,10 @@ async def handle_pull_request_review(
         reviewer = user.get("login", "")
         if not reviewer or _is_bot_user(user):
             return  # ignore Mira's own and other bot reviews
+        from mira.auto_review.author_self_review import is_author_self_review
+
+        if is_author_self_review(review.get("body") or ""):
+            return  # an author self-review is not an independent review
         pr = payload.get("pull_request", {})
         author = (pr.get("user") or {}).get("login", "")
         if reviewer == author:

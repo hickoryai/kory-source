@@ -230,6 +230,38 @@ class SnapshotReader:
         response.raise_for_status()
         return response.json().get("body") or ""
 
+    async def issue_comments(self, number: int) -> list[dict[str, str]]:
+        """Issue comments already on the pull request. One listing, no wait."""
+        comments: list[dict[str, str]] = []
+        page = 1
+        while page <= 10:
+            resp = await self._get(
+                f"/issues/{number}/comments",
+                params={"per_page": 100, "page": page},
+            )
+            if resp.status_code >= 400:
+                raise SnapshotError(
+                    "github_unavailable",
+                    f"GitHub comments returned {resp.status_code}",
+                )
+            batch = resp.json()
+            if not isinstance(batch, list):
+                raise SnapshotError("github_unavailable", "GitHub comments were not a list")
+            for item in batch:
+                if not isinstance(item, dict):
+                    continue
+                user = item.get("user") or {}
+                comments.append(
+                    {
+                        "login": str(user.get("login") or ""),
+                        "body": str(item.get("body") or ""),
+                    }
+                )
+            if len(batch) < 100:
+                break
+            page += 1
+        return comments
+
     async def file_content(self, path: str, ref: str) -> str:
         resp = await self._get(f"/contents/{path}", params={"ref": ref})
         if resp.status_code >= 400:

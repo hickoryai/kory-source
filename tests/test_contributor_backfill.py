@@ -89,6 +89,37 @@ def test_backfill_sync_records_prs_merges_reviews(db: AppDatabase) -> None:
     assert db.get_contributor_totals(bob.id)["reviews"] == 1
 
 
+def test_backfill_skips_an_author_self_review(db: AppDatabase) -> None:
+    from mira.auto_review.author_self_review import format_author_self_review
+
+    ordinary = _review(5, "bob")
+    posted = _review(6, "carol")
+    posted.body = format_author_self_review("d" * 40, "The cache key drops the tenant id.")
+    pr = _pr(1, "alice", reviews=[ordinary, posted])
+    pr.get_review_comments.return_value = []
+    gh = MagicMock()
+    repo = MagicMock()
+    pulls = MagicMock()
+    pulls.totalCount = 1
+    pulls.__iter__ = lambda self: iter([pr])
+    repo.get_pulls.return_value = pulls
+    gh.get_repo.return_value = repo
+
+    counts: dict[str, int] = {"prs": 0, "merges": 0, "reviews": 0, "commits": 0}
+    import mira.platforms.github.contributor_backfill as mod
+
+    orig_github = mod.Github
+    mod.Github = lambda _token, **_kw: gh  # type: ignore[assignment]
+    try:
+        mod._backfill_sync(db, "tok", "o", "r", None, False, counts, None)
+    finally:
+        mod.Github = orig_github
+
+    assert counts["reviews"] == 1
+    assert db.get_contributor_by_login("github", "bob") is not None
+    assert db.get_contributor_by_login("github", "carol") is None
+
+
 def test_backfill_sync_is_idempotent(db: AppDatabase) -> None:
     def make_gh() -> MagicMock:
         pr = _pr(1, "alice", merged=True)

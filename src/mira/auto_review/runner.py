@@ -18,6 +18,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
+from mira.auto_review.author_self_review import (
+    load_author_self_review,
+    section_for_head,
+)
 from mira.auto_review.config import (
     CALL_TIMEOUT_SECONDS,
     DEFAULT_ROLE,
@@ -269,7 +273,15 @@ async def execute_request(
                 if carried is not None
                 else {}
             )
-            result = await engine.review_snapshot(snapshot.pr_info(), diff_text, **kwargs)
+            # Already on the pull request, or absent. Never a wait.
+            # A matching description is left as captured. A matching author
+            # comment is appended so the review reads it from the description.
+            section = await load_author_self_review(reader, snapshot)
+            pr_info = snapshot.pr_info()
+            if section and section_for_head(pr_info.description, pr_info.head_sha) is None:
+                body = (pr_info.description or "").rstrip()
+                pr_info = replace(pr_info, description=f"{body}\n\n{section}" if body else section)
+            result = await engine.review_snapshot(pr_info, diff_text, **kwargs)
             if provider.write_attempts:
                 store.mark_skipped(
                     req.id,

@@ -319,3 +319,34 @@ async def test_self_review_ignored(
     )
     # bob reviewing his own PR is not a review of someone else's work
     assert patched_api.get_open_pr_reviewers() == []
+
+
+async def test_author_self_review_body_is_not_an_independent_review(
+    monkeypatch: pytest.MonkeyPatch, patched_api: AppDatabase
+) -> None:
+    from mira.auto_review.author_self_review import format_author_self_review
+
+    auth = MagicMock()
+    head = "d" * 40
+    await handlers.handle_pull_request_review(
+        {
+            "action": "submitted",
+            "repository": {"owner": {"login": "o"}, "name": "r"},
+            "pull_request": {
+                "number": 1,
+                "user": {"login": "bob"},
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+            },
+            "review": {
+                "id": 2,
+                "user": {"login": "carol", "type": "User"},
+                "state": "COMMENTED",
+                "submitted_at": "2024-01-02T00:00:00Z",
+                "body": format_author_self_review(head, "The cache key drops the tenant id."),
+            },
+        },
+        auth,
+        "mira",
+    )
+    assert patched_api.get_open_pr_reviewers() == []

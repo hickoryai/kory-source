@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from mira.llm.base import LLMProviderProtocol
 
 from mira.analysis.severity import classify_severity
+from mira.auto_review.author_self_review import prepare_author_self_review
 from mira.config import MiraConfig
 from mira.core.chunker import chunk_files
 from mira.core.context import expand_context
@@ -1151,6 +1152,11 @@ class ReviewEngine:
         """
         import asyncio as _asyncio
 
+        info = getattr(self, "_pr_info", None)
+        author_section, pr_description = prepare_author_self_review(
+            pr_description, info.head_sha if info is not None else ""
+        )
+
         # Parse the full diff (not just the priority-selected subset) so the
         # walkthrough can surface skipped files to the user.
         patch = parse_diff(diff_text)
@@ -1437,6 +1443,7 @@ class ReviewEngine:
                         review_round=review_round,
                         resolved_threads=resolved_threads,
                         team_conventions=team_conventions,
+                        author_self_review=author_section,
                     )
 
                     def _parse(raw: str) -> tuple[list[ReviewComment], list[KeyIssue], str]:

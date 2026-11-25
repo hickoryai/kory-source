@@ -7,6 +7,7 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
 
+from mira.auto_review.author_self_review import prepare_author_self_review
 from mira.config import MiraConfig
 from mira.core.context import build_file_context_string
 from mira.llm.prompts.footguns import get_footguns_for_files
@@ -37,11 +38,20 @@ def build_review_prompt(
     review_round: int = 1,
     resolved_threads: list[dict] | None = None,
     team_conventions: str = "",
+    author_self_review: str | None = None,
+    head_sha: str = "",
 ) -> list[dict[str, str]]:
     """Build the review prompt messages for the LLM.
 
     Returns a list of message dicts with 'role' and 'content' keys.
+
+    ``author_self_review`` is the runner's section for ``head_sha``, including
+    an empty string when that head has none. ``None`` reads a matching section
+    from ``pr_description``. A section for a different head is left out.
     """
+    author_self_review, pr_description = prepare_author_self_review(
+        pr_description, head_sha, explicit=author_self_review
+    )
     env = _get_template_env()
     template = env.get_template("review.jinja2")
 
@@ -95,6 +105,7 @@ def build_review_prompt(
         resolved_threads=resolved_threads,
         team_conventions=team_conventions,
         footguns=footguns,
+        author_self_review=author_self_review,
     )
 
     # Build user message with optional code context before diffs
