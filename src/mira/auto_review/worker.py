@@ -13,8 +13,8 @@ service refuses a late answer from any other worker.
 
 The service can also run this loop itself (``start_local_reviewer``) when the
 host holds a router configuration with at least one account. It then answers
-calls through ``mira.auto_review.local_seat`` instead of a relay. Without that
-configuration nothing starts.
+review calls and history-import batches through ``mira.auto_review.local_seat``
+instead of a relay. Without that configuration nothing starts.
 """
 
 from __future__ import annotations
@@ -404,7 +404,8 @@ async def start_local_reviewer() -> bool:
     finds a router binary and a router configuration with at least one
     account. Otherwise it does nothing and logs nothing. The loop polls the
     service's own work routes in process, so it claims and answers exactly as
-    an outside worker does.
+    an outside worker does. It takes history-import batches too, one at a
+    time, with the same first-claim fencing as review calls.
     """
     global _local_task, _local_seat
     from mira.auto_review import local_seat
@@ -426,7 +427,7 @@ async def start_local_reviewer() -> bool:
                 source="http://local-reviewer",
                 complete=seat.complete,
                 worker=worker,
-                imports=False,
+                imports=True,
                 pause_on_outage=True,
             )
         finally:

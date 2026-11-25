@@ -262,18 +262,20 @@ class DecisionClassifier:
         retries: int | None = None,
         use_unpinned_model: bool = False,
     ):
-        """Build a fresh strictly-traced provider for one concurrent call.
+        """Build a fresh provider for one concurrent call.
 
         In particular, do not adjust a shared provider's config for a deadline:
         sibling calls may be executing at that point.
         """
         from mira.config import load_config
-        from mira.llm.router_acp import RouterAcpProvider, _shared_tracer
+        from mira.llm.router_acp import RouterAcpProvider
 
         class RequiredTracingProvider(RouterAcpProvider):
-            def _resolve_tracer(self):
-                # Deliberately ignore MIRA_ROUTER_ACP_ALLOW_UNTRACED.
-                return self._tracer if self._tracer is not None else _shared_tracer()
+            """Records the served model. Tracing matches other router calls.
+
+            A configured collector traces the call. ``MIRA_ROUTER_ACP_ALLOW_UNTRACED=1``
+            leaves it untraced. Without that opt-out a missing collector fails closed.
+            """
 
             async def _complete_raw(self, prompt: str, requested: str) -> dict[str, Any]:
                 # Each call builds its own provider, so this records the model

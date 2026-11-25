@@ -340,8 +340,9 @@ beside any outside worker:
 With no mount, no account, or no `router-acp` binary, nothing starts and the
 service behaves as it did before. The local reviewer is one more seat worker:
 it polls the same work routes in process and claims calls under the rules
-above, so an outside worker that claims a call first keeps it. It takes
-review calls only, never history import work. After three outage answers in a
+above, so an outside worker that claims a call first keeps it. It also claims
+one history-import batch at a time. The standalone import settings are in
+`docs/decision-history-import.md`. After three outage answers in a
 row it stops claiming for 60 seconds, so another worker takes the calls.
 
 Each call starts `router-acp serve` with a small overlay on top of the mounted

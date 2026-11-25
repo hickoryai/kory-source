@@ -28,6 +28,13 @@ from mira.auto_review.routes import router as auto_review_router
 from mira.auto_review.store import LEGACY_WORKER, WORK_LEASE_SECONDS, AutoReviewStore
 from mira.dashboard.auth import AuthMiddleware
 from mira.dashboard.db import AppDatabase
+from mira.registry import set_registry
+from mira.registry.db import RegistryDB
+from mira.registry.decision_llm import EXTRACTOR
+from mira.registry.import_work import ImportWorkStore
+from mira.registry.imports import ImportRuns
+from mira.registry.service import Registry
+from tests import registry_policy as rp
 from tests.server_db import SERVERS, server_url
 
 HEAD = "a" * 40
@@ -766,3 +773,124 @@ async def test_local_reviewer_pauses_after_repeated_outages(
         assert store.claim_work("workstation").id == waiting
     finally:
         await worker.stop_local_reviewer()
+
+
+def _import_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ImportWorkStore, str]:
+    """One admitted repository-import batch, with no relay URL configured.
+
+    The run pins the model the stub router actually serves. A repository
+    import must request that extractor model, and the local seat refuses a
+    pin the router did not run.
+    """
+    monkeypatch.setenv("REGISTRY_IMPORT_OPERATOR", rp.OPERATOR)
+    monkeypatch.delenv("MIRA_ROUTER_ACP_URL", raising=False)
+    registry = Registry(RegistryDB(path=str(tmp_path / "registry.db")))
+    set_registry(registry)
+    run = ImportRuns(registry).start(
+        rp.operator(),
+        source_system="git",
+        stream="repository:acme/widgets",
+        importer="repository-history",
+        importer_version="1",
+        scope={},
+        extractor=EXTRACTOR,
+        extractor_model=STUB_MODEL,
+    )
+    repo = rp.manifest()["repositories"][0]["full_name"]
+    registry.db.execute(
+        "UPDATE registry_import_runs SET stream = ? WHERE run_id = ?",
+        ("repository:" + repo, run["run_id"]),
+    )
+    store = ImportWorkStore(registry)
+    work_id = store.enqueue(
+        run["run_id"],
+        rp.CORPUS,
+        {
+            "prompt": "classify this repository passage",
+            "model": STUB_MODEL,
+            "timeout_seconds": 30,
+        },
+        time.time() + 100,
+    )
+    return store, work_id
+
+
+def _close_registry() -> None:
+    from mira.registry import get_registry
+
+    current = get_registry(create=False)
+    set_registry(None)
+    if current is not None:
+        current.db.close()
+
+
+async def test_local_reviewer_claims_a_repository_import_without_a_relay(
+    db: AppDatabase, stub_router: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
+    monkeypatch.setenv("KORY_SOURCE_ROUTER_CONFIG_DIR", str(_router_config(tmp_path / "cfg")))
+    monkeypatch.setattr(worker, "POLL_SECONDS", 0.05)
+    with rp.policy():
+        store, work_id = _import_queue(tmp_path, monkeypatch)
+        try:
+            assert await worker.start_local_reviewer() is True
+            await _wait_for(lambda: store.get(work_id)["state"] == "answered")
+            stored = store.get(work_id)
+            result = json.loads(stored["result_json"])
+            assert result["text"] == "turn 1: classify this repository passage"
+            assert result["actual_model"] == STUB_MODEL
+            assert [entry["prompt"] for entry in _log(stub_router) if "prompt" in entry] == [
+                "classify this repository passage"
+            ]
+
+            wire_id = f"{work_id}:{stored['attempt']}"
+            async with AsyncClient(
+                transport=ASGITransport(app=_api(db)), base_url="http://test"
+            ) as http:
+                poll = await http.post(
+                    "/api/auto-review/work",
+                    headers=_headers("workstation"),
+                    json={"import_capacity": 1},
+                )
+                assert poll.status_code == 204
+                late = await http.post(
+                    f"/api/auto-review/work/{wire_id}",
+                    headers=_headers("workstation"),
+                    json={"text": "second answer", "actual_model": STUB_MODEL},
+                )
+                assert late.status_code == 409
+            assert json.loads(store.get(work_id)["result_json"])["text"].startswith("turn 1:")
+        finally:
+            await worker.stop_local_reviewer()
+            _close_registry()
+
+
+async def test_outside_worker_that_claims_an_import_first_keeps_it(
+    db: AppDatabase, stub_router: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KORY_SOURCE_AUTO_REVIEW", "1")
+    monkeypatch.setenv("KORY_SOURCE_ROUTER_CONFIG_DIR", str(_router_config(tmp_path / "cfg")))
+    monkeypatch.setattr(worker, "POLL_SECONDS", 0.05)
+    with rp.policy():
+        store, work_id = _import_queue(tmp_path, monkeypatch)
+        claimed = store.claim()
+        assert claimed is not None and claimed["work_id"] == f"{work_id}:1"
+        try:
+            assert await worker.start_local_reviewer() is True
+            await asyncio.sleep(0.4)
+            assert store.get(work_id)["state"] == "leased"
+            assert not [entry for entry in _log(stub_router) if "prompt" in entry]
+            assert store.answer(claimed["work_id"], {"text": "outside", "actual_model": STUB_MODEL})
+            assert json.loads(store.get(work_id)["result_json"])["text"] == "outside"
+            async with AsyncClient(
+                transport=ASGITransport(app=_api(db)), base_url="http://test"
+            ) as http:
+                late = await http.post(
+                    f"/api/auto-review/work/{claimed['work_id']}",
+                    headers=_headers("local_late"),
+                    json={"text": "container", "actual_model": STUB_MODEL},
+                )
+                assert late.status_code == 409
+        finally:
+            await worker.stop_local_reviewer()
+            _close_registry()
