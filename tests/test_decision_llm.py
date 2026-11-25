@@ -360,16 +360,45 @@ def test_batch_bounds_and_content_deduplication(tmp_path):
     assert len(provider.calls) == 3
 
 
-def test_required_tracing_ignores_general_opt_out(tmp_path, monkeypatch):
-    from mira.llm import router_acp
+def test_classification_honors_the_untraced_opt_out(tmp_path, monkeypatch):
+    monkeypatch.delenv("LLM_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", raising=False)
+    passage = Passage(0, 20, "We use a fixed key.")
+
+    def carrier(fake: FakeProvider) -> RouterAcpProvider:
+        return RouterAcpProvider(
+            LLMConfig(model="test/pinned"),
+            transport=fake.respond,
+            tracer=None,
+            relay=False,
+        )
+
+    closed_transport = FakeProvider()
+    closed = DecisionClassifier(
+        registry(tmp_path),
+        corpus_id="sample",
+        model="test/pinned",
+        provider=carrier(closed_transport),
+    )
+    with pytest.raises(RuntimeError, match="LLM tracing is required but unavailable") as raised:
+        closed.classify([passage])
+    assert closed_transport.calls == []
+    assert getattr(raised.value.__cause__, "code", None) == "router_acp_tracing_unavailable"
 
     monkeypatch.setenv("MIRA_ROUTER_ACP_ALLOW_UNTRACED", "1")
-    sentinel = object()
-    monkeypatch.setattr(router_acp, "_shared_tracer", lambda: sentinel)
-    classifier = DecisionClassifier(registry(tmp_path), corpus_id="sample", model="test/pinned")
-    assert classifier._provider()._resolve_tracer() is sentinel
+    opened_transport = FakeProvider()
+    opened = DecisionClassifier(
+        registry(tmp_path / "open"),
+        corpus_id="sample",
+        model="test/pinned",
+        provider=carrier(opened_transport),
+    )
+    assert opened.classify([passage])
+    assert len(opened_transport.calls) == 1
+    assert opened_transport.traces == 0
+    assert opened._provider()._resolve_tracer() is None
     with pytest.raises(ValueError, match="pinned"):
-        DecisionClassifier(classifier.registry, corpus_id="sample", model="auto")
+        DecisionClassifier(opened.registry, corpus_id="sample", model="auto")
 
 
 def test_real_importer_dry_run_has_no_calls_and_cache_prevents_duplicate_rows(tmp_path):

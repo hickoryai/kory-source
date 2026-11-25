@@ -65,9 +65,11 @@ recorded in coverage/checkpoint details; it is never counted as a negative
 classification or a completed decision. Budget expiry instead leaves work
 resumable. Extractor version 3
 uses short local response IDs while retaining SHA-256 cache keys.
-It uses `mira.llm.router_acp.RouterAcpProvider` with tracing required, regardless
-of `MIRA_ROUTER_ACP_ALLOW_UNTRACED`. The runtime needs the relay settings and
-tracing endpoint described by that provider; no provider API keys are used.
+It uses `mira.llm.router_acp.RouterAcpProvider`. Tracing follows that provider.
+`MIRA_ROUTER_ACP_ALLOW_UNTRACED=1` runs classification with no collector.
+Without that opt-out, a missing `LLM_OTLP_ENDPOINT` fails closed with
+`router_acp_tracing_unavailable`. With the endpoint set and the opt-out unset,
+the call stays traced. No provider API keys are used.
 `REGISTRY_EXTRACTION_MODEL` selects a pinned router candidate; otherwise the
 runtime indexing model, then runtime model is used. Unpinned/auto models are
 refused so model-specific cache entries have stable meaning.
@@ -314,7 +316,9 @@ Nomination uses indexed newline positions, position-based SQL/TOML scanning and
 the safe C YAML loader when available, with a portable safe-loader fallback.
 
 The runtime job must set `MIRA_TRACING_MODULE=mira.tracing.otlp` together with its
-OTLP endpoint and relay configuration. Live runtime estimates must distinguish
+OTLP endpoint when classification is traced. `MIRA_ROUTER_ACP_ALLOW_UNTRACED=1`
+skips that requirement. A direct router transport also needs the relay settings.
+Live runtime estimates must distinguish
 cold-cache seat work from source/Git processing time: the initial backfill can
 require many bounded executions, whereas unchanged passages require no further
 model calls. A bounded sample is not a complete history inventory or permission
@@ -326,8 +330,29 @@ to run a shared-environment import.
 Set `REGISTRY_EXTRACTION_TRANSPORT=worker` on the import job to use its existing
 registry database connection instead of a direct relay credential. The default
 remains the configured direct router transport. The worker mode does not need a
-relay URL, a new secret, or a new IAM grant on the job. It still constructs the
-strictly traced classifier provider and requires its tracer to be available.
+relay URL, a new secret, or a new IAM grant on the job. Classification still
+honors the tracing opt-out above. Without the opt-out, the tracer must be
+available.
+
+### Standalone import, no outside worker
+
+When the service has the bundled router, a mounted router configuration with
+at least one account, and `KORY_SOURCE_AUTO_REVIEW=1`, the in-container worker
+claims history-import batches as well as review calls. It answers them through
+the local seat. A standalone deploy then needs no outside relay and no
+`MIRA_ROUTER_ACP_URL`. Run the import with `REGISTRY_EXTRACTION_TRANSPORT=worker`.
+
+Set `LLM_OTLP_ENDPOINT` and `MIRA_TRACING_MODULE=mira.tracing.otlp` to trace
+those calls. Or set `MIRA_ROUTER_ACP_ALLOW_UNTRACED=1` to classify with no
+collector. Leave the opt-out unset and omit the endpoint, and classification
+fails closed with `router_acp_tracing_unavailable`. Hickory deploys keep the
+endpoint set and the opt-out unset, so Hickory imports stay traced.
+
+An outside worker and the in-container worker share the queue. The first claim
+owns the batch. A second answer for that attempt is refused. A timeout requeues
+the batch once. `router_acp_model_mismatch` stays retryable when model fallback
+is on. After repeated outages the in-container worker stops claiming for a
+minute.
 
 Migration `003_import_work.sql` adds the additive classification queue. Each
 batch binds a corpus, live policy hash, admitted repository import run, operator,
