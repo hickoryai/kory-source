@@ -22,6 +22,8 @@ classifiers = [
 ]
 dependencies = [
     "click>=8.1",
+    # The Linear importer parses GraphQL in the served image, not only in tests.
+    "graphql-core>=3.2",
     "httpx>=0.27",
     "jinja2>=3.1",
     "pydantic>=2.5",
@@ -43,7 +45,6 @@ dev = [
     "ruff>=0.4",
     "types-PyYAML>=6.0",
     "cryptography>=42.0",
-    "graphql-core>=3.2",
 ]
 serve = [
     "opentelemetry-sdk>=1.28,<2",
