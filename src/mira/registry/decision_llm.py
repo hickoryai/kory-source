@@ -105,6 +105,12 @@ def _run(coro):
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        in_loop = False
+    else:
+        in_loop = True
+    if not in_loop:
+        # Finish the probe before starting the loop. asyncio.run inside that
+        # except attaches "no running event loop" to the real failure.
         return asyncio.run(coro)
     # Importers are synchronous, including when called by an async job adapter.
     with ThreadPoolExecutor(max_workers=1) as pool:

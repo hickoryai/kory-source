@@ -16,6 +16,7 @@ from mira.registry.imports import ImportRuns
 from mira.registry.provenance import ProvenanceStore
 from mira.registry.repository_history import GitReader, RepositoryHistoryImporter
 from mira.registry.service import Registry
+from mira.registry.session_history import _failure
 from tests import registry_policy as rp
 from tests.test_extra_repository_decisions import git
 
@@ -261,6 +262,46 @@ def test_session_classifier_keeps_working_after_account_retries(tmp_path, monkey
     problem = classifier.unresolved[decision_llm.passage_hash(texts[0])]
     assert isinstance(problem, decision_llm.ClassificationProviderError)
     assert problem.code == "router_acp_seat_exhausted"
+
+
+def test_sync_classify_reports_worker_failure_without_a_missing_event_loop(tmp_path):
+    """The session importer calls classify with no running loop.
+
+    The probe that detects that must not stay on the failure the operator sees.
+    """
+
+    class WorkerDown(FakeProvider):
+        async def respond(self, request):
+            raise RouterTransportError(
+                "import worker: no_worker_before_deadline",
+                kind="router_failed",
+            )
+
+    classifier = DecisionClassifier(
+        registry(tmp_path),
+        corpus_id="sample",
+        model="test/pinned",
+        provider=WorkerDown(),
+        allow_model_fallback=True,
+        max_concurrency=1,
+    )
+    classifier.import_run_id = "run-1"
+    passage = Passage(0, 28, "Use the compatible layout.")
+    with pytest.raises(decision_llm.ClassificationProviderError) as caught:
+        classifier.classify([passage])
+
+    failure = _failure(caught.value, (1, 1, "classify"))
+    classes = []
+    messages = []
+    node = failure
+    while isinstance(node, dict):
+        classes.append(node["class"])
+        messages.append(node["message"])
+        node = node.get("cause")
+    assert failure["stage"] == "classify"
+    assert "RuntimeError" not in classes
+    assert all("no running event loop" not in message for message in messages)
+    assert any("no_worker_before_deadline" in message for message in messages)
 
 
 def test_session_account_outage_reduces_retry_budget_across_transcripts(tmp_path, monkeypatch):

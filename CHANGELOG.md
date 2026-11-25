@@ -31,6 +31,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A synchronous classification failure no longer reports a missing event loop.** The importer checks for a running loop, then starts the classifier. A router or worker error stays the reported cause.
 - **The freshness report no longer waits on registry startup.** `python -m mira.registry.freshness report` opens the registry read-only. It takes no schema lock, runs no schema or migrations, and loads no conflict judge. It prints the same JSON. Before this, a report run could hang before it printed anything.
 
 ## [0.12.18] — 2026-11-19
