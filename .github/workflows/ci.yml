@@ -164,3 +164,8 @@ jobs:
 
       - name: Smoke test — UI assets bundled
         run: docker run --rm --entrypoint ls mira:ci /app/ui_dist/index.html
+
+      - name: Smoke test — Linear importer imports in the image
+        run: |
+          docker run --rm --entrypoint python mira:ci -c \
+            "from mira.registry.linear import LinearImporter; from mira.registry.imports import assert_read_only_graphql; assert LinearImporter.__name__ == 'LinearImporter'; assert_read_only_graphql('{ viewer { id } }')"
