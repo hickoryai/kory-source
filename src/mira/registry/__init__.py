@@ -120,7 +120,8 @@ def set_registry(registry: Registry | None) -> None:
 
 async def run_jobs(interval: float = 3600.0, initial_delay: float = 60.0) -> None:
     """Create the registry at startup; then hourly: expire stale agent proposals,
-    age confidence, mirror learned rules."""
+    age confidence, mirror learned rules and AGENTS.md rules."""
+    from mira.registry.agent_rules import sync_configured
     from mira.registry.learned import import_learned_rules
 
     # Create the registry schema at startup, not on first use, so a deploy's
@@ -140,6 +141,10 @@ async def run_jobs(interval: float = 3600.0, initial_delay: float = 60.0) -> Non
             totals = await asyncio.to_thread(import_learned_rules, registry, repos)
             if expired or totals.get("created") or totals.get("retired"):
                 logger.info("Registry jobs: expired %d, learned rules %s", len(expired), totals)
+            agent_rules = await asyncio.to_thread(sync_configured, registry, trigger="hourly")
+            for run in agent_rules:
+                if run.get("status") not in ("unchanged", None):
+                    logger.info("AGENTS.md rule sync: %s", run)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

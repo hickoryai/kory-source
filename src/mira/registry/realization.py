@@ -28,6 +28,7 @@ def observe_github(event: str, payload: dict[str, Any], registry: Any = None) ->
             ref = str(payload.get("ref") or "")
             if payload.get("deleted") or not ref.startswith("refs/heads/") or not repo:
                 return []
+            _sync_agent_rules(registry, repo, ref, payload)
             return registry.on_push(repo, ref.removeprefix("refs/heads/"))
         if event == "pull_request" and payload.get("action") in _PR_ACTIONS:
             pr = payload.get("pull_request") or {}
@@ -47,3 +48,18 @@ def observe_github(event: str, payload: dict[str, Any], registry: Any = None) ->
     except Exception as exc:
         logger.warning("Registry realization skipped %s event: %s", event, exc)
     return []
+
+
+def _sync_agent_rules(registry: Any, repo: str, ref: str, payload: dict[str, Any]) -> None:
+    """A default-branch push re-reads that repository's AGENTS.md rules, if configured.
+
+    The same ``sync_repo`` the hourly job runs. Needs the GitHub App to be
+    subscribed to push events; without them the hourly check alone keeps up.
+    """
+    try:
+        from mira.registry.agent_rules import on_push
+
+        default_branch = str((payload.get("repository") or {}).get("default_branch") or "")
+        on_push(registry, repo, ref, default_branch)
+    except Exception as exc:
+        logger.warning("AGENTS.md rule sync on push skipped: %s", type(exc).__name__)

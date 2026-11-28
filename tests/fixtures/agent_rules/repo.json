@@ -1,0 +1,15 @@
+{
+  "repo": "example-org/example-service",
+  "hook_dir": "tools/hooks/rules",
+  "files": {
+    "AGENTS.md": "# Example service\n\nIntro paragraph that mentions `no_print.py` without being a rule.\n\n## Hard rules\n\n- Never call `print` in library code; `no_print` enforces this.\n- Keep imports sorted. This has no hook.\n* Do not commit secrets (`tools/hooks/rules/no_secrets.py`).\n- Both `no_print.py` and `max_line` apply to scripts.\n  This bullet continues on a second line.\n1. Numbered bullet naming `max_line`.\n- A helper `_shared.py` is not a hook, and `unknown_hook` does not exist.\n\n```markdown\n- `no_print` inside a code fence is ignored.\n```\n",
+    "web/AGENTS.md": "# Web package\n\n- Templates must not call `no_inline_style`.\n- Write tests first.\n",
+    "tools/hooks/rules/no_print.py": "# hook: no print\n",
+    "tools/hooks/rules/no_secrets.py": "# hook: no secrets\n",
+    "tools/hooks/rules/max_line.py": "# hook: max line\n",
+    "tools/hooks/rules/no_inline_style.py": "# hook: no inline style\n",
+    "tools/hooks/rules/unused_hook.py": "# hook: named by nothing\n",
+    "tools/hooks/rules/_shared.py": "# helper\n",
+    "src/app.py": "print('x')\n"
+  }
+}
