@@ -418,3 +418,72 @@ lookup stores the message with an unknown author in the attribution.
 The same classifier used for repository history proposes decisions with an
 exact quote, a permalink, the message timestamp, and the Slack author fields.
 Apply keeps decisions proposed and sets their basis to migration.
+
+## AGENTS.md hard rules (HAI-14726)
+
+`mira.registry.agent_rules` mirrors hard rules written in `AGENTS.md` files
+into the registry as `rule` objects anchored to the hook files that enforce
+them. `AGENTS.md` stays the source of truth. Unlike the commands above, this
+one runs on its own once it is configured, and it is off until then.
+
+A bullet names a hook file when a backticked span is the hook's path, its
+file name, or its file name without `.py`, and that file exists under the hook
+directory. Files whose name starts with `_` are helpers, not hooks. A file
+name that two hooks share names neither; only its full path does. Each bullet
+that names a hook becomes one proposed rule with one path anchor per named
+hook. Every other bullet is an exception: it is listed in the run report and
+is not written. Paragraph lines that name a hook, and hooks no bullet names,
+are counted and listed in the report only. Fenced code is skipped.
+
+Runtime configuration (nothing is set in the image):
+
+| Variable | Meaning |
+|---|---|
+| `REGISTRY_AGENT_RULES_REPOS` | Space-separated `owner/name` list. Unset: off. |
+| `REGISTRY_AGENT_RULES_HOOK_DIR` | Hook directory inside each repository, for example `tools/hooks/rules`. Unset: off. |
+| `REGISTRY_AGENT_RULES_MODE` | `dry-run` (default) stores the report only. `apply` writes registry rows. |
+| `REGISTRY_CORPUS_ACCESS_POLICY`, `REGISTRY_IMPORT_OPERATOR` | The corpus policy and its approved import operator. A repository outside the manifest is refused before any GitHub call. |
+| `MIRA_GITHUB_APP_ID`, `MIRA_GITHUB_PRIVATE_KEY` | The GitHub App that mints a read-only (`contents: read`) token for that one repository. |
+
+Triggers, all calling the same `sync_repo`:
+
+- the hourly registry job checks each repository's default-branch head. A
+  head and mode that match the last finished run read nothing more. This path
+  works on its own;
+- a push to the default branch, through the registry's existing GitHub
+  webhook observer. It fires only once the GitHub App is subscribed to `push`
+  events;
+- `POST /api/registry/agent-rules/sync` (admin) runs it now.
+  `GET /api/registry/agent-rules/report` (admin who reads the corpus) returns
+  the newest run per repository.
+
+GitHub is read with REST only: the head commit, one recursive tree, and the
+`AGENTS.md` blobs. No clone, no model call. A truncated tree, an HTTP error, a
+timeout or any partial read writes and retires nothing; the run is saved as
+failed and the next trigger retries.
+
+Apply writes rows under the policy's corpus with source system
+`agents_md_rule`, status `proposed`, repository scope, the bullet as the body
+and the `AGENTS.md` blob URL at the head commit as the source URL. Imported
+proposals do not expire. `registry_agent_rule_identities` keeps one identity
+per rule, `registry_agent_rule_versions` every text version, and
+`registry_agent_rule_runs` every run and its report. A run pairs bullets with
+identities in this order:
+
+1. same file, same text and hooks: unchanged;
+2. same file and same hooks: an edit;
+3. same file and same text with hook names masked: a hook rename;
+4. the old hook paths are gone and their blobs sit at the paths the bullet now
+   names: a hook move;
+5. same text and hooks with the old `AGENTS.md` gone: the file moved;
+6. a removed rule with the same file, text and hooks: it reappeared.
+
+Anything else is a new rule. A new version is written only when the text, the
+hook paths or the `AGENTS.md` path changed; the old version is kept. An edited
+rule keeps its status, so an approved rule stays approved. A bullet that is
+gone, or whose hook file is gone, retires its rule with `source_removed`. When
+it comes back the rule returns to the status it had. A rule a person rejected
+stays rejected.
+
+Use `dry-run` first and approve the reported change set before setting
+`REGISTRY_AGENT_RULES_MODE=apply`. Switching mode reruns at the same head.

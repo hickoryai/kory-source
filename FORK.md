@@ -577,3 +577,25 @@ Fork-owned files:
 `src/mira/platforms/server.py` and `src/mira/core/engine.py` are unchanged.
 The routing overlay in `local_seat.py` is a copy of the relay's completion
 overlay. A routing change has to be made in both until they share one source.
+
+## AGENTS.md rule mirror (HAI-14726)
+
+Fork-owned, inside the `registry` package, with no upstream file edits:
+
+- `src/mira/registry/agent_rules.py` (new): parser, matcher, GitHub REST
+  reader, dry-run report and apply;
+- `src/mira/registry/migrations/006_agent_rule_sources.sql` (new): identity,
+  version and run tables;
+- `src/mira/registry/__init__.py`: the hourly job calls `sync_configured`;
+- `src/mira/registry/realization.py`: `observe_github`, which `server.py`
+  already calls on every GitHub webhook, starts the same sync on a
+  default-branch push. `platforms/github/webhook.py` is unchanged;
+- `src/mira/registry/api.py`: `POST /api/registry/agent-rules/sync` and
+  `GET /api/registry/agent-rules/report`;
+- `tests/test_registry_agent_rules.py` and `tests/fixtures/agent_rules/`
+  (synthetic repository);
+- `docs/decision-history-import.md`.
+
+Configuration is runtime only (`REGISTRY_AGENT_RULES_REPOS`,
+`REGISTRY_AGENT_RULES_HOOK_DIR`, `REGISTRY_AGENT_RULES_MODE`); with the first
+two unset the mirror is off.

@@ -357,3 +357,26 @@ def sync_learned_rules(request: Request) -> dict:
 
     _actor(request, admin=True)
     return import_learned_rules(_reg(), _known_repos())
+
+
+@router.post("/agent-rules/sync")
+def sync_agent_rules(request: Request) -> dict:
+    """Mirror AGENTS.md rules now, as the hourly job would, in the configured mode."""
+    from mira.registry.agent_rules import settings, sync_configured
+
+    _actor(request, admin=True)
+    conf = settings()
+    return {
+        "enabled": conf is not None,
+        "mode": conf.mode if conf else "",
+        "runs": sync_configured(_reg(), trigger="manual"),
+    }
+
+
+@router.get("/agent-rules/report")
+def agent_rules_report(request: Request) -> list[dict]:
+    """Newest AGENTS.md rule run per repository, for admins who read that corpus."""
+    from mira.registry.agent_rules import latest_reports
+
+    _actor(request, admin=True)
+    return latest_reports(_reg(), _access(request))
