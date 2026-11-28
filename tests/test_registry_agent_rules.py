@@ -516,3 +516,28 @@ def test_old_runs_are_pruned(reg, reader):
         sync(reg, reader, mode="dry-run")
     count = reg.db.execute("SELECT COUNT(*) FROM registry_agent_rule_runs")[0][0]
     assert count == ar.KEEP_RUNS
+
+
+def test_new_bullet_with_an_edited_rules_first_text_is_a_new_rule(reg, reader):
+    sync(reg, reader)
+    obj = by_text(reg, "Never call")
+    original = obj["body"]
+    edit_root(reader, "in library code", "in any library module")
+    sync(reg, reader)
+    edit_root(reader, "- Keep imports sorted.", f"- {original}\n- Keep imports sorted.")
+    run = sync(reg, reader)
+    assert run["status"] == "finished" and run["counts"]["create"] == 1
+    assert len(rules(reg)) == 6
+    assert "any library module" in reg.get(obj["id"])["body"]
+    [again] = [o for o in rules(reg) if o["body"] == original]
+    assert again["id"] != obj["id"]
+    reader.set("src/app.py", "pass\n")
+    assert sync(reg, reader)["counts"]["create"] == 0  # both stay tracked
+
+
+def test_changed_hook_dir_reruns_at_the_same_head(reg, reader):
+    sync(reg, reader, mode="dry-run")
+    reader.calls.clear()
+    other = {**env("dry-run"), ar.HOOK_DIR_ENV: "tools/hooks"}
+    [run] = ar.sync_configured(reg, env=other, reader=reader, access=rp.operator())
+    assert run["status"] == "finished" and "tree" in reader.calls

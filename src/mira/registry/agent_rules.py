@@ -428,6 +428,19 @@ def identity_id(repo: str, bullet: Bullet) -> str:
     return _sha(key)[:32]
 
 
+def _new_identity_id(registry: Any, repo: str, bullet: Bullet) -> str:
+    """The deterministic id, unless an older rule already holds it.
+
+    An identity keeps the id of its first text through edits, renames and
+    moves, so a new bullet with that first text must not take it over.
+    """
+    candidate = identity_id(repo, bullet)
+    taken = registry.db.execute(
+        "SELECT 1 FROM registry_agent_rule_identities WHERE identity_id = ?", (candidate,)
+    )
+    return uuid.uuid4().hex if taken else candidate
+
+
 # ── sync ────────────────────────────────────────────────────────────────
 
 
@@ -442,13 +455,17 @@ def _short(b: Bullet) -> dict:
 
 def last_finished(registry: Any, repo: str) -> dict | None:
     rows = registry.db.execute(
-        "SELECT run_id, head_commit, mode, finished_at FROM registry_agent_rule_runs "
+        "SELECT run_id, head_commit, mode, report FROM registry_agent_rule_runs "
         "WHERE repo = ? AND status = 'finished' ORDER BY finished_at DESC, run_id LIMIT 1",
         (repo,),
     )
     if not rows:
         return None
-    return {"run_id": rows[0][0], "head": rows[0][1], "mode": rows[0][2]}
+    try:
+        hook_dir = str(json.loads(rows[0][3] or "{}").get("hook_dir") or "")
+    except ValueError:
+        hook_dir = ""
+    return {"run_id": rows[0][0], "head": rows[0][1], "mode": rows[0][2], "hook_dir": hook_dir}
 
 
 def _save_run(registry: Any, run: dict) -> None:
@@ -534,7 +551,11 @@ def _sync_repo(
         reader = reader or GitHubReader()
         run["head"] = reader.head(repo)
         last = last_finished(registry, repo)
-        if last and last["head"] == run["head"] and last["mode"] == conf.mode:
+        if last and (last["head"], last["mode"], last["hook_dir"]) == (
+            run["head"],
+            conf.mode,
+            conf.hook_dir,
+        ):
             return {**_summary(run), "status": "unchanged", "run_id": last["run_id"]}
         tree = reader.tree(repo, run["head"])
         report = _compute(registry, repo, run["head"], tree, reader, conf)
@@ -686,7 +707,18 @@ def _apply_match(
     version = 1 if ident is None else ident.version + int(changed)
     if ident is None:
         ident = Identity(
-            identity_id(repo, b), repo, "", b.agents_path, "", "", (), {}, "", 0, "active", ""
+            _new_identity_id(registry, repo, b),
+            repo,
+            "",
+            b.agents_path,
+            "",
+            "",
+            (),
+            {},
+            "",
+            0,
+            "active",
+            "",
         )
     item = {
         "source_id": f"{repo}/agents-md/{ident.identity_id}",
