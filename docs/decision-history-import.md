@@ -117,8 +117,9 @@ cited evidence; source wording never grants registry approval.
 
 ## Known gaps (reported, not imported)
 
-Linear project objects; comments not on an issue; relations beyond the
-first 50; edit history before the first observation (GitHub and Linear expose
+Linear project objects (a document keeps its project id and name);
+comments not on an issue; Linear relations of type `similar`; edit history
+before the first observation (GitHub and Linear expose
 only the current body); languages without a comment syntax here; git history
 beyond `--max-commits`; cross-repository references outside the manifest.
 
@@ -166,6 +167,41 @@ The first Linear run after upgrading from importer version 2 revisits prior
 observations so unchanged descriptions and comments also get decision extraction;
 subsequent runs resume the per-stream incremental cursors. Replays preserve
 proposed status and never infer human approval.
+
+## Linear documents, relations and reconciliation sweeps
+
+Importer version 5 stores each Linear document as a `document` record as well
+as evidence. The record keeps its title, content, URL, source timestamps and
+parents (`source_refs`: issue, project id and name, initiative, team, parent
+document). A document on an issue owns one `relates` link to that issue, and
+the issue's work context lists it under `documents`. Projects are not records.
+Archived is a flag (`source_archived_at`); trashed retires the record as
+`source_deleted`, and restoring it restores the record. Documents are
+import-only: `put_object` refuses the kind.
+
+An issue holding more than 50 relations is paged to the end before its page is
+written. A failed relation page stops the walk on that page, so no truncated
+relation set is stored and the watermark does not move.
+
+Two sweeps catch what an `updatedAt` walk misses. They run inside the same
+`import` command (no new job), every 6 hours, resumable across runs, within 500
+record writes and 5 minutes per run:
+
+- `document_reconcile` lists every workspace document's id and version,
+  imports any document with no record or an older one, and fixes a document's
+  issue link when it changed. When the listing completes, a stored document it
+  did not see is re-read by id; only Linear answering that the document does
+  not exist retires it, with a tombstone. A pass whose cursor was rejected
+  retires nothing, and a pass that would retire more than 25 documents or 10%
+  of those stored retires none and records an error.
+- `relation_reconcile` reads each manifest team's issues with their parent and
+  every relation, and rewrites an issue's owned links only when they differ.
+  It runs only when the import covers every manifest team.
+
+Upgrading from version 4 does not re-walk the streams: the first sweep pass is
+the backfill for document records and relations past the first 50.
+`python -m mira.registry.linear inventory` counts documents by parent, archived
+and trashed, all relations, and issues over 50 relations.
 
 Deployments may exclude GitHub PRs and reviews as decision sources; repository
 history is independent of that importer. Image publication requires the separate
@@ -262,7 +298,7 @@ agent markers remain separate from source accounts. Linear retains issue,
 comment or document author/time and source URL. Unknown identities remain
 unknown instead of being replaced with the importer.
 
-Replaying repository v4 or Linear v4 revisits existing evidence and backfills
+Replaying repository v4, or Linear from before v3, revisits existing evidence and backfills
 missing provenance without approving decisions. Existing lifecycle approvers
 and statuses are preserved; after a registry lifecycle action `decided_by` and
 `decided_at` retain their lifecycle meaning, while source attribution and

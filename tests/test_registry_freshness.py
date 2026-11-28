@@ -387,3 +387,42 @@ def test_cli_refuses_a_non_operator(reg, monkeypatch):
 def test_import_run_index_exists(reg):
     names = {r[0] for r in reg.db.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
     assert "registry_import_runs_stream_started" in names
+
+
+# ── Linear reconciliation sweeps (HAI-14727) ───────────────────────────
+
+
+def sweep(reg, name, *, completed, progress=""):
+    reg.db.execute(
+        "INSERT INTO registry_sync_state (source_system, stream, watermark, after_cursor, "
+        "updated_at) VALUES ('linear', ?, ?, ?, ?)",
+        (name, completed, progress, NOW),
+    )
+
+
+def test_sweep_names_match_the_importer():
+    from mira.registry import linear
+
+    assert freshness.LINEAR_SWEEPS == linear.SWEEPS
+
+
+def test_a_sweep_without_a_completed_pass_is_reported_not_stale(reg):
+    fresh_corpus(reg)
+    assert stale(reg) == {"stale": False, "stale_sources": []}
+    rows = freshness.report(reg, access.current_policy(), NOW)["sources"]["linear_sweeps"]
+    assert {name: row["status"] for name, row in rows.items()} == dict.fromkeys(
+        freshness.LINEAR_SWEEPS, "no_completed_pass"
+    )
+
+
+def test_a_sweep_pass_older_than_a_day_is_stale(reg):
+    fresh_corpus(reg)
+    sweep(reg, "document_reconcile", completed=NOW - 23 * 3600)
+    sweep(reg, "relation_reconcile", completed=NOW - 25 * 3600, progress='{"phase": "x"}')
+    out = stale(reg)
+    assert [(r["stream"], r["reason"], r["lag_seconds"]) for r in out["stale_sources"]] == [
+        ("relation_reconcile", "sweep_overdue", 25 * 3600)
+    ]
+    rows = freshness.report(reg, access.current_policy(), NOW)["sources"]["linear_sweeps"]
+    assert rows["relation_reconcile"]["in_progress"] is True
+    assert rows["document_reconcile"]["age_seconds"] == 23 * 3600

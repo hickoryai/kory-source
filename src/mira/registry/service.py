@@ -39,6 +39,7 @@ from mira.registry.model import (
     DELIVERY_STATES,
     EVIDENCE_RESULTS,
     EXPIRY_DAYS,
+    IMPORT_ONLY_KINDS,
     INACTIVE_REL_STATUSES,
     KINDS,
     RELATIONSHIP_TYPES,
@@ -100,7 +101,13 @@ COLUMNS = (
     "policy_version",
     "authority_tier",
     "decision_revision",
+    "source_created_at",
+    "source_updated_at",
+    "source_archived_at",
+    "source_refs",
 )
+# Source-side fields an importer may set on its rows (migration 006).
+_SOURCE_FIELDS = ("source_created_at", "source_updated_at", "source_archived_at", "source_refs")
 _COLS = ", ".join(COLUMNS)
 _REL_COLS = (
     "id",
@@ -184,6 +191,10 @@ _SOURCE_RETIRE_REASONS = ("source_retired", "source_deleted")
 _MIRRORED_WORK_FIELDS = ("title", "owner", "delivery_state")
 # Work links that mirror a Linear relation when both ends came from Linear.
 _MIRRORED_WORK_LINKS = ("parent_of", "blocks", "relates")
+
+
+# Ids per ``IN (...)`` read when an importer compares a page with stored rows.
+_IN_BATCH = 500
 
 
 class _ConcurrentInsert(Exception):
@@ -327,6 +338,10 @@ class Registry:
             obj["alternatives"] = json.loads(obj["alternatives"]) if obj["alternatives"] else []
         except ValueError:
             obj["alternatives"] = [obj["alternatives"]]
+        try:
+            obj["source_refs"] = json.loads(obj["source_refs"]) if obj["source_refs"] else {}
+        except ValueError:
+            obj["source_refs"] = {}
         obj["proposal"] = obj["status"] == "proposed"
         return obj
 
@@ -382,6 +397,8 @@ class Registry:
         values[COLUMNS.index("alternatives")] = (
             json.dumps(obj["alternatives"]) if obj["alternatives"] else ""
         )
+        refs = obj.get("source_refs") or {}
+        values[COLUMNS.index("source_refs")] = json.dumps(refs, sort_keys=True) if refs else ""
         if insert:
             marks = ", ".join("?" for _ in COLUMNS)
             self.db.execute(f"INSERT INTO registry_objects ({_COLS}) VALUES ({marks})", values)
@@ -420,6 +437,10 @@ class Registry:
             policy_version="",
             authority_tier="",
             decision_revision=0,
+            source_created_at=0.0,
+            source_updated_at=0.0,
+            source_archived_at=0.0,
+            source_refs={},
         )
         if kind == "work":
             obj["delivery_state"] = "planned"
@@ -877,9 +898,9 @@ class Registry:
     async def put_object(self, fields: dict, actor: Actor) -> dict:
         """Record an object. Claims start ``proposed`` and run the conflict check."""
         kind = str(fields.get("kind") or "decision")
-        if kind not in KINDS or kind == "verification_evidence":
+        if kind not in KINDS or kind in IMPORT_ONLY_KINDS:
             raise RegistryError(
-                f"kind must be one of {', '.join(k for k in KINDS if k != 'verification_evidence')}"
+                f"kind must be one of {', '.join(k for k in KINDS if k not in IMPORT_ONLY_KINDS)}"
             )
         ignored = sorted(k for k in fields if k not in _CALLER_FIELDS | _INPUT_ONLY)
         obj = self._blank(kind, actor)
@@ -2171,6 +2192,12 @@ class Registry:
             },
             "evidence": evidence,
             "comments": self.comments_for(work),
+            # Imported documents attached to this ticket. Each document owns its link.
+            "documents": [
+                o
+                for o in self._linked(work_id, "relates", direction="in", access=a)
+                if o["kind"] == "document"
+            ],
         }
 
     def work_view(self, work_id: str, access: AccessContext | None = None) -> dict:
@@ -2387,7 +2414,7 @@ class Registry:
         for key in _CALLER_FIELDS - {"basis"}:
             if key in item and item[key] is not None:
                 obj[key] = item[key]
-        for key in ("tested_revision", "method", "result", "artifact_url"):
+        for key in ("tested_revision", "method", "result", "artifact_url", *_SOURCE_FIELDS):
             if key in item and item[key] is not None:
                 obj[key] = item[key]
         if item.get("status") == "retired" and obj["status"] == "approved":
@@ -2464,6 +2491,142 @@ class Registry:
         obj["synced_at"] = self.clock()
         self._write(obj)
         return obj["sync_status"], errors
+
+    def _ids_by_source(self, system: str, source_ids: Iterable[str]) -> dict[str, str]:
+        """``{source_id: object_id}`` for imported rows, read in batches."""
+        wanted = sorted({s for s in source_ids if s})
+        found: dict[str, str] = {}
+        for start in range(0, len(wanted), _IN_BATCH):
+            chunk = wanted[start : start + _IN_BATCH]
+            marks = ", ".join("?" for _ in chunk)
+            for sid, oid in self.db.execute(
+                "SELECT source_id, id FROM registry_objects WHERE source_system = ? "
+                f"AND source_id IN ({marks})",
+                (system, *chunk),
+            ):
+                found[sid] = oid
+        return found
+
+    def reconcile_import_links(
+        self, source_system: str, items: list[dict], actor: Actor
+    ) -> list[dict]:
+        """Rewrite an imported item's owned links only where they differ from ``items``.
+
+        Each item is ``{"source_id", "links"}`` in the ``import_items`` link form,
+        for an object already imported. Its fields and version are left alone,
+        so a source that changes links without bumping its version (Linear
+        relations) is still mirrored. Matching items are read and never written.
+        An unknown ``source_id`` is reported ``missing``; nothing is created.
+        """
+        rows = {o["source_id"]: o for o in self._by_sources(source_system, items)}
+        targets = [
+            str(link.get("target_source_id") or "")
+            for item in items
+            for link in item.get("links") or []
+        ]
+        ids = self._ids_by_source(source_system, targets)
+        owned = self._owned_links(source_system, list(rows.values()))
+        results: list[dict] = []
+        for item in items:
+            sid = str(item.get("source_id") or "")
+            obj = rows.get(sid)
+            if obj is None:
+                results.append({"source_id": sid, "outcome": "missing"})
+                continue
+            wanted: set[tuple[str, str, str]] = set()
+            missing = False
+            for link in item.get("links") or []:
+                target = ids.get(str(link.get("target_source_id") or ""))
+                if target is None:
+                    missing = True
+                    continue
+                type = str(link.get("type") or "")
+                wanted.add(
+                    (target, obj["id"], type) if link.get("reverse") else (obj["id"], target, type)
+                )
+            current = owned.get(obj["id"])
+            expected = "pending_links" if missing else "synced"
+            if current is not None and (
+                (current == wanted and obj["sync_status"] == expected)
+                # A link the registry refused stays refused until the source changes.
+                or (obj["sync_status"] == "error" and current <= wanted)
+            ):
+                results.append(
+                    {
+                        "source_id": sid,
+                        "object_id": obj["id"],
+                        "outcome": "unchanged",
+                        "sync_status": obj["sync_status"],
+                    }
+                )
+                continue
+            with self.db.transaction():
+                sync, errors = self._import_links(source_system, item, obj, actor)
+            res = {"source_id": sid, "object_id": obj["id"], "outcome": "relinked"}
+            res["sync_status"] = sync
+            if errors:
+                res["link_errors"] = errors
+            results.append(res)
+        return results
+
+    def retire_source_deleted(self, source_system: str, source_id: str) -> bool:
+        """Retire an imported row its source confirmed deleted. True if it changed.
+
+        Only an approved row is retired, as for a trashed ticket; a row a person
+        retired or rejected keeps its state. A later import of the same source
+        id restores it, because the reason is a source retire reason.
+        """
+        with self.db.transaction():
+            obj = self.by_source(source_system, source_id)
+            if obj is None:
+                return False
+            self._lock_row(obj["id"])
+            obj = self.get(obj["id"])
+            if obj["status"] != "approved":
+                return False
+            obj.update(status="retired", status_reason="source_deleted", synced_at=self.clock())
+            self._write(obj)
+            return True
+
+    def _by_sources(self, system: str, items: list[dict]) -> list[dict]:
+        wanted = sorted({str(i.get("source_id") or "") for i in items} - {""})
+        out: list[dict] = []
+        for start in range(0, len(wanted), _IN_BATCH):
+            chunk = wanted[start : start + _IN_BATCH]
+            marks = ", ".join("?" for _ in chunk)
+            out += self._select(f"source_system = ? AND source_id IN ({marks})", (system, *chunk))
+        return out
+
+    def _owned_links(
+        self, system: str, objs: list[dict]
+    ) -> dict[str, set[tuple[str, str, str]] | None]:
+        """The links each imported object owns. ``None`` marks legacy-tagged links."""
+        by_origin = {f"import:{system}#{o['source_id']}": o["id"] for o in objs}
+        out: dict[str, set[tuple[str, str, str]] | None] = {o["id"]: set() for o in objs}
+        origins = sorted(by_origin)
+        for start in range(0, len(origins), _IN_BATCH):
+            chunk = origins[start : start + _IN_BATCH]
+            marks = ", ".join("?" for _ in chunk)
+            for origin, src, dst, type in self.db.execute(
+                "SELECT origin, source_id, target_id, type FROM registry_relationships "
+                f"WHERE origin IN ({marks})",
+                chunk,
+            ):
+                links = out[by_origin[origin]]
+                if links is not None:
+                    links.add((src, dst, type))
+        ids = sorted(out)
+        for start in range(0, len(ids), _IN_BATCH):
+            chunk = ids[start : start + _IN_BATCH]
+            marks = ", ".join("?" for _ in chunk)
+            # Links from before per-item origins: rewrite them under the item's origin.
+            for (src,) in self.db.execute(
+                "SELECT DISTINCT source_id FROM registry_relationships "
+                f"WHERE origin = ? AND source_id IN ({marks})",
+                (f"import:{system}", *chunk),
+            ):
+                out[src] = None
+        return out
 
     # ── mirrored comments ─────────────────────────────────
 

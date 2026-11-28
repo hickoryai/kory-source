@@ -63,7 +63,16 @@ def test_linear_report_detects_missing_stale_extra_and_runs(reg, monkeypatch):
     assert out["teams"]["workspace_documents"]["documents"]["source"] == 2
     assert out["streams"]["comments"]["evidence_without_run"]["count"] == 0
     assert out["streams"]["comments"]["run_ids"]
-    assert set(out["cursors"]) == {"issues", "comments", "documents"}
+    assert set(out["cursors"]) == {
+        "issues",
+        "comments",
+        "documents",
+        "document_reconcile",
+        "relation_reconcile",
+    }
+    records = out["streams"]["document_records"]
+    assert (records["stored"]["ids"], records["missing"]["ids"]) == (["doc-1"], ["doc-2"])
+    assert out["streams"]["relations"]["issues_over_first_page"]["count"] == 0
     assert reg.db.execute("SELECT COUNT(*) FROM registry_import_runs") == before
 
 

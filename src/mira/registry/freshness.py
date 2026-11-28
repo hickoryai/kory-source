@@ -11,6 +11,10 @@ Rules:
 
 - Linear: lag is now minus the stream cursor's ``updated_at`` for issues,
   comments, and documents. Over 45 minutes is stale. The lease row is ignored.
+- Linear sweeps (document and relation reconciliation): age is now minus the
+  start of the last completed pass. Over 24 hours is stale. Before a first
+  pass completes the sweep is reported, not stale: the walks still keep
+  documents and relations current.
 - Git: each policy repository. No completed cursor is stale at once. A run
   newer than the cursor that has not completed is catching up for 30 minutes,
   then stale. A completed cursor with nothing newer stays fresh on quiet days.
@@ -40,6 +44,10 @@ logger = logging.getLogger(__name__)
 
 LINEAR_STREAMS = ("issues", "comments", "documents")
 LINEAR_THRESHOLD_SECONDS = 45 * 60
+# The sweeps the Linear importer runs (``linear.SWEEPS``) and the age of the
+# last completed pass after which one is stale: four missed six-hour passes.
+LINEAR_SWEEPS = ("document_reconcile", "relation_reconcile")
+LINEAR_SWEEP_THRESHOLD_SECONDS = 24 * 3600
 GIT_THRESHOLD_SECONDS = 30 * 60
 SESSION_SYSTEM = "session_history"
 UNAVAILABLE = {
@@ -115,6 +123,33 @@ def linear_streams(db: Any, policy: CorpusPolicy, now: float) -> dict[str, dict]
     return out
 
 
+def linear_sweeps(db: Any, policy: CorpusPolicy, now: float) -> dict[str, dict]:
+    if not policy.linear_teams:
+        return {}
+    rows = db.execute(
+        "SELECT stream, watermark, after_cursor FROM registry_sync_state WHERE source_system = ?",
+        ("linear",),
+    )
+    state = {r[0]: (float(r[1] or 0), r[2] or "") for r in rows}
+    out = {}
+    for sweep in LINEAR_SWEEPS:
+        completed, progress = state.get(sweep, (0.0, ""))
+        run = _latest_run(db, "linear", sweep)
+        row: dict[str, Any] = {
+            "in_progress": bool(progress),
+            "latest_run_status": run[0] if run else None,
+            "threshold_seconds": LINEAR_SWEEP_THRESHOLD_SECONDS,
+            "age_seconds": round(now - completed) if completed else None,
+            "stale_reason": None,
+        }
+        if not completed:
+            row["status"] = "no_completed_pass"
+        elif now - completed > LINEAR_SWEEP_THRESHOLD_SECONDS:
+            row["stale_reason"] = "sweep_overdue"
+        out[sweep] = row
+    return out
+
+
 def git_streams(db: Any, policy: CorpusPolicy, now: float) -> dict[str, dict]:
     cursors = _cursors(db, "git")
     out = {}
@@ -174,6 +209,17 @@ def stale_rows(db: Any, policy: CorpusPolicy, now: float) -> list[dict]:
                     stream,
                     row["lag_seconds"],
                     LINEAR_THRESHOLD_SECONDS,
+                    row["stale_reason"],
+                )
+            )
+    for sweep, row in linear_sweeps(db, policy, now).items():
+        if row["stale_reason"]:
+            rows.append(
+                _row(
+                    "linear",
+                    sweep,
+                    row["age_seconds"],
+                    LINEAR_SWEEP_THRESHOLD_SECONDS,
                     row["stale_reason"],
                 )
             )
@@ -257,6 +303,7 @@ def report(
         "generated_at": now,
         "sources": {
             "linear": linear_rows,
+            "linear_sweeps": linear_sweeps(db, policy, now),
             "git": git_rows,
             "sessions": subjects,
             "slack": {"status": "held_by_owner", "blocks_dogfood": None},

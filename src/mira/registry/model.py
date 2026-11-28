@@ -12,7 +12,11 @@ KINDS = (
     "requirement",
     "concept",
     "verification_evidence",
+    "document",
 )
+# Kinds only an importer or the evidence tool writes; ``put_object`` refuses them.
+# A ``document`` mirrors a Linear document and Linear stays authoritative for it.
+IMPORT_ONLY_KINDS = ("verification_evidence", "document")
 # Kinds that make a claim about how code should behave. They carry session and
 # branch, run the conflict check, follow the realization tracker, and expire.
 CLAIM_KINDS = ("decision", "rule", "constraint", "requirement")
