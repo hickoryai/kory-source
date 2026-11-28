@@ -52,6 +52,8 @@ class FakeLinear:
         self.fail_next: list[int] = []  # HTTP statuses to return before serving
         self.crash_after_pages: int | None = None
         self.pages_served = 0
+        # Whether list queries leave trashed documents out (Linear does not document it).
+        self.lists_hide_trashed = False
 
     def issue(self, key: str, *, t: float, **fields) -> dict:
         node = {
@@ -60,6 +62,7 @@ class FakeLinear:
             "title": fields.pop("title", key),
             "description": fields.pop("description", ""),
             "url": f"https://linear.app/hickoryai/issue/{key}",
+            "createdAt": iso(fields.pop("created", t)),
             "updatedAt": iso(t),
             "archivedAt": None,
             "trashed": False,
@@ -101,6 +104,7 @@ class FakeLinear:
             "id": did,
             "title": fields.pop("title", did),
             "url": f"https://linear.app/hickoryai/document/{did}",
+            "createdAt": iso(fields.pop("created", t)),
             "updatedAt": iso(t),
             "archivedAt": None,
             "issue": (
@@ -110,10 +114,19 @@ class FakeLinear:
             ),
             "project": None,
             "initiative": None,
+            "team": None,
+            "parentDocument": None,
+            "trashed": False,
         }
         node.update(fields)
         self.documents[did] = node
         return node
+
+    def relate(self, key: str, related: list[str], *, rel_type: str = "related") -> None:
+        """Give an issue any number of relations, served 50 per page as Linear does."""
+        self.issues[f"uuid-{key}"]["_relations"] = [
+            {"type": rel_type, "relatedIssue": {"id": f"uuid-{r}"}} for r in related
+        ]
 
     @staticmethod
     def _project_match(project: dict | None, cond: dict) -> bool:
@@ -147,6 +160,26 @@ class FakeLinear:
                 return False
         return True
 
+    @staticmethod
+    def _relations(node: dict, after: str | None, first: int) -> dict | None:
+        """A relations connection page over ``_relations``, cursors ``r<offset>``."""
+        if "_relations" not in node:
+            return None
+        rels = node["_relations"]
+        start = int(after[1:]) if after else 0
+        more = start + first < len(rels)
+        return {
+            "pageInfo": {"hasNextPage": more, "endCursor": f"r{start + first}" if more else None},
+            "nodes": rels[start : start + first],
+        }
+
+    def _serve(self, node: dict) -> dict:
+        out = {k: v for k, v in node.items() if k != "_relations"}
+        rels = self._relations(node, None, lin.RELATIONS_PAGE)
+        if rels is not None:
+            out["relations"] = rels
+        return out
+
     def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         self.requests.append(body)
@@ -155,21 +188,48 @@ class FakeLinear:
         if self.crash_after_pages is not None and self.pages_served >= self.crash_after_pages:
             raise httpx.ConnectError("linear went away")
         q, v = body["query"], body["variables"]
-        name = next(
-            n for n in ("issues", "comments", "teams", "documents") if f"Registry{n.title()}" in q
-        )
+        op = q.split("query ", 1)[1].split("(", 1)[0].strip()
+        self.pages_served += 1
+        if op == "RegistryIssueRelations":
+            node = self.issues.get(v["id"])
+            if node is None:
+                return httpx.Response(200, json=not_found("Issue"))
+            after = v.get("after")
+            if after is not None and not after.startswith("r"):
+                return httpx.Response(200, json={"errors": [{"message": "invalid cursor"}]})
+            rels = self._relations(node, after, v["first"]) or node["relations"]
+            return httpx.Response(
+                200, json={"data": {"issue": {"id": node["id"], "relations": rels}}}
+            )
+        if op == "RegistryDocument":
+            node = self.documents.get(v["id"])
+            if node is None:
+                return httpx.Response(200, json=not_found("Document"))
+            return httpx.Response(200, json={"data": {"document": self._serve(node)}})
+        name, order = {
+            "RegistryIssues": ("issues", "updatedAt"),
+            "RegistryIssueLinks": ("issues", "createdAt"),
+            "RegistryComments": ("comments", "updatedAt"),
+            "RegistryTeams": ("teams", "updatedAt"),
+            "RegistryDocuments": ("documents", "updatedAt"),
+            "RegistryDocumentIds": ("documents", "createdAt"),
+        }[op]
         store = getattr(self, name)
         nodes = sorted(
-            (n for n in store.values() if self._match(n, v["filter"])),
-            key=lambda n: (n["updatedAt"], n["id"]),
+            (
+                n
+                for n in store.values()
+                if self._match(n, v["filter"])
+                and not (name == "documents" and self.lists_hide_trashed and n.get("trashed"))
+            ),
+            key=lambda n: (n.get(order) or "", n["id"]),
         )
         after = v.get("after")
         if after is not None and not after.startswith("c"):
             return httpx.Response(200, json={"errors": [{"message": "invalid cursor"}]})
         start = int(after[1:]) if after else 0
-        page = nodes[start : start + v["first"]]
+        page = [self._serve(n) for n in nodes[start : start + v["first"]]]
         more = start + v["first"] < len(nodes)
-        self.pages_served += 1
         return httpx.Response(
             200,
             json={
@@ -186,6 +246,22 @@ class FakeLinear:
         )
 
 
+def not_found(entity: str) -> dict:
+    """Linear's answer for an id it does not hold."""
+    return {
+        "data": None,
+        "errors": [
+            {
+                "message": f"Entity not found: {entity}",
+                "extensions": {
+                    "code": "INPUT_ERROR",
+                    "userPresentableMessage": f"Could not find referenced {entity}.",
+                },
+            }
+        ],
+    }
+
+
 @pytest.fixture
 def fake() -> FakeLinear:
     return FakeLinear()
@@ -198,7 +274,8 @@ def sleeps() -> list[float]:
 
 @pytest.fixture
 def client(fake, sleeps) -> LinearClient:
-    http = httpx.Client(transport=httpx.MockTransport(fake.handler))
+    # Late-bound, so a test can wrap ``fake.handler``.
+    http = httpx.Client(transport=httpx.MockTransport(lambda request: fake.handler(request)))
     return LinearClient(
         "lin_sync_test", endpoint="https://linear.test/graphql", http=http, sleep=sleeps.append
     )
@@ -220,6 +297,7 @@ def reg(tmp_path, clock) -> Registry:
 @pytest.fixture(autouse=True)
 def small_pages(monkeypatch):
     monkeypatch.setattr(lin, "PAGE_SIZE", 2)
+    monkeypatch.setattr(lin, "SWEEP_PAUSE_SECONDS", 0)
 
 
 @pytest.fixture(autouse=True)
@@ -422,7 +500,7 @@ def test_default_scope_is_every_manifest_team(reg, client, fake, clock):
         r["variables"]["filter"] == manifest or r["variables"]["filter"]["and"][0] == manifest
         for r in walks
     )
-    assert all("includeArchived: true" in q for q in lin.QUERIES)
+    assert all("includeArchived: true" in q for q in lin.WALK_QUERIES)
 
 
 def test_cli_defaults_to_every_manifest_team(monkeypatch):
@@ -534,14 +612,21 @@ def test_incremental_waits_without_touching_backfill_cursor(reg, client, fake, c
 def test_incremental_only_walks_ready_streams(reg, client, fake, clock):
     imp = importer(reg, client, clock)
     imp._save("issues", imp.state("issues") | {"watermark": T0})
-    fake.issue("HAI-1", t=T0, relations={"pageInfo": {"hasNextPage": True}, "nodes": []})
+    fake.issue("HAI-1", t=T0)
+    fake.relate("HAI-1", [])
+    fake.issues["uuid-HAI-1"]["_relations"] = [
+        {"type": "related", "relatedIssue": {"id": f"uuid-HAI-{i}"}} for i in range(2, 60)
+    ]
 
     out = imp.run(apply=True, incremental_only=True)
 
-    assert out["issues"]["truncated_relations"] == ["HAI-1"]
+    assert out["issues"]["relations_paged"] == ["HAI-1"]
     assert out["comments"]["status"] == out["documents"]["status"] == "waiting_for_backfill"
-    assert len(fake.requests) == 1
-    assert "RegistryIssues" in fake.requests[0]["query"]
+    assert out["document_reconcile"] == {"status": "waiting_for_backfill"}
+    assert [r["query"].split("(")[0].split()[-1] for r in fake.requests] == [
+        "RegistryIssues",
+        "RegistryIssueRelations",
+    ]
 
 
 def test_incremental_item_error_replays_the_window(reg, client, fake, clock, monkeypatch):
@@ -1001,10 +1086,15 @@ def test_inventory_counts_every_manifest_team(client, fake):
     assert out["documents"] == {
         "total": 4,
         "archived": 1,
+        "trashed": 0,
         "on_issue": 2,
         "on_project": 2,
         "on_initiative": 0,
+        "on_team": 0,
+        "on_parent_document": 0,
     }
+    assert (out["relations_total"], out["relations_imported"]) == (2, 1)
+    assert out["issues_over_first_relation_page"] == 0
     assert out["documents_linked_to_issues"] == ["HAI-2: HAI-2 design", "OPS-1: doc-2"]
     assert out["projects_referenced"] == 1
     joined = "\n".join(out["exceptions"])
@@ -1070,20 +1160,34 @@ def test_sent_filters_are_valid_linear_inputs(linear_schema, reg, client, fake, 
         ],
         HUMAN,
     )
+    fake.relate("HAI-4", ["HAI-1"] * 60)  # past the first relations page
     lin.inventory(client, access=rp.operator())
     lin.inventory(client, ["HAI", "OPS"], access=rp.operator())
     LinearImporter(reg, client, access=rp.operator(), clock=clock).run(apply=True)
     LinearImporter(reg, client, ["HAI"], access=rp.operator(), clock=clock).run(apply=True)
     clock.now += 3600
     LinearImporter(reg, client, ["HAI"], access=rp.operator(), clock=clock).run(apply=True)
+    del fake.documents["doc-2"]  # confirmed by document(id) before it is retired
+    clock.now += lin.SWEEP_INTERVAL_SECONDS
+    LinearImporter(reg, client, access=rp.operator(), clock=clock).run(apply=True)
     sent = {json.dumps(r, sort_keys=True): r for r in fake.requests}.values()
-    assert {
-        next(n for n in ("Issues", "Comments", "Teams", "Documents") if n in r["query"])
-        for r in sent
-    } == {"Issues", "Comments", "Teams", "Documents"}
+    assert {operation(r) for r in sent} == {
+        "RegistryIssues",
+        "RegistryComments",
+        "RegistryTeams",
+        "RegistryDocuments",
+        "RegistryIssueLinks",
+        "RegistryDocumentIds",
+        "RegistryIssueRelations",
+        "RegistryDocument",
+    }
     assert any('"in"' in json.dumps(r["variables"]) for r in sent)  # the pending re-read
     for r in sent:
         assert check_variables(linear_schema, r["query"], r["variables"]) == [], r["variables"]
+
+
+def operation(request: dict) -> str:
+    return request["query"].split("query ", 1)[1].split("(", 1)[0].strip()
 
 
 def test_schema_check_catches_a_bad_filter(linear_schema):
@@ -1365,3 +1469,473 @@ def test_upgraded_backfill_resumes_its_saved_page_cursor(reg, client, fake, cloc
     importer(reg, client, clock).run(apply=True)
     assert fake.requests[0]["variables"]["after"] == "c2"
     assert len(_decisions(reg)) == 5
+
+
+# ── documents as records, every relation, reconciliation sweeps (HAI-14727) ──
+
+
+def doc(reg, did: str) -> dict:
+    obj = reg.by_source("linear", did)
+    assert obj is not None and obj["kind"] == "document"
+    return obj
+
+
+def ticket_docs(reg, key: str) -> list[str]:
+    ctx = reg.work_context(reg.work_by_ticket(key, rp.reader())["id"], rp.reader())
+    return [d["source_id"] for d in ctx["documents"]]
+
+
+def tombstones(reg) -> list[str]:
+    return [
+        r[0]
+        for r in reg.db.execute(
+            "SELECT source_id FROM registry_source_revisions "
+            "WHERE source_type = 'linear_document' AND availability = 'deleted'"
+        )
+    ]
+
+
+def wrote(result: dict) -> int:
+    totals = result.get("totals") or {}
+    return sum(totals.get(k, 0) for k in ("created", "updated", "relinked", "retired"))
+
+
+def fail_requests(fake: FakeLinear, monkeypatch, when) -> None:
+    """Fail every request ``when(op, variables)`` matches, as a dropped connection."""
+    original = fake.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if when(operation(body), body["variables"]):
+            fake.requests.append(body)
+            raise httpx.ConnectError("linear went away")
+        return original(request)
+
+    monkeypatch.setattr(fake, "handler", handler)
+
+
+def due(clock: Clock) -> None:
+    clock.now += lin.SWEEP_INTERVAL_SECONDS + 1
+
+
+def test_an_issue_with_120_relations_imports_every_one(reg, client, fake, clock, monkeypatch):
+    monkeypatch.setattr(lin, "PAGE_SIZE", 50)
+    fake.issue("HAI-0", t=T0 - 100)
+    for i in range(1, 121):
+        fake.issue(f"HAI-{i}", t=T0 - 200)
+    fake.relate("HAI-0", [f"HAI-{i}" for i in range(1, 121)])
+
+    out = importer(reg, client, clock).run(apply=True)
+
+    assert out["issues"]["totals"]["relations_paged"] == 1
+    ctx = reg.work_context(reg.work_by_ticket("HAI-0", rp.reader())["id"], rp.reader())
+    assert len(ctx["dependencies"]["relates"]) == 120
+    pages = [
+        r["variables"]["after"] for r in fake.requests if operation(r) == "RegistryIssueRelations"
+    ]
+    assert pages == ["r50", "r100"]
+
+
+def test_a_failed_relation_page_writes_no_truncated_set(reg, client, fake, clock, monkeypatch):
+    for i in range(61):
+        fake.issue(f"HAI-{i}", t=T0 - 200)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    clock.now = T0 + 100
+    fake.issue("HAI-0", t=T0 + 50, title="Now related to sixty")
+    fake.relate("HAI-0", [f"HAI-{i}" for i in range(1, 61)])
+    fail_requests(
+        fake, monkeypatch, lambda op, v: op == "RegistryIssueRelations" and v["after"] == "r50"
+    )
+
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["issues"]["status"] == "incomplete"
+    assert imp.state("issues")["watermark"] == T0
+    work = reg.work_by_ticket("HAI-0", rp.reader())
+    assert work["title"] == "HAI-0"  # the page holding HAI-0 was not written
+    assert reg.relationships(work["id"]) == []
+    assert out["document_reconcile"] == {"status": "skipped_after_stream_failure"}
+
+
+def test_relation_sweep_mirrors_changes_linear_did_not_bump(reg, client, fake, clock):
+    seed(fake)
+    imp = importer(reg, client, clock, teams=None)
+    assert imp.run(apply=True)["relation_reconcile"]["status"] == "complete"
+    # HAI-3 now blocks HAI-4, not HAI-2, and HAI-2 moved under HAI-4; updatedAt unchanged.
+    fake.issues["uuid-HAI-3"]["relations"] = {
+        "pageInfo": {"hasNextPage": False},
+        "nodes": [{"type": "blocks", "relatedIssue": {"id": "uuid-HAI-4"}}],
+    }
+    fake.issues["uuid-HAI-2"]["parent"] = {"id": "uuid-HAI-4"}
+
+    clock.now = T0 + 600
+    out = imp.run(apply=True, incremental_only=True)
+    assert out["relation_reconcile"]["status"] == "not_due"
+    hai2 = reg.work_context(reg.work_by_ticket("HAI-2", rp.reader())["id"], rp.reader())
+    assert [o["ticket"] for o in hai2["dependencies"]["blocked_by"]] == ["HAI-3"]
+
+    due(clock)
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["relation_reconcile"]["status"] == "complete"
+    assert out["relation_reconcile"]["totals"]["relinked"] == 2
+    hai2 = reg.work_context(reg.work_by_ticket("HAI-2", rp.reader())["id"], rp.reader())
+    hai4 = reg.work_context(reg.work_by_ticket("HAI-4", rp.reader())["id"], rp.reader())
+    assert hai2["dependencies"]["blocked_by"] == []
+    assert hai2["dependencies"]["parent"]["ticket"] == "HAI-4"
+    assert [o["ticket"] for o in hai4["dependencies"]["blocked_by"]] == ["HAI-3"]
+
+
+def test_relation_changes_with_an_updated_issue_land_on_the_next_tick(reg, client, fake, clock):
+    seed(fake)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    clock.now = T0 + 100
+    fake.issue("HAI-3", t=T0 + 90)  # relations removed, updatedAt bumped
+    fake.relate("HAI-4", ["HAI-1"], rel_type="blocks")
+    fake.issue(
+        "HAI-4", t=T0 + 91, state="completed", _relations=fake.issues["uuid-HAI-4"]["_relations"]
+    )
+
+    imp.run(apply=True, incremental_only=True)
+
+    hai1 = reg.work_context(reg.work_by_ticket("HAI-1", rp.reader())["id"], rp.reader())
+    hai2 = reg.work_context(reg.work_by_ticket("HAI-2", rp.reader())["id"], rp.reader())
+    assert hai2["dependencies"]["blocked_by"] == []
+    assert [o["ticket"] for o in hai1["dependencies"]["blocked_by"]] == ["HAI-4"]
+
+
+def test_relation_sweep_reads_only_manifest_teams(reg, client, fake, clock):
+    seed(fake)
+    fake.issue("SECRET-1", t=T0 - 5)
+    importer(reg, client, clock, teams=None).run(apply=True)
+    filters = [
+        r["variables"]["filter"] for r in fake.requests if operation(r) == "RegistryIssueLinks"
+    ]
+    assert {json.dumps(f, sort_keys=True) for f in filters} == {
+        json.dumps(lin._team_filter([t]), sort_keys=True) for t in ("HAI", "OPS")
+    }
+    assert reg.by_source("linear", "uuid-SECRET-1") is None
+
+
+def test_a_narrowed_run_does_not_count_as_a_relation_pass(reg, client, fake, clock):
+    seed(fake)
+    out = importer(reg, client, clock, teams=("HAI",)).run(apply=True)
+    assert out["relation_reconcile"] == {"status": "skipped_team_narrowed"}
+    assert not [r for r in fake.requests if operation(r) == "RegistryIssueLinks"]
+
+
+def test_a_document_is_a_linked_record_through_its_lifecycle(reg, client, fake, clock):
+    fake.issue("HAI-1", t=T0 - 50)
+    fake.issue("HAI-2", t=T0 - 50)
+    fake.document(
+        "doc-1",
+        "HAI-1",
+        t=T0 - 10,
+        title="Spec",
+        content="Spec v1",
+        team={"id": "team-HAI", "key": "HAI"},
+        initiative={"id": "init-1"},
+        parentDocument={"id": "doc-0"},
+    )
+    imp = importer(reg, client, clock)
+    out = imp.run(apply=True)
+    assert out["documents"]["totals"]["created"] == 1
+    rec = doc(reg, "doc-1")
+    assert (rec["title"], rec["body"], rec["status"], rec["sync_status"]) == (
+        "Spec",
+        "Spec v1",
+        "approved",
+        "synced",
+    )
+    assert rec["source_refs"] == {
+        "issue": "HAI-1",
+        "issue_id": "uuid-HAI-1",
+        "initiative_id": "init-1",
+        "parent_document_id": "doc-0",
+        "team_id": "team-HAI",
+        "team_key": "HAI",
+    }
+    assert rec["source_created_at"] == T0 - 10
+    assert ticket_docs(reg, "HAI-1") == ["doc-1"]
+
+    def edit(t: float, **fields) -> dict:
+        clock.now = t + 10
+        base = {k: v for k, v in fake.documents["doc-1"].items() if k not in ("updatedAt",)}
+        base.pop("id")
+        base.pop("issue")
+        issue = fields.pop("issue_key", "HAI-1")
+        fake.document("doc-1", issue, t=t, **(base | fields))
+        imp.run(apply=True, incremental_only=True)
+        return doc(reg, "doc-1")
+
+    assert edit(T0 + 100, content="Spec v2")["body"] == "Spec v2"
+    edit(T0 + 200, issue_key="HAI-2")
+    assert (ticket_docs(reg, "HAI-1"), ticket_docs(reg, "HAI-2")) == ([], ["doc-1"])
+    rec = edit(T0 + 300, issue_key=None, project=project("proj-1", "HAI"))
+    assert ticket_docs(reg, "HAI-2") == []
+    assert (rec["source_refs"]["project_id"], rec["source_refs"]["project_name"]) == (
+        "proj-1",
+        "proj-1",
+    )
+    assert "issue_id" not in rec["source_refs"]
+    rec = edit(T0 + 400, archivedAt=iso(T0 + 400))
+    assert (rec["status"], rec["source_archived_at"]) == ("approved", T0 + 400)
+    rec = edit(T0 + 500, archivedAt=None)
+    assert (rec["status"], rec["source_archived_at"]) == ("approved", 0.0)
+    rec = edit(T0 + 600, trashed=True)
+    assert (rec["status"], rec["status_reason"]) == ("retired", "source_deleted")
+    rec = edit(T0 + 700, trashed=False)
+    assert (rec["status"], rec["status_reason"]) == ("approved", "")
+    assert tombstones(reg) == []
+
+
+def test_a_hard_deleted_document_is_retired_with_a_tombstone(reg, client, fake, clock):
+    fake.issue("HAI-1", t=T0 - 50)
+    fake.document("doc-1", "HAI-1", t=T0 - 10)
+    fake.document("doc-2", None, t=T0 - 10)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    del fake.documents["doc-2"]
+
+    clock.now = T0 + 600
+    out = imp.run(apply=True, incremental_only=True)
+    assert out["document_reconcile"]["status"] == "not_due"
+    assert doc(reg, "doc-2")["status"] == "approved"
+
+    due(clock)
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["document_reconcile"]["status"] == "complete"
+    assert out["document_reconcile"]["totals"]["retired"] == 1
+    assert (doc(reg, "doc-2")["status"], doc(reg, "doc-2")["status_reason"]) == (
+        "retired",
+        "source_deleted",
+    )
+    assert doc(reg, "doc-1")["status"] == "approved"
+    assert tombstones(reg) == ["doc-2"]
+
+
+def test_a_document_absent_from_the_list_but_readable_by_id_is_not_deleted(
+    reg, client, fake, clock
+):
+    fake.lists_hide_trashed = True
+    fake.document("doc-1", None, t=T0 - 10)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    fake.document("doc-1", None, t=T0 + 50, trashed=True)  # gone from every list query
+    clock.now = T0 + 100
+    imp.run(apply=True, incremental_only=True)
+    assert doc(reg, "doc-1")["status"] == "approved"
+
+    due(clock)
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["document_reconcile"]["totals"]["updated"] == 1
+    rec = doc(reg, "doc-1")
+    assert (rec["status"], rec["status_reason"]) == ("retired", "source_deleted")
+    assert tombstones(reg) == []
+
+
+def test_an_unconfirmed_absence_retires_nothing(reg, client, fake, clock, monkeypatch):
+    fake.document("doc-1", None, t=T0 - 10)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    del fake.documents["doc-1"]
+    original = fake.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if operation(json.loads(request.content)) == "RegistryDocument":
+            return httpx.Response(200, json={"errors": [{"message": "Forbidden"}]})
+        return original(request)
+
+    monkeypatch.setattr(fake, "handler", handler)
+    due(clock)
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["document_reconcile"]["totals"]["absence_unconfirmed"] == 1
+    assert doc(reg, "doc-1")["status"] == "approved"
+    assert tombstones(reg) == []
+
+
+def test_a_mass_absence_retires_nothing_and_errors(reg, client, fake, clock, monkeypatch):
+    monkeypatch.setattr(lin, "MASS_ABSENCE_FLOOR", 1)
+    for i in range(3):
+        fake.document(f"doc-{i}", None, t=T0 - 10)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    del fake.documents["doc-0"], fake.documents["doc-1"]
+
+    due(clock)
+    out = imp.run(apply=True, incremental_only=True)
+
+    sweep = out["document_reconcile"]
+    assert sweep["status"] == "complete_with_errors"
+    assert "none retired" in sweep["errors"][0]
+    assert {doc(reg, f"doc-{i}")["status"] for i in range(3)} == {"approved"}
+    assert tombstones(reg) == []
+
+
+def test_replaying_a_whole_sweep_writes_nothing(reg, client, fake, clock):
+    seed_inventory(fake)
+    fake.relate("HAI-4", ["HAI-1", "HAI-2"] + [f"OPS-{i}" for i in range(1, 60)])
+    imp = importer(reg, client, clock, teams=None)
+    imp.run(apply=True)
+    before = snapshot(reg)
+    revisions = reg.db.execute("SELECT COUNT(*) FROM registry_source_revisions")
+
+    due(clock)
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["document_reconcile"]["status"] == out["relation_reconcile"]["status"] == "complete"
+    assert wrote(out["document_reconcile"]) == wrote(out["relation_reconcile"]) == 0
+    assert out["relation_reconcile"]["totals"]["relations_paged"] == 1
+    assert snapshot(reg) == before
+    assert reg.db.execute("SELECT COUNT(*) FROM registry_source_revisions") == revisions
+
+
+def test_a_sweep_interrupted_mid_pass_resumes_from_its_page(reg, client, fake, clock, monkeypatch):
+    for i in range(5):
+        fake.document(f"doc-{i}", None, t=T0 - 10, created=T0 - 100 + i)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    due(clock)
+    with monkeypatch.context() as patch:
+        fail_requests(fake, patch, lambda op, v: op == "RegistryDocumentIds" and v["after"] == "c2")
+        out = imp.run(apply=True, incremental_only=True)
+    assert out["document_reconcile"]["status"] == "incomplete"
+    assert json.loads(imp.state("document_reconcile")["after_cursor"])["after"] == "c2"
+    assert doc(reg, "doc-0")["status"] == "approved"
+    del fake.documents["doc-0"]  # after this pass already saw it on its first page
+
+    fake.requests.clear()
+    clock.now += 60
+    out = imp.run(apply=True, incremental_only=True)
+
+    sweeps = [
+        r["variables"]["after"] for r in fake.requests if operation(r) == "RegistryDocumentIds"
+    ]
+    assert sweeps[0] == "c2"
+    assert out["document_reconcile"]["status"] == "complete"
+    # doc-0 was seen on the first page before it was deleted: this pass cannot prove it gone.
+    assert doc(reg, "doc-0")["status"] == "approved"
+    due(clock)
+    imp.run(apply=True, incremental_only=True)
+    assert doc(reg, "doc-0")["status"] == "retired"
+
+
+def test_a_rejected_sweep_cursor_restarts_without_retiring(reg, client, fake, clock):
+    for i in range(3):
+        fake.document(f"doc-{i}", None, t=T0 - 10)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    del fake.documents["doc-2"]
+    st = imp.state("document_reconcile")
+    imp._save(
+        "document_reconcile",
+        st | {"after_cursor": json.dumps({"phase": "enumerate", "after": "bad"})},
+    )
+
+    out = imp.run(apply=True, incremental_only=True)
+
+    totals = out["document_reconcile"]["totals"]
+    assert totals["walk_restarted"] == 1
+    assert totals["retirement_skipped_restarted"] == 1
+    assert doc(reg, "doc-2")["status"] == "approved"
+    due(clock)
+    imp.run(apply=True, incremental_only=True)
+    assert doc(reg, "doc-2")["status"] == "retired"
+
+
+def test_sweep_writes_stay_inside_the_per_run_budget(reg, client, fake, clock, monkeypatch):
+    for i in range(5):
+        fake.document(f"doc-{i}", None, t=T0 - 1000, created=T0 - 2000 + i)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    forget_document_records(reg)
+    monkeypatch.setattr(lin, "SWEEP_WRITE_BUDGET", 2)
+    due(clock)
+
+    statuses = []
+    for _ in range(3):
+        out = imp.run(apply=True, incremental_only=True)["document_reconcile"]
+        assert wrote(out) <= 2
+        statuses.append(out["status"])
+        clock.now += 900
+
+    assert statuses == ["in_progress", "in_progress", "complete"]
+    assert {doc(reg, f"doc-{i}")["status"] for i in range(5)} == {"approved"}
+
+
+def forget_document_records(reg) -> None:
+    """The state an importer before version 5 left: document evidence, no records."""
+    reg.db.execute("DELETE FROM registry_relationships WHERE origin LIKE 'import:linear#doc-%'")
+    reg.db.execute("DELETE FROM registry_objects WHERE kind = 'document'")
+    reg.db.execute("DELETE FROM registry_sync_state WHERE stream IN (?, ?)", lin.SWEEPS)
+
+
+def test_upgrade_backfills_document_records_without_rewalking(reg, client, fake, clock):
+    fake.issue("HAI-1", t=T0 - 50)
+    fake.document("doc-1", "HAI-1", t=T0 - 1000)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    forget_document_records(reg)
+    reg.db.execute("UPDATE registry_import_runs SET importer_version = '4'")
+    clock.now = T0 + 3600
+    fake.requests.clear()
+
+    out = imp.run(apply=True)
+
+    walk = next(r for r in fake.requests if operation(r) == "RegistryIssues")
+    assert lin.to_epoch(walk["variables"]["filter"]["and"][1]["updatedAt"]["gte"]) == (
+        T0 - lin.WATERMARK_OVERLAP
+    )
+    assert out["document_reconcile"]["totals"]["created"] == 1
+    assert ticket_docs(reg, "HAI-1") == ["doc-1"]
+
+
+def test_a_document_on_an_issue_imported_later_links_on_the_sweep(reg, client, fake, clock):
+    fake.document("doc-1", None, t=T0 - 10)
+    imp = importer(reg, client, clock)
+    imp.run(apply=True)
+    # The document moves to an issue without its updatedAt changing.
+    fake.issue("HAI-1", t=T0 + 50)
+    fake.documents["doc-1"]["issue"] = {
+        "id": "uuid-HAI-1",
+        "identifier": "HAI-1",
+        "team": {"id": "team-HAI", "key": "HAI"},
+    }
+    clock.now = T0 + 100
+    imp.run(apply=True, incremental_only=True)
+    assert ticket_docs(reg, "HAI-1") == []
+
+    due(clock)
+    out = imp.run(apply=True, incremental_only=True)
+
+    assert out["document_reconcile"]["totals"]["relinked"] == 1
+    assert ticket_docs(reg, "HAI-1") == ["doc-1"]
+
+
+def test_dry_run_reports_due_sweeps_and_writes_nothing(reg, client, fake, clock):
+    seed_inventory(fake)
+    imp = importer(reg, client, clock, teams=None)
+    imp.run(apply=True)
+    before = snapshot(reg)
+    due(clock)
+    out = imp.run(apply=False)
+    assert out["document_reconcile"] == {"status": "due", "in_progress": False}
+    assert snapshot(reg) == before
+
+
+async def test_documents_are_import_only(reg):
+    with pytest.raises(RegistryError, match="kind must be one of"):
+        await reg.put_object({"kind": "document", "title": "Spec", "scope": "org"}, HUMAN)
+
+
+def test_every_query_is_read_only():
+    from mira.registry.imports import assert_read_only_graphql
+
+    for document in lin.QUERIES:
+        assert_read_only_graphql(document)
+        assert "mutation" not in document.lower()

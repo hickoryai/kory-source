@@ -492,7 +492,9 @@ async def test_work_context_order_and_view(reg):
         "dependencies",
         "evidence",
         "comments",
+        "documents",
     ]
+    assert ctx["documents"] == []
     assert ctx["work"]["plan"] == "1. schema"
     assert [o["id"] for o in ctx["requirements"]] == [req["id"]]
     assert [o["id"] for o in ctx["decisions"]] == [dec["id"]]

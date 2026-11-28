@@ -28,6 +28,7 @@ NEW_TABLES = (
     "registry_corpus_members",
     "registry_decision_classifications",
     "registry_import_work",
+    "registry_sync_seen",
 )
 
 
@@ -71,6 +72,11 @@ def test_upgrade_from_todays_schema_keeps_rows(tmp_path):
     db = RegistryDB(path=str(path))
     rows = db.execute("SELECT id, title, corpus_id, authority_tier FROM registry_objects")
     assert rows == [("reg_1", "Old", "", "")]
+    # 006: source record fields default to empty on rows written before them.
+    assert db.execute(
+        "SELECT source_created_at, source_updated_at, source_archived_at, source_refs "
+        "FROM registry_objects"
+    ) == [(0, 0, 0, "")]
     db.close()
 
 
@@ -108,6 +114,10 @@ def _stamp(path: Path, sha: str) -> None:
     with sqlite3.connect(path) as conn:
         conn.execute("DELETE FROM registry_schema_migrations WHERE version > 1")
         conn.execute("DROP TABLE IF EXISTS registry_decision_classifications")
+        conn.execute("DROP TABLE IF EXISTS registry_sync_seen")
+        for column in ("source_created_at", "source_updated_at", "source_archived_at"):
+            conn.execute(f"ALTER TABLE registry_objects DROP COLUMN {column}")
+        conn.execute("ALTER TABLE registry_objects DROP COLUMN source_refs")
         conn.execute("UPDATE registry_schema_migrations SET sha256 = ? WHERE version = 1", (sha,))
 
 

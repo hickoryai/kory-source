@@ -395,8 +395,17 @@ Fork-owned, with no upstream drift:
     `python -m mira.registry.linear import [--apply]`. Both cover every team in
     the workspace and every state, archived and trashed included. `--team KEY`
     (repeatable) narrows them to the named teams.
-  - The inventory also counts the workspace's teams and its documents, and
-    lists the documents linked to issues. Documents are not imported yet.
+  - The inventory also counts the workspace's teams and its documents (by
+    parent, archived and trashed), lists the documents linked to issues, and
+    counts every relation and the issues holding more than 50.
+- **Each Linear document becomes a `document` record (HAI-14727)**, linked to
+  its issue by a `relates` link the document owns, with its parents in
+  `source_refs` (migration `006`). Documents are import-only.
+- **Every relation imports.** An issue with more than 50 relations is paged to
+  the end before its page is written.
+- **Reconciliation sweeps** (`document_reconcile`, `relation_reconcile`) run in
+  the same `import` command every 6 hours, resumable and budgeted, and retire a
+  document only after Linear confirms by id that it is gone.
 - **Each Linear issue becomes a `work` object** with source id = issue UUID
   and `ticket` = the identifier.
   - Delivery state follows Linear's state type (`duplicate` maps to

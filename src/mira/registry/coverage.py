@@ -91,6 +91,7 @@ class CoverageReport:
         by_team = {team: {} for team in teams}
         by_team["workspace_documents"] = {}
         partial_document_teams = set()
+        seen_nodes: dict[str, dict] = {}
         for stream, (query, filt, kind) in specs.items():
             nodes = {}
             groups = defaultdict(set)
@@ -140,6 +141,7 @@ class CoverageReport:
                 for sid, node in nodes.items()
                 if sid in latest and linear.version(node.get("updatedAt")) > latest[sid]
             }
+            seen_nodes[stream] = nodes
             result[stream] = reconcile(nodes, latest, stale=stale)
             result[stream].update(
                 self._provenance(rows, [r for r in runs if r["stream"] == stream])
@@ -151,6 +153,33 @@ class CoverageReport:
                     "missing": len(ids - latest.keys()),
                     "stale": len(ids & stale),
                 }
+        # Documents are records as well as evidence: reconcile the records too.
+        # A stored record Linear no longer lists is ``extra``, never proof of deletion.
+        records = dict(
+            self.registry.db.execute(
+                "SELECT source_id, source_version FROM registry_objects WHERE corpus_id = ? "
+                "AND source_system = 'linear' AND kind = 'document'",
+                (self.policy.corpus_id,),
+            )
+        )
+        documents = seen_nodes.get("documents", {})
+        result["document_records"] = reconcile(
+            documents,
+            records,
+            stale={
+                sid
+                for sid, node in documents.items()
+                if sid in records and linear.version(node.get("updatedAt")) > int(records[sid])
+            },
+        )
+        # The issue query carries 50 relations; the importer pages the rest.
+        result["relations"] = {
+            "issues_over_first_page": inventory_ids(
+                sid
+                for sid, node in seen_nodes.get("issues", {}).items()
+                if linear._relations_truncated(node)
+            )
+        }
         return {
             "streams": result,
             "teams": by_team,
